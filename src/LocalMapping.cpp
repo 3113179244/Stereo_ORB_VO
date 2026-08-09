@@ -197,6 +197,12 @@ bool LocalMapping::CheckNewKeyFrames()
     return !mlNewKeyFrames.empty();
 }
 
+bool LocalMapping::KeyframesInQueue()
+{
+    std::unique_lock<std::mutex> lock(mMutexNewKeyBase);
+    return !mlNewKeyFrames.empty();
+}
+
 void LocalMapping::ProcessNewKeyFrame()
 {
     {

@@ -17,6 +17,8 @@ class Viewer;
 class FrameDrawer;
 class LocalMapping;
 typedef DBoW3::Vocabulary ORBVocabulary;
+class KeyFrameDatabase;
+
 class System
 {
 public:
@@ -35,7 +37,7 @@ public:
     std::shared_ptr<FrameDrawer> GetFrameDrawer() const { return mpFrameDrawer; }
     // 核心输入接口：传入左右目图像和时间戳，返回世界到相机的变换 Tcw
     Eigen::Matrix4f TrackStereo(const cv::Mat &imLeft, const cv::Mat &imRight, const double &timestamp);
-    ORBVocabulary* GetVocabulary() const { return mpVocabulary.get(); }
+    ORBVocabulary *GetVocabulary() const { return mpVocabulary.get(); }
     // 控制接口
     void Reset();
     void Shutdown();
@@ -70,9 +72,7 @@ private:
     std::shared_ptr<FrameDrawer> mpFrameDrawer;
     // 线程安全互斥锁
     std::mutex mMutexMode;
-    // 逐帧轨迹记录（顺序与序列帧一致，保存 T_wc 相机在世界坐标系下的位姿）
-    // 方案C：区别于「关键帧轨迹」，该容器记录每一帧的位姿，行数与图像帧数一致，
-    //        从而与 KITTI ground truth 逐行对齐评估。
+    KeyFrameDatabase *mpKeyFrameDatabase;
     std::vector<Eigen::Matrix4f> mvFrameTrajectory;
 };
 

@@ -1,0 +1,163 @@
+#include "KeyFrameDatabase.h"
+#include "KeyFrame.h"
+#include "Frame.h"
+#include <algorithm>
+
+KeyFrameDatabase::KeyFrameDatabase(ORBVocabulary* pVoc) : mpVoc(pVoc)
+{
+    if (mpVoc)
+    {
+        // 根据词典的大小预分配倒排索引数组
+        mvInvertedFile.resize(mpVoc->size());
+    }
+}
+
+KeyFrameDatabase::~KeyFrameDatabase()
+{
+}
+
+void KeyFrameDatabase::add(KeyFrame* pKF)
+{
+    std::unique_lock<std::mutex> lock(mMutex);
+
+    // 确保关键帧已经计算了 BoW 向量
+    pKF->ComputeBoW();
+
+    // 遍历关键帧的所有 Word，将当前关键帧加入对应 Word 的倒排索引列表中
+    for (auto vit = pKF->mBowVec.begin(); vit != pKF->mBowVec.end(); vit++)
+    {
+        mvInvertedFile[vit->first].push_back(pKF);
+    }
+}
+
+void KeyFrameDatabase::erase(KeyFrame* pKF)
+{
+    std::unique_lock<std::mutex> lock(mMutex);
+
+    // 遍历该关键帧包含的所有 Word，从相应的倒排索引中删除自身
+    for (auto vit = pKF->mBowVec.begin(); vit != pKF->mBowVec.end(); vit++)
+    {
+        mvInvertedFile[vit->first].remove(pKF);
+    }
+}
+
+void KeyFrameDatabase::clear()
+{
+    std::unique_lock<std::mutex> lock(mMutex);
+    for (size_t i = 0; i < mvInvertedFile.size(); i++)
+    {
+        mvInvertedFile[i].clear();
+    }
+}
+
+std::vector<KeyFrame*> KeyFrameDatabase::DetectRelocalizationCandidates(Frame* pF)
+{
+    std::list<KeyFrame*> lKFsSharingWords;
+
+    // 1. 搜集所有与当前帧共享 BoW Word 的关键帧
+    {
+        std::unique_lock<std::mutex> lock(mMutex);
+
+        for (auto vit = pF->mBowVec.begin(); vit != pF->mBowVec.end(); vit++)
+        {
+            const std::list<KeyFrame*>& lKFs = mvInvertedFile[vit->first];
+
+            for (KeyFrame* pKFi : lKFs)
+            {
+                // 用 mnRelocQuery 标记防止在同一查询中重复处理同一个关键帧
+                if (pKFi->mnRelocQuery != pF->mnId)
+                {
+                    pKFi->mnRelocWords = 0;
+                    pKFi->mnRelocQuery = pF->mnId;
+                    lKFsSharingWords.push_back(pKFi);
+                }
+                pKFi->mnRelocWords++; // 统计共享词汇数量
+            }
+        }
+    }
+
+    if (lKFsSharingWords.empty())
+        return std::vector<KeyFrame*>();
+
+    // 2. 筛选共享词汇数量最多的门槛 (至少需要达到最大值的 80%)
+    int maxCommonWords = 0;
+    for (KeyFrame* pKFi : lKFsSharingWords)
+    {
+        if (pKFi->mnRelocWords > maxCommonWords)
+            maxCommonWords = pKFi->mnRelocWords;
+    }
+
+    int minCommonWords = static_cast<int>(maxCommonWords * 0.8f);
+
+    std::list<std::pair<float, KeyFrame*>> lScoreAndMatch;
+    int nscores = 0;
+
+    // 3. 计算 BoW 相似度得分 (Score)
+    for (KeyFrame* pKFi : lKFsSharingWords)
+    {
+        if (pKFi->mnRelocWords > minCommonWords)
+        {
+            nscores++;
+            // 计算当前帧与候选关键帧之间的得分
+            float score = mpVoc->score(pF->mBowVec, pKFi->mBowVec);
+            pKFi->mRelocScore = score;
+            lScoreAndMatch.push_back(std::make_pair(score, pKFi));
+        }
+    }
+
+    if (lScoreAndMatch.empty())
+        return std::vector<KeyFrame*>();
+
+    // 4. 统计候选关键帧与其共视关键帧（Covisibility Group）的累计最高分
+    std::list<std::pair<float, KeyFrame*>> lAccScoreAndMatch;
+    float bestAccScore = 0.0f;
+
+    for (auto it = lScoreAndMatch.begin(); it != lScoreAndMatch.end(); it++)
+    {
+        KeyFrame* pKFi = it->second;
+        std::vector<KeyFrame*> vpNeighKFs = pKFi->GetBestCovisibilityKeyFrames(10);
+
+        float bestScore = it->first;
+        float accScore = it->first;
+        KeyFrame* pBestKF = pKFi;
+
+        for (KeyFrame* pNeighKF : vpNeighKFs)
+        {
+            if (pNeighKF->mnRelocQuery != pF->mnId)
+                continue;
+
+            accScore += pNeighKF->mRelocScore;
+            if (pNeighKF->mRelocScore > bestScore)
+            {
+                pBestKF = pNeighKF;
+                bestScore = pNeighKF->mRelocScore;
+            }
+        }
+
+        lAccScoreAndMatch.push_back(std::make_pair(accScore, pBestKF));
+        if (accScore > bestAccScore)
+            bestAccScore = accScore;
+    }
+
+    // 5. 按照累计得分门槛（不低于最高分的 75%）挑选最终的重定位候选关键帧
+    float minAccScore = 0.75f * bestAccScore;
+
+    std::set<KeyFrame*> spAlreadyAddedKF;
+    std::vector<KeyFrame*> vpRelocCandidates;
+    vpRelocCandidates.reserve(lAccScoreAndMatch.size());
+
+    for (auto it = lAccScoreAndMatch.begin(); it != lAccScoreAndMatch.end(); it++)
+    {
+        if (it->first > minAccScore)
+        {
+            KeyFrame* pKFi = it->second;
+            if (!spAlreadyAddedKF.count(pKFi))
+            {
+                vpRelocCandidates.push_back(pKFi);
+                spAlreadyAddedKF.insert(pKFi);
+            }
+        }
+    }
+
+    return vpRelocCandidates;
+}

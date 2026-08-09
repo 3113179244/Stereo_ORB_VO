@@ -16,6 +16,7 @@ class KeyFrame;
 class ORBmatcher;
 class MotionOnlyBA;
 class LocalMapping;
+class KeyFrameDatabase;
 
 class Tracker
 {
@@ -28,7 +29,7 @@ public:
         OK = 2,
         LOST = 3
     };
-    Tracker(System *pSys, ORBVocabulary* pVoc, std::shared_ptr<Map> pMap, System::eSensor sensor);
+    Tracker(System *pSys, ORBVocabulary* pVoc, KeyFrameDatabase* pKFDB, std::shared_ptr<Map> pMap, System::eSensor sensor);
     ~Tracker();
     void SetFrameDrawer(std::shared_ptr<FrameDrawer> pFrameDrawer) { mpFrameDrawer = pFrameDrawer; }
     // 图像数据Grab接口
@@ -36,7 +37,7 @@ public:
     void SetLocalMapper(LocalMapping *pLocalMapper) { mpLocalMapper = pLocalMapper; }
     void SetViewer(std::shared_ptr<Viewer> pViewer) { mpViewer = pViewer; }
     void Reset();
-
+    bool Relocalize();
     eTrackingState mState;
     // 当前帧与上一帧
     Frame mCurrentFrame;
@@ -52,6 +53,7 @@ private:
     bool NeedNewKeyFrame();
     void CreateNewKeyFrame();
     System *mpSystem;
+    KeyFrameDatabase* mpKeyFrameDB;
     std::shared_ptr<Map> mpMap;
     std::shared_ptr<Viewer> mpViewer;
     ORBVocabulary* mpORBVocabulary;

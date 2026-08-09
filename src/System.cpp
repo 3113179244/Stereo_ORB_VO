@@ -6,7 +6,7 @@
 #include "Viewer.h"
 #include "FrameDrawer.h"
 #include "LocalMapping.h"
-
+#include "KeyFrameDatabase.h"
 #include <fstream>
 #include <algorithm>
 #include <iomanip>
@@ -42,13 +42,15 @@ System::System(const std::string &strConfigFile, const std::string &strVocFile, 
     std::cout << "Vocabulary loaded successfully." << std::endl;
     // 初始化全局地图 Map
     mpMap = std::make_shared<Map>();
-    mpFrameDrawer = std::make_shared<FrameDrawer>(mpMap.get());
+    mpFrameDrawer = std::make_shared<FrameDrawer>(mpMap.get()); 
+    mpKeyFrameDatabase = new KeyFrameDatabase(mpVocabulary.get());
     // 初始化前端 Tracker
-    mpTracker = std::make_shared<Tracker>(this, mpVocabulary.get(), mpMap, mSensor);
+    mpTracker = std::make_shared<Tracker>(this, mpVocabulary.get(), mpKeyFrameDatabase, mpMap, sensor);
     mpTracker->SetFrameDrawer(mpFrameDrawer);
     mpLocalMapper = std::make_shared<LocalMapping>(this, mpMap);
     mpTracker->SetLocalMapper(mpLocalMapper.get());
     mpLocalMapper->SetTracker(mpTracker.get());
+   
     if (bUseViewer)
     {
         mpViewer = std::make_shared<Viewer>(this, mpMap);

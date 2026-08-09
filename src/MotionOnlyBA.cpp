@@ -180,16 +180,9 @@ int MotionOnlyBA::Optimize(Frame *pFrame)
         if (depth <= 0)
             continue;
 
-        ceres::CostFunction *cost_function = nullptr;
-
-        if (pFrame->isNear(i))
-        {
-            cost_function = ReprojectionError::Create(obs, P_w, K_eigen);
-        }
-        else
-        {
-            cost_function = RotationOnlyError::Create(obs, P_w, K_eigen);
-        }
+        // 双目/立体视觉下所有地图点均有绝对深度，统一使用带平移的标准重投影误差，
+        // 为位姿的平移分量提供充分的约束，避免因远点被当作“纯旋转观测”而导致平移漂移。
+        ceres::CostFunction *cost_function = ReprojectionError::Create(obs, P_w, K_eigen);
 
         // 向求解器问题中添加残差块
         problem.AddResidualBlock(cost_function, loss_function, camera_pose);

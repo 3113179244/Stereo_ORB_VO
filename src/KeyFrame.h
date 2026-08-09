@@ -110,7 +110,11 @@ public:
 
     DBoW3::BowVector mBowVec;
     DBoW3::FeatureVector mFeatVec;
-
+    
+    long unsigned int mnRelocQuery = 0;
+    int mnRelocWords = 0;
+    float mRelocScore = 0.0f;
+    
 private:
     // 将特征点分配到网格
     void AssignFeaturesToGrid();
