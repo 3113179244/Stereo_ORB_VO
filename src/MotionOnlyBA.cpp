@@ -73,56 +73,6 @@ struct ReprojectionError
 };
 
 /**
- * @brief 仅包含旋转约束的残差块（忽略平移量，常用于远点优化）
- */
-struct RotationOnlyError
-{
-    // 构造函数：传入观测到的2D像素坐标、3D世界坐标点和相机内参矩阵 K
-    RotationOnlyError(const Eigen::Vector2d &observed, const Eigen::Vector3d &point_3d, const Eigen::Matrix3d &K)
-        : observed_(observed), point_3d_(point_3d), K_(K) {}
-
-    /**
-     * @brief 计算仅旋转的重投影残差
-     */
-    template <typename T>
-    bool operator()(const T *const se3, T *residuals) const
-    {
-        T p_w[3] = {T(point_3d_[0]), T(point_3d_[1]), T(point_3d_[2])};
-        T p_c[3];
-
-        // 仅对点进行旋转运算，忽略平移量 se3[3..5]
-        ceres::AngleAxisRotatePoint(se3, p_w, p_c);
-
-        // 归一化平面坐标
-        T x = p_c[0] / p_c[2];
-        T y = p_c[1] / p_c[2];
-
-        // 获取内参
-        T fx = T(K_(0, 0)), fy = T(K_(1, 1));
-        T cx = T(K_(0, 2)), cy = T(K_(1, 2));
-
-        // 计算投影像素残差
-        residuals[0] = (fx * x + cx) - T(observed_[0]);
-        residuals[1] = (fy * y + cy) - T(observed_[1]);
-
-        return true;
-    }
-
-    /**
-     * @brief 工厂函数，创建仅旋转误差的 CostFunction
-     */
-    static ceres::CostFunction *Create(const Eigen::Vector2d &observed, const Eigen::Vector3d &point_3d, const Eigen::Matrix3d &K)
-    {
-        return new ceres::AutoDiffCostFunction<RotationOnlyError, 2, 6>(
-            new RotationOnlyError(observed, point_3d, K));
-    }
-
-    Eigen::Vector2d observed_; // 2D 观察像素坐标
-    Eigen::Vector3d point_3d_; // 3D 世界坐标点
-    Eigen::Matrix3d K_;        // 相机内参矩阵
-};
-
-/**
  * @brief 执行相机位姿(Pose)的优化计算
  */
 int MotionOnlyBA::Optimize(Frame *pFrame)
@@ -180,8 +130,14 @@ int MotionOnlyBA::Optimize(Frame *pFrame)
         if (depth <= 0)
             continue;
 
-        // 双目/立体视觉下所有地图点均有绝对深度，统一使用带平移的标准重投影误差，
-        // 为位姿的平移分量提供充分的约束，避免因远点被当作“纯旋转观测”而导致平移漂移。
+        // 【方案A-兜底】只优化近点：远点（深度 >= mThDepth）直接跳过。
+        // 地图在创建时已尽量只保留近点，但运行中部分点可能随相机移动变为远点，
+        // 在此统一过滤，保证 MotionOnlyBA 的所有约束都来自近点。
+        if (depth >= pFrame->mThDepth)
+            continue;
+
+        // 双目/立体视觉下所有近点均有绝对深度，统一使用带平移的标准重投影误差，
+        // 为位姿的平移分量提供充分的约束。
         ceres::CostFunction *cost_function = ReprojectionError::Create(obs, P_w, K_eigen);
 
         // 向求解器问题中添加残差块

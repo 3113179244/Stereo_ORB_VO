@@ -412,7 +412,6 @@ void LocalMapping::CreateNewMapPoints()
             if (Pc2.z() <= 0.0f)
                 continue;
 
-            // --- 检查地图点到当前帧光心的距离，避免出现离相机非常近或非常远的异常点 ---
             const float dist0 = (x3D - Ow0).norm();
             const float dist2 = (x3D - Ow2).norm();
             if (dist0 <= 0.0f || dist2 <= 0.0f)
