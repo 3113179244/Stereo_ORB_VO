@@ -186,13 +186,13 @@ bool Tracker::TrackWithMotionModel()
 
     // 利用投影建立上一帧地图点与当前帧特征点的匹配
     ORBmatcher matcher(0.9, true);
-    int nmatches = matcher.SearchByProjection(mCurrentFrame, mLastFrame, 15); // 搜索半径阈值设为15
+    int nmatches = matcher.SearchByProjection(mCurrentFrame, mLastFrame, 7); // 搜索半径阈值设为15
 
     if (nmatches < 20)
     {
         // 匹配点太少，放大搜索半径重试一次
         mCurrentFrame.mvpMapPoints = std::vector<MapPoint *>(mCurrentFrame.N, static_cast<MapPoint *>(nullptr));
-        nmatches = matcher.SearchByProjection(mCurrentFrame, mLastFrame, 2 * 15);
+        nmatches = matcher.SearchByProjection(mCurrentFrame, mLastFrame, 2 * 7);
     }
 
     if (nmatches < 20)
@@ -348,7 +348,7 @@ bool Tracker::TrackLocalMap()
         float u = Frame::fx * P_c[0] / P_c[2] + Frame::cx;
         float v = Frame::fy * P_c[1] / P_c[2] + Frame::cy;
 
-        if (u < Frame::mnMinX || u > Frame::mnMaxX || v < Frame::mnMinY || v > Frame::mnMaxY)
+        if (u < Frame::mnMinX || u >= Frame::mnMaxX || v < Frame::mnMinY || v >= Frame::mnMaxY)
             continue;
 
         // 在投影区域 (半径 5~10 像素) 内查找的最佳描述子点

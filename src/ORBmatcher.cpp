@@ -250,7 +250,6 @@ int ORBmatcher::SearchByProjection(
         if (!pMP || pMP->isBad())
             continue;
 
-        // 世界点投影到当前相机坐标系
         const Eigen::Vector3f Pc = Rcw * pMP->GetWorldPos() + tcw;
         if (Pc.z() <= 0.0f)
             continue;
@@ -259,19 +258,15 @@ int ORBmatcher::SearchByProjection(
         const float u = Frame::fx * Pc.x() * invz + Frame::cx;
         const float v = Frame::fy * Pc.y() * invz + Frame::cy;
 
-        // 图像边界检查
         if (u < Frame::mnMinX || u >= Frame::mnMaxX ||
             v < Frame::mnMinY || v >= Frame::mnMaxY)
             continue;
 
         const int lastLevel = LastFrame.mvKeysUn[i].octave;
-        const float radius =
-            th * CurrentFrame.mpORBextractorLeft->GetScaleFactors()[lastLevel];
+        const float radius = th * CurrentFrame.mpORBextractorLeft->GetScaleFactors()[lastLevel];
 
-        // 只搜索空间邻近、尺度相近的当前帧特征
         const std::vector<size_t> candidates =
-            CurrentFrame.GetFeaturesInArea(u, v, radius,
-                                           lastLevel - 1, lastLevel + 1);
+            CurrentFrame.GetFeaturesInArea(u, v, radius, lastLevel - 1, lastLevel + 1);
 
         if (candidates.empty())
             continue;
@@ -283,7 +278,6 @@ int ORBmatcher::SearchByProjection(
         int bestLevel = -1;
         int secondBestLevel = -1;
 
-        // 双目情况下，右目坐标也应与预测值相符
         const float predictedUR = u - CurrentFrame.mbf * invz;
 
         for (size_t idx : candidates)
@@ -319,15 +313,14 @@ int ORBmatcher::SearchByProjection(
         if (bestIdx < 0 || bestDist > TH_HIGH)
             continue;
 
-        // 同层级候选时使用 ratio test，去掉歧义匹配
-        if (bestLevel == secondBestLevel &&
+        if (secondBestLevel >= 0 &&
+            bestLevel == secondBestLevel &&
             static_cast<float>(bestDist) > mfNNratio * secondBestDist)
             continue;
 
         CurrentFrame.mvpMapPoints[bestIdx] = pMP;
         ++nmatches;
 
-        // 方向一致性统计
         if (mbCheckOrientation)
         {
             float rot = LastFrame.mvKeysUn[i].angle - CurrentFrame.mvKeysUn[bestIdx].angle;
@@ -343,7 +336,6 @@ int ORBmatcher::SearchByProjection(
         }
     }
 
-    // 仅保留前三个主旋转方向上的匹配
     if (mbCheckOrientation)
     {
         int idx1 = -1, idx2 = -1, idx3 = -1;
