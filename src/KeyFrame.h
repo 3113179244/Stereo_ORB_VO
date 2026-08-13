@@ -65,7 +65,11 @@ public:
     std::vector<MapPoint *> GetMapPointMatches();
     // 获取第 idx 个特征点对应的地图点
     MapPoint *GetMapPoint(const size_t &idx);
-
+    void SetParent(KeyFrame* pKF);
+    KeyFrame* GetParent();
+    void AddChild(KeyFrame* pKF);
+    void EraseChild(KeyFrame* pKF);
+    std::set<KeyFrame*> GetChilds();
     // 词袋模型 (Bag of Words)
     // 计算当前关键帧的词袋向量，用于重定位和闭环检测
     void ComputeBoW();
@@ -79,7 +83,7 @@ public:
     float mfGridElementHeightInv;
     float mnMinX, mnMaxX, mnMinY, mnMaxY;
     std::vector<std::size_t> mGrid[64][48]; // 二维网格，存特征点索引
-    
+
     // 基础标识与时间戳
     static long unsigned int nNextId;  // 静态全局变量，用于生成下一个关键帧的唯一ID
     long unsigned int mnId;            // 当前关键帧的唯一ID
@@ -110,12 +114,14 @@ public:
 
     DBoW3::BowVector mBowVec;
     DBoW3::FeatureVector mFeatVec;
-    
+
     long unsigned int mnRelocQuery = 0;
     int mnRelocWords = 0;
     float mRelocScore = 0.0f;
-    
+
 private:
+    KeyFrame *mpParent = nullptr;     // 父节点指针
+    std::set<KeyFrame *> mspChildren; // 子节点集合
     // 将特征点分配到网格
     void AssignFeaturesToGrid();
     // 判断特征点是否在网格内并返回网格坐标

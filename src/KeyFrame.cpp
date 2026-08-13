@@ -19,16 +19,11 @@ KeyFrame::KeyFrame(Frame &F, Map *pMap)
       mvScaleFactors(F.mpORBextractorLeft->GetScaleFactors()),
       mvLevelSigma2(F.mpORBextractorLeft->GetScaleSigmaSquares()),
       mvInvLevelSigma2(F.mpORBextractorLeft->GetInverseScaleSigmaSquares()),
-      mbBad(false), mpMap(pMap), mpORBvocabulary(F.mpORBvocabulary)
+      mbBad(false), mpMap(pMap), mpORBvocabulary(F.mpORBvocabulary), mpParent(nullptr)
 {
     mnId = nNextId++;             // 分配新的关键帧 ID
     mvpMapPoints = F.mvpMapPoints;// 继承普通帧中已经匹配好的 3D 地图点
     SetPose(F.mTcw);              // 设置关键帧的初始位姿
-
-    // ⚠️ 重要修复：必须在构造函数中初始化特征点网格。
-    // 否则 SearchInNeighbors()/CreateNewMapPoints() 依赖的
-    // GetFeaturesInArea() 会用未初始化的垃圾网格数据，
-    // 导致投影/融合永远搜不到候选特征点（"看起来没起作用"）。
     AssignFeaturesToGrid();
 }
 
@@ -480,4 +475,36 @@ std::vector<size_t> KeyFrame::GetFeaturesInArea(
         }
     }
     return vIndices;
+}
+
+void KeyFrame::SetParent(KeyFrame *pKF)
+{
+    std::unique_lock<std::mutex> lock(mMutexConnections);
+    mpParent = pKF;
+    if (pKF)
+        pKF->AddChild(this);
+}
+
+KeyFrame *KeyFrame::GetParent()
+{
+    std::unique_lock<std::mutex> lock(mMutexConnections);
+    return mpParent;
+}
+
+void KeyFrame::AddChild(KeyFrame *pKF)
+{
+    std::unique_lock<std::mutex> lock(mMutexConnections);
+    mspChildren.insert(pKF);
+}
+
+void KeyFrame::EraseChild(KeyFrame *pKF)
+{
+    std::unique_lock<std::mutex> lock(mMutexConnections);
+    mspChildren.erase(pKF);
+}
+
+std::set<KeyFrame *> KeyFrame::GetChilds()
+{
+    std::unique_lock<std::mutex> lock(mMutexConnections);
+    return mspChildren;
 }
