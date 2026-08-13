@@ -53,7 +53,7 @@ static float CheckDistEpipolarLine(const KeyFrame *pKF1, const KeyFrame *pKF2,
 {
     const cv::KeyPoint &kp1 = pKF1->mvKeysUn[idx1];
     const cv::KeyPoint &kp2 = pKF2->mvKeysUn[idx2];
-    // 归一化坐标点（齐次）
+    // 像素齐次坐标（注意：F12 是像素域基础矩阵，此处必须用像素坐标而非归一化坐标）
     Eigen::Vector3f p1(kp1.pt.x, kp1.pt.y, 1.0f);
     Eigen::Vector3f p2(kp2.pt.x, kp2.pt.y, 1.0f);
 
@@ -392,9 +392,13 @@ void LocalMapping::CreateNewMapPoints()
                 continue;
 
             // --- 三角化 ---
-            Eigen::Vector2f xpi0(kp0.pt.x, kp0.pt.y); // 已含内参，直接作为归一化观测（近似）
-            Eigen::Vector2f xpi2(pKF2->mvKeysUn[bestIdx2].pt.x,
-                                 pKF2->mvKeysUn[bestIdx2].pt.y);
+            // 注意：mvKeysUn 是去畸变后的像素坐标（单位：像素），而 Triangulate() 采用
+            // DLT 求解 x × (P X) = 0，其中 P = [R | t] 不含内参，因此必须先把像素坐标
+            // 换算成归一化平面坐标：x = (u - cx) / fx, y = (v - cy) / fy。
+            // 这里统一使用当前帧内参，与下方重投影检查（u = fx*Pc.x/Pc.z + cx）保持同一坐标系。
+            Eigen::Vector2f xpi0((kp0.pt.x - cx) / fx, (kp0.pt.y - cy) / fy);
+            Eigen::Vector2f xpi2((pKF2->mvKeysUn[bestIdx2].pt.x - cx) / fx,
+                                 (pKF2->mvKeysUn[bestIdx2].pt.y - cy) / fy);
 
             Eigen::Vector3f x3D;
             if (!Triangulate(Rcw1, tcw1, Rcw2, tcw2, xpi0, xpi2, x3D))
