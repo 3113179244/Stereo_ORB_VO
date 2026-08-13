@@ -74,6 +74,7 @@ public:
     // 计算当前关键帧的词袋向量，用于重定位和闭环检测
     void ComputeBoW();
     void SetBadFlag();
+    int TrackedMapPoints(const int &minObs);
     std::vector<size_t> GetFeaturesInArea(const float &x, const float &y, const float &r,
                                           const int minLevel = -1, const int maxLevel = -1) const;
     // 网格划分相关参数（每个关键帧独立，用于加速局部特征投影匹配）

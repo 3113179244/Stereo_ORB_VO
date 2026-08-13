@@ -535,3 +535,25 @@ std::set<KeyFrame *> KeyFrame::GetChilds()
     std::unique_lock<std::mutex> lock(mMutexConnections);
     return mspChildren;
 }
+
+int KeyFrame::TrackedMapPoints(const int &minObs)
+{
+    std::unique_lock<std::mutex> lock(mMutexFeatures);
+    int nPoints = 0;
+    const bool bCheckObs = minObs > 0;
+    for (int i = 0; i < N; i++)
+    {
+        MapPoint* pMP = mvpMapPoints[i];
+        if (pMP && !pMP->isBad())
+        {
+            if (bCheckObs)
+            {
+                if (pMP->GetObservations().size() >= minObs)
+                    nPoints++;
+            }
+            else
+                nPoints++;
+        }
+    }
+    return nPoints;
+}

@@ -588,15 +588,25 @@ bool Tracker::TrackLocalMap()
 
 bool Tracker::NeedNewKeyFrame()
 {
-    // 保留 SetNotStop() 的副作用：确保 LocalMapping 线程不会因暂停请求而停掉
+    // 确保 LocalMapping 不会被外部 RequestStop 阻断
     if (mpLocalMapper)
         mpLocalMapper->SetNotStop();
 
-    // 真正意义上的 LocalMapping 空闲：当前没有待排队处理的关键帧
-    bool bLocalMappingIdle = (mpLocalMapper != nullptr) && !mpLocalMapper->KeyframesInQueue();
+    // 1. 如果局部建图队列里已经堆积了超过 2 个关键帧，坚决不再插入新帧！
+    // 强制等待后端消化，这是解决严重延迟的关键！
+    if (mpLocalMapper && mpLocalMapper->KeyframesInQueue())
+    {
+        // 队列里已有等待处理的关键帧，暂缓插入
+        return false; 
+    }
 
-    // 跟踪到的点太少，位姿不可靠，不建帧
+    // 2. 跟踪到的点太少，位姿不可靠，不建帧
     if (mnMatchesInliers < 15)
+        return false;
+
+    // 3. 距离上一帧建帧的时间太短（例如小于 4 帧），直接拦截
+    // 原版条件中 (mCurrentFrame.mnId >= mnLastKeyFrameId + 3) 太敏感了
+    if (mCurrentFrame.mnId < mnLastKeyFrameId + 5)
         return false;
 
     // 参考关键帧中被跟踪到的点数量
@@ -618,18 +628,16 @@ bool Tracker::NeedNewKeyFrame()
                 nNonTrackedClose++;
     }
 
-    // -- ORB-SLAM2 风格的三条条件 --
-    // c1a: 距上次关键帧超过 20 帧 → 强制插入
-    const bool c1a = mCurrentFrame.mnId >= mnLastKeyFrameId + 20;
-    // c1b: 距上次关键帧超过 3 帧 且 LocalMapping 空闲 → 插入（主要持续来源）
-    const bool c1b = (mCurrentFrame.mnId >= mnLastKeyFrameId + 3 && bLocalMappingIdle);
-    // c2: 跟踪比跌破参考关键帧的 0.75 → 插入
-    const bool c2 = (nRefMatches > 0 &&
-                     static_cast<float>(mnMatchesInliers) / static_cast<float>(nRefMatches) < 0.75f);
-    // c3: 跟踪点少且近点大量未跟踪 → 插入（提供三角化基线）
-    const bool c3 = (mnMatchesInliers < 50 && nNonTrackedClose > 70);
+    // 触发条件优化：
+    // c1: 距离上一关键帧较长 (如 > 30 帧) 强制插入
+    const bool c1 = mCurrentFrame.mnId >= mnLastKeyFrameId + 20;
+    // c2: 跟踪内点数大幅下降（跌破参考帧的 65%，原版是 75% 容易频繁触发）
+    const bool c2 = (nRefMatches > 0 && 
+                     static_cast<float>(mnMatchesInliers) / static_cast<float>(nRefMatches) < 0.70f);
+    // c3: 未跟踪的近点较多，需要补点
+    const bool c3 = (mnMatchesInliers < 40 && nNonTrackedClose > 100);
 
-    return (c1a || c1b || c2 || c3);
+    return (c1 || c2 || c3);
 }
 
 void Tracker::CreateNewKeyFrame()
