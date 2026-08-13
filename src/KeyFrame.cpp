@@ -150,18 +150,26 @@ void KeyFrame::UpdateConnections()
         vWeights.push_back(vPairs[i].first);
     }
 
-    // 4. 更新自身连接关系（加锁），并反向注册到邻居，实现双向连接
+    // 4. 更新自身的连接关系（加锁，持锁时间尽量短，只更新自己的数据）
     {
         std::unique_lock<std::mutex> lockCon(mMutexConnections);
         mConnectedKeyFrameWeights = KFcounter;
         mvpOrderedConnectedKeyFrames = vNeighbors;  // 降序
         mvOrderedWeights = vWeights;
-
-        // 反向注册：让每个邻居把自己的连接权重指向本关键帧
-        for (size_t i = 0; i < vNeighbors.size(); i++)
-            vNeighbors[i]->AddConnection(this,
-                mConnectedKeyFrameWeights[vNeighbors[i]]);
     }
+
+    // 5. 反向注册 + 生成树（Spanning Tree）建立。
+    //    这两步都会获取【其它】关键帧的锁，因此必须放在锁外执行，
+    //    否则会出现“持 this 锁 + 等 neighbor 锁”的嵌套解锁顺序，
+    //    与另一线程反向执行时构成 ABBA 死锁（程序卡死）。
+    for (size_t i = 0; i < vNeighbors.size(); i++)
+        vNeighbors[i]->AddConnection(this, KFcounter[vNeighbors[i]]);
+
+    //    生成树建立：只有在本关键帧还没有父节点时，才把它共视程度最高的
+    //    关键帧设为父节点。这样生成树会随关键帧插入逐步生长、保持连通，
+    //    且每个关键帧有且仅有一个父节点（不构成环）。
+    if (mpParent == nullptr && pKFmax != nullptr)
+        SetParent(pKFmax);
 }
 
 // 主动添加或修改一条共视连接
@@ -286,6 +294,8 @@ void KeyFrame::SetBadFlag()
 {
     std::map<KeyFrame *, int> connectedKFs;
     std::vector<MapPoint *> vpMP;
+    KeyFrame *pParent = nullptr;
+    std::set<KeyFrame *> vChildren;
 
     {
         std::unique_lock<std::mutex> lockCon(mMutexConnections);
@@ -293,30 +303,44 @@ void KeyFrame::SetBadFlag()
             return;
         mbBad = true;
         connectedKFs = mConnectedKeyFrameWeights; // 拷贝
+        pParent = mpParent;                       // 拷贝父节点
+        vChildren = mspChildren;                  // 拷贝子节点集合
     }
     {
         std::unique_lock<std::mutex> lockFeat(mMutexFeatures);
         vpMP = mvpMapPoints; // 拷贝
     }
 
-    // 1. 断开与所有相连关键帧的双向共视连接（基于拷贝，安全）
+    // 1. 维护生成树（Spanning Tree）：
+    //    1.1 先从父节点的子节点集合中移除自身
+    //    1.2 再把当前关键帧的所有子节点重新挂到父节点下，保证生成树仍然连通、仍是一棵树。
+    //        若当前关键帧本身是根（无父节点），则它的子节点将成为新的根节点。
+    //    这些调用各自会对 mMutexConnections 加锁，需在锁外执行，避免死锁。
+    if (pParent)
+        pParent->EraseChild(this);
+    for (auto it = vChildren.begin(); it != vChildren.end(); it++)
+        (*it)->SetParent(pParent); // SetParent(nullptr) 会让子节点成为孤立根，SetParent(pParent) 则改挂到父节点
+
+    // 2. 断开与所有相连关键帧的双向共视连接（基于拷贝，安全）
     for (auto mit = connectedKFs.begin(); mit != connectedKFs.end(); mit++)
         mit->first->EraseConnection(this);
 
-    // 2. 解除所有关联地图点对该关键帧的观测引用
+    // 3. 解除所有关联地图点对该关键帧的观测引用
     for (size_t i = 0; i < vpMP.size(); i++)
         if (vpMP[i])
             vpMP[i]->EraseObservation(this);
 
-    // 3. 清空自身的连接记录
+    // 4. 清空自身的连接记录与生成树成员关系
     {
         std::unique_lock<std::mutex> lockCon(mMutexConnections);
         mConnectedKeyFrameWeights.clear();
         mvpOrderedConnectedKeyFrames.clear();
         mvOrderedWeights.clear();
+        mpParent = nullptr;
+        mspChildren.clear();
     }
 
-    // 4. 从全局地图中删除自身
+    // 5. 从全局地图中删除自身
     mpMap->EraseKeyFrame(this);
 }
 
@@ -479,8 +503,11 @@ std::vector<size_t> KeyFrame::GetFeaturesInArea(
 
 void KeyFrame::SetParent(KeyFrame *pKF)
 {
-    std::unique_lock<std::mutex> lock(mMutexConnections);
-    mpParent = pKF;
+    {
+        std::unique_lock<std::mutex> lock(mMutexConnections);
+        mpParent = pKF;
+    }
+
     if (pKF)
         pKF->AddChild(this);
 }
