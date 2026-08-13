@@ -84,26 +84,16 @@ void Tracker::Track()
         if (mState == OK)
         {
             bWasOK = true;
-            int nFeat  = mCurrentFrame.N;
-            int nStereo = 0;
-            for (float d : mCurrentFrame.mvDepth)
-                if (d > 0) nStereo++;
-            std::cout << "[Track] frame " << mCurrentFrame.mnId
-                      << " | N=" << nFeat << " | stereoDepth=" << nStereo
-                      << " | prevState=OK" << std::endl;
 
             bool bMM = false, bRF = false, bLM = false;
             if (mLastFrame.mnId == mCurrentFrame.mnId - 1)
                 bMM = TrackWithMotionModel();
-            std::cout << "[Track] MotionModel=" << (bMM?"OK":"FAIL")
-                      << " inliers=" << mnMatchesInliers << std::endl;
+
             bRF = bRF || bMM;
 
             if (!bRF)
             {
                 bRF = TrackReferenceKeyFrame();
-                std::cout << "[Track] RefKeyFrame=" << (bRF?"OK":"FAIL")
-                          << " inliers=" << mnMatchesInliers << std::endl;
             }
 
             bOK = bRF;
@@ -111,21 +101,11 @@ void Tracker::Track()
             {
                 bLM = TrackLocalMap();
                 bOK = bLM;
-                std::cout << "[Track] LocalMap=" << (bLM?"OK":"FAIL")
-                          << " inliers=" << mnMatchesInliers << std::endl;
             }
-
-            if (!bOK)
-                std::cout << "[Track] >>> FRAME " << mCurrentFrame.mnId
-                          << " ALL TRACKING FAILED -> LOST" << std::endl;
         }
         else // 2. 系统丢失状态 (LOST)：触发重定位
         {
-            std::cout << "[Reloc] attempting relocalize on frame "
-                      << mCurrentFrame.mnId << std::endl;
             bOK = Relocalize();
-            std::cout << "[Reloc] result=" << (bOK?"OK":"FAIL")
-                      << " inliers=" << mnMatchesInliers << std::endl;
         }
 
         // 3. 跟踪或重定位结果处理
