@@ -588,56 +588,93 @@ bool Tracker::TrackLocalMap()
 
 bool Tracker::NeedNewKeyFrame()
 {
-    // 确保 LocalMapping 不会被外部 RequestStop 阻断
+    // 确保 LocalMapping 不会被外部阻断
     if (mpLocalMapper)
         mpLocalMapper->SetNotStop();
 
-    // 1. 如果局部建图队列里已经堆积了超过 2 个关键帧，坚决不再插入新帧！
-    // 强制等待后端消化，这是解决严重延迟的关键！
-    if (mpLocalMapper && mpLocalMapper->KeyframesInQueue())
-    {
-        // 队列里已有等待处理的关键帧，暂缓插入
-        return false; 
-    }
+    // 1. 如果局部建图线程被暂停，不插入
+    if (mpLocalMapper && mpLocalMapper->isStopped())
+        return false;
 
-    // 2. 跟踪到的点太少，位姿不可靠，不建帧
+    // 2. 跟踪到的内点太少，位姿不可靠，不建帧
     if (mnMatchesInliers < 15)
         return false;
 
-    // 3. 距离上一帧建帧的时间太短（例如小于 4 帧），直接拦截
-    // 原版条件中 (mCurrentFrame.mnId >= mnLastKeyFrameId + 3) 太敏感了
-    if (mCurrentFrame.mnId < mnLastKeyFrameId + 5)
-        return false;
+    const int nKFs = mpMap->GetKeyFramesInMap();
 
-    // 参考关键帧中被跟踪到的点数量
+    // 3. 【核心修复】：参考关键帧中有效的地图点总数
+    //    直接统计 mpReferenceKF 里所有非 bad 的地图点，不设 minObs 门槛！
     int nRefMatches = 0;
     if (mpReferenceKF)
     {
-        const std::vector<MapPoint *> vpRefMPs = mpReferenceKF->GetMapPointMatches();
+        // 原版 TrackedMapPoints(nMinObs) 中，只有 nKFs <= 2 时 minObs才为 2，
+        // 但最稳妥、最直观的是直接统计当前参考帧绑定的有效地图点数：
+        const std::vector<MapPoint*> vpRefMPs = mpReferenceKF->GetMapPointMatches();
         for (size_t i = 0; i < vpRefMPs.size(); i++)
+        {
             if (vpRefMPs[i] && !vpRefMPs[i]->isBad())
                 nRefMatches++;
+        }
     }
 
-    // 近点统计
+    // 避免除零异常
+    if (nRefMatches == 0)
+        nRefMatches = 1;
+
+    // 4. 双目近点统计
     int nNonTrackedClose = 0;
+    int nTrackedClose = 0;
     for (int i = 0; i < mCurrentFrame.N; i++)
     {
         if (mCurrentFrame.mvDepth[i] > 0 && mCurrentFrame.mvDepth[i] < mCurrentFrame.mThDepth)
-            if (!mCurrentFrame.mvpMapPoints[i] || mCurrentFrame.mvbOutlier[i])
+        {
+            if (mCurrentFrame.mvpMapPoints[i] && !mCurrentFrame.mvbOutlier[i])
+                nTrackedClose++;
+            else
                 nNonTrackedClose++;
+        }
     }
 
-    // 触发条件优化：
-    // c1: 距离上一关键帧较长 (如 > 30 帧) 强制插入
-    const bool c1 = mCurrentFrame.mnId >= mnLastKeyFrameId + 20;
-    // c2: 跟踪内点数大幅下降（跌破参考帧的 65%，原版是 75% 容易频繁触发）
-    const bool c2 = (nRefMatches > 0 && 
-                     static_cast<float>(mnMatchesInliers) / static_cast<float>(nRefMatches) < 0.70f);
-    // c3: 未跟踪的近点较多，需要补点
-    const bool c3 = (mnMatchesInliers < 40 && nNonTrackedClose > 100);
+    // 触发近点补充机制
+    bool bNeedToInsertClose = (nTrackedClose < 100) && (nNonTrackedClose > 70);
 
-    return (c1 || c2 || c3);
+    // 5. 比例与条件判断
+    float thRefRatio = (nKFs < 2) ? 0.40f : 0.75f;
+    const int nFramesPassed = mCurrentFrame.mnId - mnLastKeyFrameId;
+
+    // Condition 1a: 距离上一关键帧很长时间 (>= 20 帧)
+    const bool c1a = nFramesPassed >= 20;
+
+    // Condition 1b: 至少隔了 2 帧
+    const bool c1b = nFramesPassed >= 2;
+
+    // Condition 1c: 跟踪急剧衰减（跌破 25%）或急需补充近点
+    const bool c1c = (mnMatchesInliers < nRefMatches * 0.25f) || bNeedToInsertClose;
+
+    // Condition 2: 匹配点降到参考帧 75% 以下，或需要补近点；且内点 > 15
+    const bool c2 = ((mnMatchesInliers < nRefMatches * thRefRatio) || bNeedToInsertClose) && (mnMatchesInliers > 15);
+
+    // 日志打印（观察修复效果）
+    // std::cout << "[KF Check] Inliers: " << mnMatchesInliers 
+    //           << " | RefMatches: " << nRefMatches 
+    //           << " | Ratio: " << (float)mnMatchesInliers / nRefMatches 
+    //           << " | FrameDiff: " << nFramesPassed << std::endl;
+
+    // 6. 决策
+    if ((c1a || c1b || c1c) && c2)
+    {
+        // 只要队列里的阻塞数量少于 3 个，就允许插入
+        if (mpLocalMapper)
+        {
+            if (mpLocalMapper->KeyframesInQueue() < 3)
+                return true;
+            else
+                return false;
+        }
+        return true;
+    }
+
+    return false;
 }
 
 void Tracker::CreateNewKeyFrame()
