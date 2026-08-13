@@ -157,8 +157,8 @@ void LocalMapping::Run()
             SearchInNeighbors();
 
             // 5. 执行局部 BA 优化
-            if (!CheckNewKeyFrames())
-                Optimizer::LocalBundleAdjustment(mpMap);
+            // if (!CheckNewKeyFrames())
+            //     Optimizer::LocalBundleAdjustment(mpMap);
 
             // 6. 剔除冗余的关键帧（如果某关键帧 90% 以上的地图点能被其他至少3个关键帧看到）
             KeyFrameCulling();
