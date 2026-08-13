@@ -192,12 +192,18 @@ void KeyFrame::AddConnection(KeyFrame *pKF, const int &weight)
 void KeyFrame::UpdateBestCovisibles()
 {
     std::vector<std::pair<int, KeyFrame *>> vPairs;
-    vPairs.reserve(mConnectedKeyFrameWeights.size());
 
-    // 提取所有连接关系
-    for (auto mit = mConnectedKeyFrameWeights.begin(); mit != mConnectedKeyFrameWeights.end(); mit++)
-        vPairs.push_back(std::make_pair(mit->second, mit->first));
+    // 1. 在锁保护下读取连接权重（与 mConnectedKeyFrameWeights 的其它读写保持一致）
+    {
+        std::unique_lock<std::mutex> lock(mMutexConnections);
+        vPairs.reserve(mConnectedKeyFrameWeights.size());
 
+        // 提取所有连接关系
+        for (auto mit = mConnectedKeyFrameWeights.begin(); mit != mConnectedKeyFrameWeights.end(); mit++)
+            vPairs.push_back(std::make_pair(mit->second, mit->first));
+    }
+
+    // 2. 在锁外排序，尽量缩短持锁时间
     // 默认按 pair 的第一个元素（权重）进行升序排序
     std::sort(vPairs.begin(), vPairs.end());
 
@@ -213,9 +219,13 @@ void KeyFrame::UpdateBestCovisibles()
         vWeights.push_back(vPairs[i].first);
     }
 
-    // 更新内部列表
-    mvpOrderedConnectedKeyFrames = vNeighbors;
-    mvOrderedWeights = vWeights;
+    // 3. 在锁保护下写回内部有序列表（与读取方 GetBestCoviscibilityKeyFrames 等保持一致，
+    //    避免对 mvpOrderedConnectedKeyFrames / mvOrderedWeights 的并发读写造成数据竞争）
+    {
+        std::unique_lock<std::mutex> lock(mMutexConnections);
+        mvpOrderedConnectedKeyFrames = vNeighbors;
+        mvOrderedWeights = vWeights;
+    }
 }
 
 // 提取共视程度排名前 N 的关键帧
