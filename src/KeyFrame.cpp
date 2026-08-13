@@ -353,6 +353,37 @@ std::vector<KeyFrame*> KeyFrame::GetConnectedKeyFrames()
     return vKF;
 }
 
+// 获取权重（共视点数）大于等于指定值 w 的所有相连关键帧（按权重降序返回）
+// 与 ORB-SLAM2 原版语义一致：内部循环按权重降序扫描，碰到第一个小于 w 的就停止
+std::vector<KeyFrame *> KeyFrame::GetCovisibleByWeight(const int &w)
+{
+    std::unique_lock<std::mutex> lock(mMutexConnections);
+
+    if (mvpOrderedConnectedKeyFrames.empty())
+        return std::vector<KeyFrame *>();
+
+    std::vector<KeyFrame *> vKFs;
+    const int N = mvOrderedWeights.size();
+    for (int i = 0; i < N; i++)
+    {
+        if (mvOrderedWeights[i] < w)
+            break; // 权重降序，遇到小于阈值的直接停止
+        vKFs.push_back(mvpOrderedConnectedKeyFrames[i]);
+    }
+    return vKFs;
+}
+
+// 获取当前关键帧与指定关键帧之间的共视权重（共享地图点数量）
+// 若两者之间没有连接，返回 0
+int KeyFrame::GetWeight(KeyFrame *pKF)
+{
+    std::unique_lock<std::mutex> lock(mMutexConnections);
+    auto it = mConnectedKeyFrameWeights.find(pKF);
+    if (it != mConnectedKeyFrameWeights.end())
+        return it->second;
+    return 0;
+}
+
 void KeyFrame::ComputeBoW()
 {
     if(!mpORBvocabulary)
