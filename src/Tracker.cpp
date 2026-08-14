@@ -61,7 +61,6 @@ Eigen::Matrix4f Tracker::GrabImageStereo(const cv::Mat &imRectLeft, const cv::Ma
     return mCurrentFrame.mTcw;
 }
 
-// Tracker.cpp
 void Tracker::Track()
 {
     if (mState == NO_IMAGES_YET)
@@ -73,54 +72,84 @@ void Tracker::Track()
         {
             mState = OK;
             mLastFrame = Frame(mCurrentFrame);
+            mVelocity.setIdentity(); // 初始化后速度归零
+            std::cout << "[Tracking] 系统初始化成功！" << std::endl;
         }
     }
     else
     {
         bool bOK = false;
-        bool bWasOK = false;
+        bool bFromRelocalization = false; // 标记是否是通过重定位恢复的
 
-        // 系统正常状态 (OK)：尝试运动模型与参考帧跟踪
+        // 1. 系统正常跟踪状态
         if (mState == OK)
         {
-            bWasOK = true;
-
             bool bMM = false, bRF = false, bLM = false;
-            if (mLastFrame.mnId == mCurrentFrame.mnId - 1)
-                bMM = TrackWithMotionModel();
 
-            bRF = bRF || bMM;
-
-            if (!bRF)
+            // 1.1 优先尝试恒速模型
+            if (mLastFrame.mnId == mCurrentFrame.mnId - 1 && !mVelocity.isIdentity())
             {
-                bRF = TrackReferenceKeyFrame();
+                bMM = TrackWithMotionModel();
             }
 
+            // 1.2 若恒速模型失败，回退到参考关键帧跟踪
+            if (!bMM)
+            {
+                // 清空先前可能留下的不完整匹配，恢复位姿初值
+                mCurrentFrame.mvpMapPoints = std::vector<MapPoint *>(mCurrentFrame.N, static_cast<MapPoint *>(nullptr));
+                mCurrentFrame.SetPose(mLastFrame.mTcw);
+
+                bRF = TrackReferenceKeyFrame();
+            }
+            else
+            {
+                bRF = true;
+            }
+
+            // 1.3 粗追踪成功后，再进行局部地图追踪 (TrackLocalMap)
             bOK = bRF;
             if (bOK)
             {
                 bLM = TrackLocalMap();
                 bOK = bLM;
             }
+
+            if (!bOK)
+            {
+                std::cout << "[Tracking 警告] 帧 ID " << mCurrentFrame.mnId 
+                          << " 跟踪丢失！(MM:" << bMM << ", RefKF:" << bRF << ", LocalMap:" << bLM << ")" << std::endl;
+            }
         }
-        else //系统丢失状态 (LOST)：触发重定位
+        else // 2. 系统丢失状态 (mState == LOST)
         {
-            bOK = Relocalize();
+            std::cout << "[Tracking] 帧 ID " << mCurrentFrame.mnId << " 处于 LOST 状态，准备执行重定位..." << std::endl;
+            bOK = Relocalize(); // 调用重定位
+            if (bOK)
+            {
+                bFromRelocalization = true; // 标记来自重定位
+            }
         }
 
-        // 跟踪或重定位结果处理
+        // 3. 状态更新与位姿预测更新
         if (bOK)
         {
             mState = OK;
-            // 恒速模型速度：T_c_current * inv(T_c_last) = T_current_last。
-            // 仅在正常连续跟踪时更新；刚重定位成功时保持单位阵，避免旧速度误导。
-            if (bWasOK)
-                mVelocity = mCurrentFrame.mTcw * mLastFrame.mTcw.inverse();
-            else
-                mVelocity = Eigen::Matrix4f::Identity();
 
+            // 💡 关键修复：重定位成功时不能计算速度，必须重置；只有正常跟踪时才更新 mVelocity
+            if (bFromRelocalization)
+            {
+                mVelocity.setIdentity();
+            }
+            else
+            {
+                mVelocity = mCurrentFrame.mTcw * mLastFrame.mTcw.inverse();
+            }
+
+            // 是否需要插入新的关键帧
             if (NeedNewKeyFrame())
+            {
                 CreateNewKeyFrame();
+            }
 
             if (mpViewer)
                 mpViewer->UpdateCurrentCameraPose(mCurrentFrame.mTcw);
@@ -128,16 +157,18 @@ void Tracker::Track()
         else
         {
             mState = LOST;
-            mVelocity.setIdentity(); // 丢失状态下清空速度
+            mVelocity.setIdentity(); // 丢失时清空速度
         }
 
+        // 保存上一帧
         mLastFrame = Frame(mCurrentFrame);
     }
 
     if (mpFrameDrawer)
         mpFrameDrawer->Update(this);
 
-    if (!mCurrentFrame.mTcw.hasNaN() && !mCurrentFrame.mTcw.isZero())
+    // 4. 轨迹与历史记录保存 (💡 关键修复：加入 mState == OK 的判断)
+    if (mState == OK && !mCurrentFrame.mTcw.hasNaN() && !mCurrentFrame.mTcw.isZero())
     {
         Eigen::Matrix4f Tcr = Eigen::Matrix4f::Identity();
         if (mpReferenceKF && !mpReferenceKF->mbBad)
@@ -152,15 +183,16 @@ void Tracker::Track()
         mlRelativeFramePoses.push_back(Tcr);
         mlpReferences.push_back(mpReferenceKF);
         mlFrameTimes.push_back(mCurrentFrame.mTimeStamp);
-        mlbLost.push_back(mState == LOST);
+        mlbLost.push_back(false);
     }
     else
     {
+        // 记录丢失帧
         if (!mlRelativeFramePoses.empty())
         {
             mlRelativeFramePoses.push_back(mlRelativeFramePoses.back());
             mlpReferences.push_back(mlpReferences.back());
-            mlFrameTimes.push_back(mlFrameTimes.back());
+            mlFrameTimes.push_back(mCurrentFrame.mTimeStamp);
         }
         else
         {
@@ -323,12 +355,20 @@ bool Tracker::Relocalize()
         mCurrentFrame.ComputeBoW();
 
     if (!mpKeyFrameDB)
+    {
+        std::cout << "  └─ [Relocalize] KeyFrameDB 为空！" << std::endl;
         return false;
+    }
 
     // 利用 KeyFrameDatabase 寻找候选关键帧
     std::vector<KeyFrame *> vpCandidateKFs = mpKeyFrameDB->DetectRelocalizationCandidates(&mCurrentFrame);
     if (vpCandidateKFs.empty())
+    {
+        std::cout << "  └─ [Relocalize] 未检索到词袋候选帧" << std::endl;
         return false;
+    }
+
+    std::cout << "  └─ [Relocalize] 检索到 " << vpCandidateKFs.size() << " 个候选帧，开始 PnP 匹配..." << std::endl;
 
     ORBmatcher matcher(0.75, true);
 
@@ -338,13 +378,11 @@ bool Tracker::Relocalize()
             continue;
 
         std::vector<MapPoint *> vpMapPointMatches;
-        // 通过 SearchByBoW 获取匹配关系
         int nmatches = matcher.SearchByBoW(pKF, mCurrentFrame, vpMapPointMatches);
 
         if (nmatches < 8)
             continue;
 
-        // 整理用于 PnP 的 3D-2D 点对
         std::vector<cv::Point3f> vPts3D;
         std::vector<cv::Point2f> vPts2D;
         std::vector<int> vMapPointIndices;
@@ -364,14 +402,13 @@ bool Tracker::Relocalize()
         if (vPts3D.size() < 8)
             continue;
 
-        // 使用 solvePnPRansac 硬算初始相机位姿
         cv::Mat rvec, tvec;
         std::vector<int> inliersPnP;
 
         bool bPnPSuccess = cv::solvePnPRansac(
-            vPts3D, vPts2D, 
-            mCurrentFrame.mK, mCurrentFrame.mDistCoef, 
-            rvec, tvec, 
+            vPts3D, vPts2D,
+            mCurrentFrame.mK, mCurrentFrame.mDistCoef,
+            rvec, tvec,
             false, 300, 8.0f, 0.99, inliersPnP, cv::SOLVEPNP_EPNP);
 
         if (!bPnPSuccess || inliersPnP.size() < 6)
@@ -390,7 +427,6 @@ bool Tracker::Relocalize()
             }
         }
 
-        // 关联内点匹配并设置位姿初值
         mCurrentFrame.mvpMapPoints = std::vector<MapPoint *>(mCurrentFrame.N, static_cast<MapPoint *>(nullptr));
         for (int inlierIdx : inliersPnP)
         {
@@ -400,7 +436,6 @@ bool Tracker::Relocalize()
 
         mCurrentFrame.SetPose(Tcw_pnp);
 
-        // 以 PnP 为良好初值，进行优化
         int nInliers = MotionOnlyBA::Optimize(&mCurrentFrame);
 
         if (nInliers >= 8)
@@ -418,21 +453,21 @@ bool Tracker::Relocalize()
             mnLastKeyFrameId = mCurrentFrame.mnId;
             mnMatchesInliers = nInliers;
 
-            std::cout << "[Relocalize SUCCESS] PnP 重定位成功恢复！帧 ID: " << mCurrentFrame.mnId 
+            std::cout << "  └─ [Relocalize SUCCESS] 重定位成功恢复！参考 KF ID: " << pKF->mnId
                       << " | 匹配点数: " << nInliers << std::endl;
             return true;
         }
     }
 
+    std::cout << "  └─ [Relocalize FAILED] PnP / BA 校验均未通过" << std::endl;
     return false;
 }
 
 bool Tracker::TrackLocalMap()
 {
-    // 搜集局部地图关键帧 (Local KeyFrames)
+    // 1. 搜集局部地图关键帧 (Local KeyFrames)
     std::vector<KeyFrame *> vpLocalKeyFrames;
 
-    // 将当前匹配点对应的 KeyFrame 放入局部关键帧列表
     for (int i = 0; i < mCurrentFrame.N; i++)
     {
         if (mCurrentFrame.mvpMapPoints[i])
@@ -443,17 +478,20 @@ bool Tracker::TrackLocalMap()
                 const std::map<KeyFrame *, size_t> observations = pMP->GetObservations();
                 for (auto mit = observations.begin(); mit != observations.end(); mit++)
                 {
-                    vpLocalKeyFrames.push_back(mit->first);
+                    if (!mit->first->mbBad)
+                        vpLocalKeyFrames.push_back(mit->first);
                 }
             }
         }
     }
 
+    if (vpLocalKeyFrames.empty())
+        return false;
+
     std::sort(vpLocalKeyFrames.begin(), vpLocalKeyFrames.end());
     vpLocalKeyFrames.erase(std::unique(vpLocalKeyFrames.begin(), vpLocalKeyFrames.end()), vpLocalKeyFrames.end());
 
-    // 增加每个局部关键帧的最佳共视邻居，扩大局部地图覆盖范围，
-    // 避免局部地图只跟随"当前已匹配点"，从而缓解匹配点萎缩的恶性循环
+    // 2. 增加每个局部关键帧的最佳共视邻居
     std::vector<KeyFrame *> vpLocalKFWithNeighbors = vpLocalKeyFrames;
     for (KeyFrame *pKF : vpLocalKeyFrames)
     {
@@ -462,7 +500,7 @@ bool Tracker::TrackLocalMap()
         std::vector<KeyFrame *> vNeighs = pKF->GetBestCovisibilityKeyFrames(10);
         for (KeyFrame *pN : vNeighs)
         {
-            if (!pN->mbBad)
+            if (pN && !pN->mbBad)
                 vpLocalKFWithNeighbors.push_back(pN);
         }
     }
@@ -470,10 +508,7 @@ bool Tracker::TrackLocalMap()
     vpLocalKFWithNeighbors.erase(std::unique(vpLocalKFWithNeighbors.begin(), vpLocalKFWithNeighbors.end()),
                                  vpLocalKFWithNeighbors.end());
 
-    if (vpLocalKFWithNeighbors.empty())
-        return false;
-
-    // 搜集局部地图点 (Local MapPoints) 并剔除已匹配的点
+    // 3. 搜集局部地图点 (Local MapPoints)
     std::vector<MapPoint *> vpLocalMapPoints;
     for (KeyFrame *pKF : vpLocalKFWithNeighbors)
     {
@@ -482,7 +517,6 @@ bool Tracker::TrackLocalMap()
         {
             if (!pMP || pMP->isBad())
                 continue;
-            // 避免重复添加
             if (std::find(vpLocalMapPoints.begin(), vpLocalMapPoints.end(), pMP) == vpLocalMapPoints.end())
             {
                 vpLocalMapPoints.push_back(pMP);
@@ -490,16 +524,18 @@ bool Tracker::TrackLocalMap()
         }
     }
 
-    // 将局部地图点投影到当前帧进行二次匹配
+    // 4. 将局部地图点投影到当前帧进行匹配
     ORBmatcher matcher(0.8, true);
     int nMatches = 0;
+
+    Eigen::Matrix3f Rcw = mCurrentFrame.mTcw.block<3, 3>(0, 0);
+    Eigen::Vector3f tcw = mCurrentFrame.mTcw.block<3, 1>(0, 3);
 
     for (MapPoint *pMP : vpLocalMapPoints)
     {
         if (pMP->isBad())
             continue;
 
-        // 检查该地图点是否已在当前帧匹配过
         bool bAlreadyFound = false;
         for (int i = 0; i < mCurrentFrame.N; i++)
         {
@@ -513,12 +549,12 @@ bool Tracker::TrackLocalMap()
         if (bAlreadyFound)
             continue;
 
-        // 将地图点投影到当前帧像素平面
+        // 计算相机坐标系坐标
         Eigen::Vector3f P_w = pMP->GetWorldPos();
-        Eigen::Vector3f P_c = mCurrentFrame.GetRotationInverse().transpose() * P_w + mCurrentFrame.mTcw.block<3, 1>(0, 3);
+        Eigen::Vector3f P_c = Rcw * P_w + tcw;
 
         if (P_c[2] <= 0)
-            continue; // 剔除相机后方的点
+            continue; // 剔除深度非正的点
 
         // 计算投影像素坐标
         float u = Frame::fx * P_c[0] / P_c[2] + Frame::cx;
@@ -527,8 +563,8 @@ bool Tracker::TrackLocalMap()
         if (u < Frame::mnMinX || u >= Frame::mnMaxX || v < Frame::mnMinY || v >= Frame::mnMaxY)
             continue;
 
-        // 在投影区域 (半径 5~10 像素) 内查找的最佳描述子点
-        std::vector<size_t> vIndices = mCurrentFrame.GetFeaturesInArea(u, v, 5.0f);
+        // 💡 修复：扩大搜索半径（从原有的 5.0f 增加到 12.0f）以容忍小漂移
+        std::vector<size_t> vIndices = mCurrentFrame.GetFeaturesInArea(u, v, 12.0f);
         if (vIndices.empty())
             continue;
 
@@ -538,9 +574,8 @@ bool Tracker::TrackLocalMap()
         for (size_t idx : vIndices)
         {
             if (mCurrentFrame.mvpMapPoints[idx])
-                continue; // 该像素特征点已有匹配
+                continue;
 
-            // 比对描述子距离
             cv::Mat dMP = pMP->GetDescriptor();
             cv::Mat dFrame = mCurrentFrame.mDescriptors.row(idx);
             int dist = ORBmatcher::DescriptorDistance(dMP, dFrame);
@@ -552,7 +587,6 @@ bool Tracker::TrackLocalMap()
             }
         }
 
-        // 若匹配质量达标则建立关联
         if (bestDist < ORBmatcher::TH_HIGH && bestIdx >= 0)
         {
             mCurrentFrame.mvpMapPoints[bestIdx] = pMP;
@@ -560,10 +594,10 @@ bool Tracker::TrackLocalMap()
         }
     }
 
-    // 第二次精细位姿优化 (Motion-Only BA)
+    // 5. 位姿优化 (Motion-Only BA)
     int nInliers = MotionOnlyBA::Optimize(&mCurrentFrame);
 
-    // 更新内点标记并统计
+    // 6. 更新内点标记
     mnMatchesInliers = 0;
     for (int i = 0; i < mCurrentFrame.N; i++)
     {
@@ -581,8 +615,7 @@ bool Tracker::TrackLocalMap()
         }
     }
 
-    // 局部地图跟踪成功的最低内点门槛（略低于原版 30，降低误判丢失的几率）
-    return mnMatchesInliers >= 20;
+    return mnMatchesInliers >= 12;
 }
 
 bool Tracker::NeedNewKeyFrame()
