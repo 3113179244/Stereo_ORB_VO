@@ -80,7 +80,7 @@ void Tracker::Track()
         bool bOK = false;
         bool bWasOK = false;
 
-        // 1. 系统正常状态 (OK)：尝试运动模型与参考帧跟踪
+        // 系统正常状态 (OK)：尝试运动模型与参考帧跟踪
         if (mState == OK)
         {
             bWasOK = true;
@@ -103,12 +103,12 @@ void Tracker::Track()
                 bOK = bLM;
             }
         }
-        else // 2. 系统丢失状态 (LOST)：触发重定位
+        else //系统丢失状态 (LOST)：触发重定位
         {
             bOK = Relocalize();
         }
 
-        // 3. 跟踪或重定位结果处理
+        // 跟踪或重定位结果处理
         if (bOK)
         {
             mState = OK;
@@ -136,6 +136,40 @@ void Tracker::Track()
 
     if (mpFrameDrawer)
         mpFrameDrawer->Update(this);
+
+    if (!mCurrentFrame.mTcw.hasNaN() && !mCurrentFrame.mTcw.isZero())
+    {
+        Eigen::Matrix4f Tcr = Eigen::Matrix4f::Identity();
+        if (mpReferenceKF && !mpReferenceKF->mbBad)
+        {
+            Tcr = mCurrentFrame.mTcw * mpReferenceKF->GetPoseInverse();
+        }
+        else
+        {
+            Tcr = mCurrentFrame.mTcw;
+        }
+
+        mlRelativeFramePoses.push_back(Tcr);
+        mlpReferences.push_back(mpReferenceKF);
+        mlFrameTimes.push_back(mCurrentFrame.mTimeStamp);
+        mlbLost.push_back(mState == LOST);
+    }
+    else
+    {
+        if (!mlRelativeFramePoses.empty())
+        {
+            mlRelativeFramePoses.push_back(mlRelativeFramePoses.back());
+            mlpReferences.push_back(mlpReferences.back());
+            mlFrameTimes.push_back(mlFrameTimes.back());
+        }
+        else
+        {
+            mlRelativeFramePoses.push_back(Eigen::Matrix4f::Identity());
+            mlpReferences.push_back(nullptr);
+            mlFrameTimes.push_back(mCurrentFrame.mTimeStamp);
+        }
+        mlbLost.push_back(true);
+    }
 }
 
 bool Tracker::StereoInitialization()
@@ -176,7 +210,7 @@ bool Tracker::StereoInitialization()
             mpMap->AddMapPoint(pMP);
             mCurrentFrame.mvpMapPoints[i] = pMP;
         }
-    }   
+    }
 
     // 关键帧插入后台：将初始化关键帧推送到 LocalMapping 线程
     if (mpLocalMapper)
@@ -285,146 +319,111 @@ bool Tracker::TrackReferenceKeyFrame()
 
 bool Tracker::Relocalize()
 {
-    // 计算当前帧的 BoW 向量（若尚未计算）
     if (mCurrentFrame.mBowVec.empty())
         mCurrentFrame.ComputeBoW();
 
     if (!mpKeyFrameDB)
         return false;
 
-    // 从关键帧数据库获取用于重定位的候选关键帧
+    // 利用 KeyFrameDatabase 寻找候选关键帧
     std::vector<KeyFrame *> vpCandidateKFs = mpKeyFrameDB->DetectRelocalizationCandidates(&mCurrentFrame);
     if (vpCandidateKFs.empty())
-    {
-        std::cout << "[Reloc]   no reloc candidates (BoW shared words=0)" << std::endl;
         return false;
-    }
-    std::cout << "[Reloc]   got " << vpCandidateKFs.size() << " candidates" << std::endl;
 
     ORBmatcher matcher(0.75, true);
 
-    // 依次尝试每个候选关键帧，直到找到一个满足内点门槛的候选
     for (KeyFrame *pKF : vpCandidateKFs)
     {
         if (!pKF || pKF->mbBad)
             continue;
 
-        // 通过 BoW 在候选关键帧与当前帧之间建立特征匹配
         std::vector<MapPoint *> vpMapPointMatches;
+        // 通过 SearchByBoW 获取匹配关系
         int nmatches = matcher.SearchByBoW(pKF, mCurrentFrame, vpMapPointMatches);
 
-        // 匹配点太少，直接跳过该候选
-        if (nmatches < 15)
-        {
-            std::cout << "[Reloc]   candidate kfId=" << pKF->mnId
-                      << " BoWmatches=" << nmatches << " (skip<15)" << std::endl;
+        if (nmatches < 8)
             continue;
-        }
 
-        // 将匹配到的地图点赋给当前帧
-        mCurrentFrame.mvpMapPoints = std::vector<MapPoint *>(mCurrentFrame.N, static_cast<MapPoint *>(nullptr));
+        // 整理用于 PnP 的 3D-2D 点对
+        std::vector<cv::Point3f> vPts3D;
+        std::vector<cv::Point2f> vPts2D;
+        std::vector<int> vMapPointIndices;
+
         for (int i = 0; i < mCurrentFrame.N; i++)
         {
-            if (vpMapPointMatches[i])
-                mCurrentFrame.mvpMapPoints[i] = vpMapPointMatches[i];
+            MapPoint *pMP = vpMapPointMatches[i];
+            if (pMP && !pMP->isBad())
+            {
+                Eigen::Vector3f P3D = pMP->GetWorldPos();
+                vPts3D.push_back(cv::Point3f(P3D.x(), P3D.y(), P3D.z()));
+                vPts2D.push_back(mCurrentFrame.mvKeysUn[i].pt);
+                vMapPointIndices.push_back(i);
+            }
         }
 
-        // 以候选关键帧的位姿作为当前帧位姿初值
-        mCurrentFrame.SetPose(pKF->GetPose());
+        if (vPts3D.size() < 8)
+            continue;
 
-        // Motion-Only BA 优化当前帧位姿
+        // 使用 solvePnPRansac 硬算初始相机位姿
+        cv::Mat rvec, tvec;
+        std::vector<int> inliersPnP;
+
+        bool bPnPSuccess = cv::solvePnPRansac(
+            vPts3D, vPts2D, 
+            mCurrentFrame.mK, mCurrentFrame.mDistCoef, 
+            rvec, tvec, 
+            false, 300, 8.0f, 0.99, inliersPnP, cv::SOLVEPNP_EPNP);
+
+        if (!bPnPSuccess || inliersPnP.size() < 6)
+            continue;
+
+        cv::Mat R_cv;
+        cv::Rodrigues(rvec, R_cv);
+
+        Eigen::Matrix4f Tcw_pnp = Eigen::Matrix4f::Identity();
+        for (int r = 0; r < 3; r++)
+        {
+            Tcw_pnp(r, 3) = static_cast<float>(tvec.at<double>(r));
+            for (int c = 0; c < 3; c++)
+            {
+                Tcw_pnp(r, c) = static_cast<float>(R_cv.at<double>(r, c));
+            }
+        }
+
+        // 关联内点匹配并设置位姿初值
+        mCurrentFrame.mvpMapPoints = std::vector<MapPoint *>(mCurrentFrame.N, static_cast<MapPoint *>(nullptr));
+        for (int inlierIdx : inliersPnP)
+        {
+            int frameIdx = vMapPointIndices[inlierIdx];
+            mCurrentFrame.mvpMapPoints[frameIdx] = vpMapPointMatches[frameIdx];
+        }
+
+        mCurrentFrame.SetPose(Tcw_pnp);
+
+        // 以 PnP 为良好初值，进行优化
         int nInliers = MotionOnlyBA::Optimize(&mCurrentFrame);
 
-        // ---- 若第一轮匹配内点偏少，则基于优化后的位姿初值，将候选KF的
-        //      未匹配地图点投影到当前帧做局部窗口补充匹配，再重新优化 ----
-        if (nInliers >= 10 && nInliers < 20)
+        if (nInliers >= 8)
         {
-            const Eigen::Matrix3f Rcw = mCurrentFrame.mTcw.block<3, 3>(0, 0);
-            const Eigen::Vector3f tcw = mCurrentFrame.mTcw.block<3, 1>(0, 3);
-
-            std::vector<MapPoint *> vpMPsKF = pKF->GetMapPointMatches();
-            for (MapPoint *pMP : vpMPsKF)
-            {
-                if (!pMP || pMP->isBad())
-                    continue;
-
-                // 跳过已经被匹配的点
-                bool bMatched = false;
-                for (int i = 0; i < mCurrentFrame.N; i++)
-                {
-                    if (mCurrentFrame.mvpMapPoints[i] == pMP)
-                    {
-                        bMatched = true;
-                        break;
-                    }
-                }
-                if (bMatched)
-                    continue;
-
-                // 将地图点投影到当前帧
-                Eigen::Vector3f P_w = pMP->GetWorldPos();
-                Eigen::Vector3f P_c = Rcw * P_w + tcw;
-                if (P_c[2] <= 0)
-                    continue;
-
-                float u = Frame::fx * P_c[0] / P_c[2] + Frame::cx;
-                float v = Frame::fy * P_c[1] / P_c[2] + Frame::cy;
-                if (u < Frame::mnMinX || u >= Frame::mnMaxX || v < Frame::mnMinY || v >= Frame::mnMaxY)
-                    continue;
-
-                std::vector<size_t> vIndices = mCurrentFrame.GetFeaturesInArea(u, v, 7.0f);
-                if (vIndices.empty())
-                    continue;
-
-                int bestDist = 255;
-                int bestIdx = -1;
-                for (size_t idx : vIndices)
-                {
-                    if (mCurrentFrame.mvpMapPoints[idx])
-                        continue;
-
-                    cv::Mat dMP = pMP->GetDescriptor();
-                    cv::Mat dFrame = mCurrentFrame.mDescriptors.row(idx);
-                    int dist = ORBmatcher::DescriptorDistance(dMP, dFrame);
-                    if (dist < bestDist)
-                    {
-                        bestDist = dist;
-                        bestIdx = idx;
-                    }
-                }
-
-                if (bestDist < ORBmatcher::TH_HIGH && bestIdx >= 0)
-                    mCurrentFrame.mvpMapPoints[bestIdx] = pMP;
-            }
-
-            // 补充匹配后再次优化位姿
-            nInliers = MotionOnlyBA::Optimize(&mCurrentFrame);
-        }
-
-        std::cout << "[Reloc]   candidate kfId=" << pKF->mnId
-                  << " finalInliers=" << nInliers << " (need>=10)" << std::endl;
-
-        if (nInliers >= 10)
-        {
-            // 剔除优化后仍被判定为外点的匹配
             for (int i = 0; i < mCurrentFrame.N; i++)
             {
                 if (mCurrentFrame.mvpMapPoints[i] && mCurrentFrame.mvbOutlier[i])
                 {
-                    mCurrentFrame.mvpMapPoints[i] = static_cast<MapPoint *>(nullptr);
+                    mCurrentFrame.mvpMapPoints[i] = nullptr;
                     mCurrentFrame.mvbOutlier[i] = false;
                 }
             }
 
-            // 设定新的参考关键帧
             mpReferenceKF = pKF;
             mnLastKeyFrameId = mCurrentFrame.mnId;
             mnMatchesInliers = nInliers;
+
+            std::cout << "[Relocalize SUCCESS] PnP 重定位成功恢复！帧 ID: " << mCurrentFrame.mnId 
+                      << " | 匹配点数: " << nInliers << std::endl;
             return true;
         }
     }
 
-    // 所有候选均未满足门槛，重定位失败
     return false;
 }
 
@@ -609,7 +608,7 @@ bool Tracker::NeedNewKeyFrame()
     {
         // 原版 TrackedMapPoints(nMinObs) 中，只有 nKFs <= 2 时 minObs才为 2，
         // 但最稳妥、最直观的是直接统计当前参考帧绑定的有效地图点数：
-        const std::vector<MapPoint*> vpRefMPs = mpReferenceKF->GetMapPointMatches();
+        const std::vector<MapPoint *> vpRefMPs = mpReferenceKF->GetMapPointMatches();
         for (size_t i = 0; i < vpRefMPs.size(); i++)
         {
             if (vpRefMPs[i] && !vpRefMPs[i]->isBad())
@@ -655,9 +654,9 @@ bool Tracker::NeedNewKeyFrame()
     const bool c2 = ((mnMatchesInliers < nRefMatches * thRefRatio) || bNeedToInsertClose) && (mnMatchesInliers > 15);
 
     // 日志打印（观察修复效果）
-    // std::cout << "[KF Check] Inliers: " << mnMatchesInliers 
-    //           << " | RefMatches: " << nRefMatches 
-    //           << " | Ratio: " << (float)mnMatchesInliers / nRefMatches 
+    // std::cout << "[KF Check] Inliers: " << mnMatchesInliers
+    //           << " | RefMatches: " << nRefMatches
+    //           << " | Ratio: " << (float)mnMatchesInliers / nRefMatches
     //           << " | FrameDiff: " << nFramesPassed << std::endl;
 
     // 6. 决策
@@ -733,4 +732,9 @@ void Tracker::Reset()
     mState = NOT_INITIALIZED;
     mVelocity.setIdentity();
     mpReferenceKF = nullptr;
+    // 清空历史轨迹记录
+    mlRelativeFramePoses.clear();
+    mlpReferences.clear();
+    mlFrameTimes.clear();
+    mlbLost.clear();
 }
