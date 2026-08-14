@@ -133,15 +133,10 @@ int main(int argc, char **argv)
     }
 
     cv::destroyAllWindows();
-
-    // 保存逐帧轨迹（KITTI 格式，供 evo 评估；每行 12 个数，无时间戳）
-    // 方案C：改为保存「每一帧」的轨迹而非「关键帧」轨迹，使行数与图像帧数一致，
-    //        从而与 KITTI ground truth（如 04.txt）逐行对齐评估，
-    //        解决 evo_ape 报 "data matrices must have the same shape" 的问题。
     std::string strTrajDir = "/home/wzj/output";
-    cv::utils::fs::createDirectories(strTrajDir);  // 确保输出目录存在（不存在则创建）
-    std::string strTrajFile = strTrajDir + "/trajectory.txt";
-    SLAM.SaveFrameTrajectoryKITTI(strTrajFile);
+    cv::utils::fs::createDirectories(strTrajDir); 
+    std::string strTrajFile = strTrajDir + "/CameraTrajectory.txt";
+    SLAM.SaveTrajectoryKITTI(strTrajFile);
 
     return 0;
 }

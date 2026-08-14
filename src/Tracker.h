@@ -43,6 +43,10 @@ public:
     Frame mCurrentFrame;
     Frame mLastFrame;
     cv::Mat mImGray;
+    std::list<Eigen::Matrix4f> mlRelativeFramePoses; // 相对于参考关键帧的相对位姿 T_cr
+    std::list<KeyFrame*> mlpReferences;             // 对应的参考关键帧指针
+    std::list<double> mlFrameTimes;                 // 每一帧的时间戳
+    std::list<bool> mlbLost;                        // 追踪丢失标记
 private:
     void Track();
     bool StereoInitialization();

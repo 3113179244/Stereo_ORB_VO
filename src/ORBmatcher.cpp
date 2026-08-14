@@ -362,66 +362,56 @@ int ORBmatcher::SearchByProjection(
 
 int ORBmatcher::SearchByBoW(KeyFrame *pKF, Frame &F, std::vector<MapPoint *> &vpMapPointMatches)
 {
-    // 初始化输出地图点匹配向量，大小与当前帧特征点数 N 一致，默认填 nullptr
     vpMapPointMatches = std::vector<MapPoint *>(F.N, static_cast<MapPoint *>(nullptr));
 
-    // 获取 KeyFrame 对应的地图点和描述子
     const std::vector<MapPoint *> vpMapPointsKF = pKF->GetMapPointMatches();
     const cv::Mat &DescriptorsKF = pKF->mDescriptors;
 
-    // 确保两者的 BoW 向量已计算（如果为空则计算）
     pKF->ComputeBoW();
     F.ComputeBoW();
 
     int nmatches = 0;
-
-    // 用于方向一致性检查的直方图
     std::vector<int> rotHist[HISTO_LENGTH];
     int histo[HISTO_LENGTH] = {0};
     const float rotFactor = static_cast<float>(HISTO_LENGTH) / 360.0f;
 
-    // 特征点双指针/迭代器交集比对：利用 DBow3::FeatureVector 的升序有序性
-    DBoW3::FeatureVector::const_iterator KFit = pKF->mFeatVec.begin();
-    DBoW3::FeatureVector::const_iterator Fit = F.mFeatVec.begin();
-    DBoW3::FeatureVector::const_iterator KFend = pKF->mFeatVec.end();
-    DBoW3::FeatureVector::const_iterator Fend = F.mFeatVec.end();
+    const DBoW3::FeatureVector &vFeatVecKF = pKF->mFeatVec;
+    const DBoW3::FeatureVector &vFeatVecF = F.mFeatVec;
+
+    auto KFit = vFeatVecKF.begin();
+    auto Fit = vFeatVecF.begin();
+    auto KFend = vFeatVecKF.end();
+    auto Fend = vFeatVecF.end();
 
     while (KFit != KFend && Fit != Fend)
     {
-        // 如果节点 ID 相同，说明属于同一个词袋节点下的特征，进行详细比对
         if (KFit->first == Fit->first)
         {
             const std::vector<unsigned int> &vIndicesKF = KFit->second;
             const std::vector<unsigned int> &vIndicesF = Fit->second;
 
-            // 遍历 KeyFrame 在当前节点下的所有特征点
             for (size_t iKF = 0; iKF < vIndicesKF.size(); iKF++)
             {
                 const unsigned int realIdxKF = vIndicesKF[iKF];
                 MapPoint *pMP = vpMapPointsKF[realIdxKF];
 
-                // 排除无效或处于 Outlier 的地图点
                 if (!pMP || pMP->isBad())
                     continue;
 
                 const cv::Mat &dKF = DescriptorsKF.row(realIdxKF);
 
-                int bestDist = TH_LOW;       // 最优距离（上限50）
-                int secondBestDist = TH_LOW; // 次优距离
+                int bestDist = TH_LOW;
+                int secondBestDist = TH_LOW;
                 int bestIdxF = -1;
 
-                // 遍历当前 Frame 在同一节点下的所有特征点
                 for (size_t iF = 0; iF < vIndicesF.size(); iF++)
                 {
                     const unsigned int realIdxF = vIndicesF[iF];
 
-                    // 如果该特征点已经分配了地图点，则跳过
                     if (vpMapPointMatches[realIdxF])
                         continue;
 
                     const cv::Mat &dF = F.mDescriptors.row(realIdxF);
-
-                    // 计算 ORB 汉明距离
                     const int dist = DescriptorDistance(dKF, dF);
 
                     if (dist < bestDist)
@@ -436,50 +426,40 @@ int ORBmatcher::SearchByBoW(KeyFrame *pKF, Frame &F, std::vector<MapPoint *> &vp
                     }
                 }
 
-                // 筛选条件：最佳匹配须小于阈值，且通过 NN Ratio 比例校验
                 if (bestDist < TH_LOW)
                 {
                     if (static_cast<float>(bestDist) < mfNNratio * static_cast<float>(secondBestDist))
                     {
-                        // 匹配成功
                         vpMapPointMatches[bestIdxF] = pMP;
-                        const cv::KeyPoint &kpKF = pKF->mvKeysUn[realIdxKF];
-                        const cv::KeyPoint &kpF = F.mvKeysUn[bestIdxF];
 
-                        // 4. 统计主方向角度差，用于旋转一致性筛选
                         if (mbCheckOrientation)
                         {
-                            float rot = kpKF.angle - kpF.angle;
-                            if (rot < 0.0f)
-                                rot += 360.0f;
-
+                            float rot = pKF->mvKeysUn[realIdxKF].angle - F.mvKeysUn[bestIdxF].angle;
+                            if (rot < 0.0f) rot += 360.0f;
                             int bin = cvRound(rot * rotFactor);
-                            if (bin == HISTO_LENGTH)
-                                bin = 0;
+                            if (bin == HISTO_LENGTH) bin = 0;
 
                             rotHist[bin].push_back(bestIdxF);
                             histo[bin]++;
                         }
-
                         nmatches++;
                     }
                 }
             }
-
             KFit++;
             Fit++;
         }
         else if (KFit->first < Fit->first)
         {
-            KFit = pKF->mFeatVec.lower_bound(Fit->first);
+            KFit++;
         }
         else
         {
-            Fit = F.mFeatVec.lower_bound(KFit->first);
+            Fit++;  
         }
     }
 
-    // 剔除角度一致性校验不合格的误匹配点
+    // 剔除非主方向误匹配
     if (mbCheckOrientation)
     {
         int idx1 = -1, idx2 = -1, idx3 = -1;
@@ -490,7 +470,6 @@ int ORBmatcher::SearchByBoW(KeyFrame *pKF, Frame &F, std::vector<MapPoint *> &vp
             if (i == idx1 || i == idx2 || i == idx3)
                 continue;
 
-            // 清除非主方向的离群匹配
             for (size_t j = 0; j < rotHist[i].size(); j++)
             {
                 int idx = rotHist[i][j];
@@ -503,13 +482,10 @@ int ORBmatcher::SearchByBoW(KeyFrame *pKF, Frame &F, std::vector<MapPoint *> &vp
         }
     }
 
-    // 记录并在当前帧中直接同步 MapPoint 指针
     for (int i = 0; i < F.N; i++)
     {
         if (vpMapPointMatches[i])
-        {
             F.mvpMapPoints[i] = vpMapPointMatches[i];
-        }
     }
 
     return nmatches;
