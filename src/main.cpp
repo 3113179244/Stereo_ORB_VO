@@ -12,7 +12,7 @@ int main(int argc, char **argv)
 {
     // 设置默认路径
     std::string strConfigFile = "/home/wzj/Stereo_ORB_VO/config/KITTI04-12.yaml";
-    std::string strSequenceDir = "/home/wzj/KITTI/data_odometry_gray/dataset/sequences/05";
+    std::string strSequenceDir = "/home/wzj/KITTI/data_odometry_gray/dataset/sequences/07";
     std::string strVocFile = "/home/wzj/DBow3/orbvoc.dbow3";
     // 解析命令行参数
     if (argc >= 2)

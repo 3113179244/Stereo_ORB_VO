@@ -44,15 +44,8 @@ public:
 
     // 数据获取接口
     std::shared_ptr<Map> GetMap() const { return mpMap; }
-
-    // 保存关键帧轨迹（KITTI 格式，每行 12 个浮点数：T_wc = [R_wc | t_wc] 行优先展平）
-    // 供 evo 等工具评估，可直接与 KITTI ground truth 对比。
-    void SaveKeyFrameTrajectoryKITTI(const std::string &filename);
-
-    // 保存关键帧轨迹（TUM 格式，每行: timestamp tx ty tz qx qy qz qw，带时间戳）
-    // evo 按时间戳自动对齐，不要求与真值行数相同，评估更稳健。
-    void SaveKeyFrameTrajectoryTUM(const std::string &filename);
     void SaveTrajectoryKITTI(const std::string &filename);
+    
 private:
     eSensor mSensor;
     std::shared_ptr<ORBVocabulary> mpVocabulary;

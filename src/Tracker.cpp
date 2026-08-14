@@ -134,8 +134,6 @@ void Tracker::Track()
         if (bOK)
         {
             mState = OK;
-
-            // 💡 关键修复：重定位成功时不能计算速度，必须重置；只有正常跟踪时才更新 mVelocity
             if (bFromRelocalization)
             {
                 mVelocity.setIdentity();
@@ -157,7 +155,7 @@ void Tracker::Track()
         else
         {
             mState = LOST;
-            mVelocity.setIdentity(); // 丢失时清空速度
+            mVelocity.setIdentity(); 
         }
 
         // 保存上一帧
@@ -167,7 +165,6 @@ void Tracker::Track()
     if (mpFrameDrawer)
         mpFrameDrawer->Update(this);
 
-    // 4. 轨迹与历史记录保存 (💡 关键修复：加入 mState == OK 的判断)
     if (mState == OK && !mCurrentFrame.mTcw.hasNaN() && !mCurrentFrame.mTcw.isZero())
     {
         Eigen::Matrix4f Tcr = Eigen::Matrix4f::Identity();

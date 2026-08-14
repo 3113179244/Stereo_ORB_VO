@@ -116,181 +116,64 @@ void System::Reset()
         mpMap->Clear();
 }
 
-/**
- * @brief 保存关键帧轨迹，KITTI 格式（供 evo 评估）
- * @details 参考 ORB-SLAM2 的 SaveKeyFrameTrajectoryKITTI：
- *          - 遍历地图中所有关键帧，按 mnId 排序；
- *          - 每个关键帧取其相机位姿 T_wc（GetPoseInverse() 返回的 [R_wc | t_wc]），
- *            与 KITTI ground truth（T_w_cam0）坐标系约定一致；
- *          - 将左上 3x4 矩阵行优先展平成 12 个浮点数，每行写一个关键帧，无时间戳。
- */
-void System::SaveKeyFrameTrajectoryKITTI(const std::string &filename)
-{
-    if (!mpMap)
-        return;
-
-    std::vector<KeyFrame *> vpKFs = mpMap->GetAllKeyFrames();
-    if (vpKFs.empty())
-        return;
-
-    // 按关键帧 ID 排序，确保输出严格按时间（插入）顺序
-    std::sort(vpKFs.begin(), vpKFs.end(),
-              [](KeyFrame *a, KeyFrame *b) { return a->mnId < b->mnId; });
-
-    std::ofstream f;
-    f.open(filename.c_str());
-    if (!f.is_open())
-    {
-        std::cerr << "[System] 无法打开轨迹文件: " << filename << std::endl;
-        return;
-    }
-
-    std::cout << "[System] 保存关键帧轨迹 (KITTI) 到 " << filename << " ..." << std::endl;
-    f << std::fixed << std::setprecision(9);
-
-    int nValid = 0;
-    for (KeyFrame *pKF : vpKFs)
-    {
-        if (!pKF || pKF->mbBad)
-            continue;
-
-        // T_wc = [R_wc | t_wc]
-        Eigen::Matrix4f Twc = pKF->GetPoseInverse();
-
-        f << Twc(0, 0) << " " << Twc(0, 1) << " " << Twc(0, 2) << " " << Twc(0, 3) << " "
-          << Twc(1, 0) << " " << Twc(1, 1) << " " << Twc(1, 2) << " " << Twc(1, 3) << " "
-          << Twc(2, 0) << " " << Twc(2, 1) << " " << Twc(2, 2) << " " << Twc(2, 3) << std::endl;
-        ++nValid;
-    }
-
-    f.close();
-    std::cout << "[System] 轨迹保存完成，共 " << nValid << " 个关键帧。" << std::endl;
-}
-
-/**
- * @brief 保存关键帧轨迹，TUM 格式（供 evo 评估）
- * @details 参考 ORB-SLAM2 的 SaveKeyFrameTrajectoryTUM：
- *          - 遍历地图中所有关键帧，按 mnId 排序；
- *          - 每个关键帧取其相机位姿 T_wc（GetPoseInverse()），
- *            输出格式：timestamp tx ty tz qx qy qz qw；
- *          - 带时间戳，evo 按时间自动对齐，不要求与真值行数相同。
- */
-void System::SaveKeyFrameTrajectoryTUM(const std::string &filename)
-{
-    if (!mpMap)
-        return;
-
-    std::vector<KeyFrame *> vpKFs = mpMap->GetAllKeyFrames();
-    if (vpKFs.empty())
-        return;
-
-    // 按关键帧 ID 排序，确保输出严格按时间（插入）顺序
-    std::sort(vpKFs.begin(), vpKFs.end(),
-              [](KeyFrame *a, KeyFrame *b) { return a->mnId < b->mnId; });
-
-    std::ofstream f;
-    f.open(filename.c_str());
-    if (!f.is_open())
-    {
-        std::cerr << "[System] 无法打开轨迹文件: " << filename << std::endl;
-        return;
-    }
-
-    std::cout << "[System] 保存关键帧轨迹 (TUM) 到 " << filename << " ..." << std::endl;
-    f << std::fixed << std::setprecision(9);
-
-    int nValid = 0;
-    for (KeyFrame *pKF : vpKFs)
-    {
-        if (!pKF || pKF->mbBad)
-            continue;
-
-        // T_wc = [R_wc | t_wc]
-        Eigen::Matrix4f Twc = pKF->GetPoseInverse();
-        Eigen::Vector3f t = Twc.block<3, 1>(0, 3);                       // 平移（世界系下相机位置）
-        Eigen::Matrix3f R = Twc.block<3, 3>(0, 0);                        // 旋转（相机到世界）
-        Eigen::Quaternionf q(R);                                          // 旋转矩阵 -> 四元数
-
-        // TUM: timestamp tx ty tz qx qy qz qw
-        f << pKF->mTimeStamp << " "
-          << t.x() << " " << t.y() << " " << t.z() << " "
-          << q.x() << " " << q.y() << " " << q.z() << " " << q.w() << std::endl;
-        ++nValid;
-    }
-
-    f.close();
-    std::cout << "[System] 轨迹保存完成，共 " << nValid << " 个关键帧。" << std::endl;
-}
-
 void System::SaveTrajectoryKITTI(const std::string &filename)
 {
-    if (!mpMap)
-        return;
-
-    std::cout << "\n[System] 正在按照 ORB-SLAM2 思路导出轨迹 (KITTI) 到 " << filename << " ..." << std::endl;
+    if (!mpMap) return;
 
     std::vector<KeyFrame*> vpKFs = mpMap->GetAllKeyFrames();
-    if (vpKFs.empty())
-    {
+    if (vpKFs.empty()) {
         std::cerr << "[System] 错误：地图中无关键帧，无法生成轨迹。" << std::endl;
         return;
     }
 
-    // 按 KeyFrame ID 排序
     std::sort(vpKFs.begin(), vpKFs.end(),
               [](KeyFrame *a, KeyFrame *b) { return a->mnId < b->mnId; });
 
-    // 第一帧关键帧位姿的逆（用于校准世界坐标系原点）
+    // 对齐到第一帧坐标系
     Eigen::Matrix4f Two = vpKFs[0]->GetPoseInverse();
 
-    std::ofstream f;
-    f.open(filename.c_str());
-    if (!f.is_open())
-    {
+    std::ofstream f(filename.c_str());
+    if (!f.is_open()) {
         std::cerr << "[System] 无法创建轨迹文件: " << filename << std::endl;
         return;
     }
-
     f << std::fixed << std::setprecision(9);
 
     auto lRit = mpTracker->mlpReferences.begin();
     auto lbL = mpTracker->mlbLost.begin();
+    Eigen::Matrix4f lastValidTwc = Eigen::Matrix4f::Identity();  // 保存最近有效帧的 Twc
     int nValid = 0;
 
-    // 结合后端优化后的最新参考帧位姿，动态重算每一帧的位姿
-    for (auto lit = mpTracker->mlRelativeFramePoses.begin(), lend = mpTracker->mlRelativeFramePoses.end();
-         lit != lend; lit++, lRit++, lbL++)
+    for (auto lit = mpTracker->mlRelativeFramePoses.begin();
+         lit != mpTracker->mlRelativeFramePoses.end();
+         ++lit, ++lRit, ++lbL)
     {
-        if (*lbL) continue; // 跳过追踪丢失的帧
-
         KeyFrame* pKF = *lRit;
-        Eigen::Matrix4f Trw = Eigen::Matrix4f::Identity();
+        Eigen::Matrix4f Twc;
 
-        // 若参考帧坏掉，向上追溯生成树上的有效父关键帧
+        // 追溯有效的父关键帧（若当前参考帧变坏）
         while (pKF && pKF->mbBad)
-        {
             pKF = pKF->GetParent();
+
+        if (pKF) {
+            // 有效帧：计算实际位姿
+            Eigen::Matrix4f Trw = pKF->GetPose() * Two;
+            Eigen::Matrix4f Tcw = (*lit) * Trw;
+            Twc = Tcw.inverse();
+            lastValidTwc = Twc;
+            nValid++;
+        } else {
+            // 无效帧：沿用上一有效位姿
+            Twc = lastValidTwc;
         }
 
-        if (!pKF) continue;
-
-        // 获取后端 BA 优化后的最新参考帧位姿 T_rw
-        Trw = pKF->GetPose() * Two;
-
-        // 重算当前帧优化后的 T_cw = T_cr * T_rw
-        Eigen::Matrix4f Tcw = (*lit) * Trw;
-
-        // 相机在世界坐标系下的变换矩阵 T_wc = (T_cw)^-1
-        Eigen::Matrix4f Twc = Tcw.inverse();
-
-        // KITTI 格式：展开输出 3x4 变换矩阵的 12 个浮点数
-        f << Twc(0, 0) << " " << Twc(0, 1) << " " << Twc(0, 2) << " " << Twc(0, 3) << " "
-          << Twc(1, 0) << " " << Twc(1, 1) << " " << Twc(1, 2) << " " << Twc(1, 3) << " "
-          << Twc(2, 0) << " " << Twc(2, 1) << " " << Twc(2, 2) << " " << Twc(2, 3) << std::endl;
-
-        nValid++;
+        // 输出 3x4 矩阵
+        f << Twc(0,0) << " " << Twc(0,1) << " " << Twc(0,2) << " " << Twc(0,3) << " "
+          << Twc(1,0) << " " << Twc(1,1) << " " << Twc(1,2) << " " << Twc(1,3) << " "
+          << Twc(2,0) << " " << Twc(2,1) << " " << Twc(2,2) << " " << Twc(2,3) << std::endl;
     }
 
     f.close();
-    std::cout << "[System] KITTI 轨迹保存完成！共导出 " << nValid << " 帧位姿。" << std::endl;
+    std::cout << "[System] KITTI 轨迹保存完成！有效帧 " << nValid
+              << "，总行数 " << mpTracker->mlRelativeFramePoses.size() << std::endl;
 }
