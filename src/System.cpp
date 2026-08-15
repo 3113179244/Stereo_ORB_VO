@@ -118,62 +118,102 @@ void System::Reset()
 
 void System::SaveTrajectoryKITTI(const std::string &filename)
 {
-    if (!mpMap) return;
+    std::cout << "[System] 正在保存 KITTI 轨迹至: " << filename << " ..." << std::endl;
 
+    if (mSensor == MONOCULAR)
+    {
+        std::cerr << "[System 警告] 单目模式下 KITTI 轨迹尺度未定，可能需要尺度对齐。" << std::endl;
+    }
+
+    // 获取并检查关键帧
     std::vector<KeyFrame*> vpKFs = mpMap->GetAllKeyFrames();
-    if (vpKFs.empty()) {
-        std::cerr << "[System] 错误：地图中无关键帧，无法生成轨迹。" << std::endl;
+    if (vpKFs.empty())
+    {
+        std::cerr << "[System 错误] 地图中无关键帧，无法生成轨迹！" << std::endl;
         return;
     }
 
+    // 按创建顺序 (mnId) 升序排序
     std::sort(vpKFs.begin(), vpKFs.end(),
               [](KeyFrame *a, KeyFrame *b) { return a->mnId < b->mnId; });
 
-    // 对齐到第一帧坐标系
-    Eigen::Matrix4f Two = vpKFs[0]->GetPoseInverse();
+    // 计算第一帧的世界坐标系逆位姿 T_w0^{-1} (用于将第一帧归一化为世界原点)
+    // 注意：GetPoseInverse() 返回的是相机的世界位姿 Twc0
+    // 其逆矩阵就是第一帧的 T_cw0 (即 GetPose())
+    Eigen::Matrix4f Two = vpKFs[0]->GetPoseInverse().inverse(); // 等价于 vpKFs[0]->GetPose()
 
+    // 打开输出文件
     std::ofstream f(filename.c_str());
-    if (!f.is_open()) {
-        std::cerr << "[System] 无法创建轨迹文件: " << filename << std::endl;
+    if (!f.is_open())
+    {
+        std::cerr << "[System 错误] 无法创建轨迹文件: " << filename << std::endl;
         return;
     }
     f << std::fixed << std::setprecision(9);
 
+    // 遍历 Tracking 线程记录的所有普通帧 (共 1101 帧)
     auto lRit = mpTracker->mlpReferences.begin();
+    auto lT = mpTracker->mlFrameTimes.begin();
     auto lbL = mpTracker->mlbLost.begin();
-    Eigen::Matrix4f lastValidTwc = Eigen::Matrix4f::Identity();  // 保存最近有效帧的 Twc
+
+    Eigen::Matrix4f lastValidTwc = Eigen::Matrix4f::Identity();
     int nValid = 0;
+    int nTotal = 0;
 
     for (auto lit = mpTracker->mlRelativeFramePoses.begin();
          lit != mpTracker->mlRelativeFramePoses.end();
-         ++lit, ++lRit, ++lbL)
+         ++lit, ++lRit, ++lT, ++lbL)
     {
+        nTotal++;
         KeyFrame* pKF = *lRit;
+        Eigen::Matrix4f Tcr = *lit; // 当前普通帧相对于参考关键帧的位姿
+        bool bLost = *lbL;
+
         Eigen::Matrix4f Twc;
 
-        // 追溯有效的父关键帧（若当前参考帧变坏）
-        while (pKF && pKF->mbBad)
-            pKF = pKF->GetParent();
+        if (!bLost && pKF)
+        {
+            // 若该参考关键帧在 LocalMapping 剔除中变为了 bad，向上找非 bad 的父关键帧
+            while (pKF && pKF->mbBad)
+            {
+                pKF = pKF->GetParent();
+            }
 
-        if (pKF) {
-            // 有效帧：计算实际位姿
-            Eigen::Matrix4f Trw = pKF->GetPose() * Two;
-            Eigen::Matrix4f Tcw = (*lit) * Trw;
-            Twc = Tcw.inverse();
-            lastValidTwc = Twc;
-            nValid++;
-        } else {
-            // 无效帧：沿用上一有效位姿
+            if (pKF)
+            {
+                // 获取当前参考关键帧最新的世界位姿 T_rw (世界系 -> 参考帧系)
+                Eigen::Matrix4f Trw = pKF->GetPose();
+
+                // 还原当前普通帧在优化后的世界坐标系中的变换 T_cw = T_cr * T_rw
+                Eigen::Matrix4f Tcw = Tcr * Trw;
+
+                // 得到当前帧相机在世界系下的绝对位姿 T_wc (相机系 -> 世界系)
+                Twc = Tcw.inverse();
+                lastValidTwc = Twc;
+                nValid++;
+            }
+            else
+            {
+                // 如果父节点全部失效，沿用上一有效帧
+                Twc = lastValidTwc;
+            }
+        }
+        else
+        {
+            // 丢失帧沿用上一帧位姿，保证 1101 行严格对齐
             Twc = lastValidTwc;
         }
 
-        // 输出 3x4 矩阵
-        f << Twc(0,0) << " " << Twc(0,1) << " " << Twc(0,2) << " " << Twc(0,3) << " "
-          << Twc(1,0) << " " << Twc(1,1) << " " << Twc(1,2) << " " << Twc(1,3) << " "
-          << Twc(2,0) << " " << Twc(2,1) << " " << Twc(2,2) << " " << Twc(2,3) << std::endl;
+        // 将位姿统一变换到以第一帧为世界原点的参考系下: T = T_w0^{-1} * T_wc
+        Eigen::Matrix4f T = Two * Twc;
+
+        // 按 KITTI 格式输出 3x4 矩阵（12 个浮点数）
+        f << T(0,0) << " " << T(0,1) << " " << T(0,2) << " " << T(0,3) << " "
+          << T(1,0) << " " << T(1,1) << " " << T(1,2) << " " << T(1,3) << " "
+          << T(2,0) << " " << T(2,1) << " " << T(2,2) << " " << T(2,3) << std::endl;
     }
 
     f.close();
-    std::cout << "[System] KITTI 轨迹保存完成！有效帧 " << nValid
-              << "，总行数 " << mpTracker->mlRelativeFramePoses.size() << std::endl;
+    std::cout << "[System] KITTI 轨迹保存成功！有效帧: " << nValid 
+              << " / 总记录帧数: " << nTotal << std::endl;
 }
