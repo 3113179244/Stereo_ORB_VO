@@ -65,7 +65,7 @@ public:
     long unsigned int mnId;
     // 全局互斥锁
     static std::mutex mGlobalMutex;
-    
+    long unsigned int mnFirstKFid; // 记录创建该点的关键帧 ID
     // 跟踪统计：在视野内的次数和实际被匹配到的次数
     int mnVisible;
     int mnFound;

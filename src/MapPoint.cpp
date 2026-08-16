@@ -12,6 +12,7 @@ MapPoint::MapPoint(const Eigen::Vector3f &Pos, KeyFrame* pRefKF, Map* pMap)
 {
     mnId = nNextId++; // 赋予独立ID
     mNormalVector.setZero(); // 法向量初始化为0
+    mnFirstKFid = pRefKF ? pRefKF->mnId : 0; // 记录是由哪个关键帧创建的
 }
 
 // 设置世界坐标，加锁保护以确保线程安全
