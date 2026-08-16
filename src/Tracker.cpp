@@ -116,7 +116,7 @@ void Tracker::Track()
 
             if (!bOK)
             {
-                std::cout << "[Tracking 警告] 帧 ID " << mCurrentFrame.mnId 
+                std::cout << "[Tracking 警告] 帧 ID " << mCurrentFrame.mnId
                           << " 跟踪丢失！(MM:" << bMM << ", RefKF:" << bRF << ", LocalMap:" << bLM << ")" << std::endl;
             }
         }
@@ -155,7 +155,7 @@ void Tracker::Track()
         else
         {
             mState = LOST;
-            mVelocity.setIdentity(); 
+            mVelocity.setIdentity();
         }
 
         // 保存上一帧
@@ -261,15 +261,19 @@ bool Tracker::TrackWithMotionModel()
     // 清空当前帧的地图点指针数组
     mCurrentFrame.mvpMapPoints = std::vector<MapPoint *>(mCurrentFrame.N, static_cast<MapPoint *>(nullptr));
 
-    // 利用投影建立上一帧地图点与当前帧特征点的匹配
+    // 动态基础搜索半径：以 500.0f 为基准焦距（ORB-SLAM2 默认基准），根据当前相机焦距动态缩放
+    const float fx_norm = Frame::fx / 500.0f;
+    const float base_th = 7.0f * std::max(1.0f, fx_norm);
+
     ORBmatcher matcher(0.9, true);
-    int nmatches = matcher.SearchByProjection(mCurrentFrame, mLastFrame, 7); // 搜索半径阈值设为15
+    // SearchByProjection 内部已经会乘以该点在金字塔对应的 scaleFactor
+    int nmatches = matcher.SearchByProjection(mCurrentFrame, mLastFrame, base_th);
 
     if (nmatches < 20)
     {
         // 匹配点太少，放大搜索半径重试一次
         mCurrentFrame.mvpMapPoints = std::vector<MapPoint *>(mCurrentFrame.N, static_cast<MapPoint *>(nullptr));
-        nmatches = matcher.SearchByProjection(mCurrentFrame, mLastFrame, 2 * 7);
+        nmatches = matcher.SearchByProjection(mCurrentFrame, mLastFrame, 2.0f * base_th);
     }
 
     if (nmatches < 20)
@@ -527,12 +531,18 @@ bool Tracker::TrackLocalMap()
 
     Eigen::Matrix3f Rcw = mCurrentFrame.mTcw.block<3, 3>(0, 0);
     Eigen::Vector3f tcw = mCurrentFrame.mTcw.block<3, 1>(0, 3);
+    Eigen::Vector3f Ow = -Rcw.transpose() * tcw; // 当前相机在世界坐标系下的中心
+
+    // 计算焦距缩放基准（以 500.0f 为基准焦距，基准半径设为 5.0 像素）
+    const float fx_ratio = Frame::fx / 500.0f;
+    const float base_radius = 5.0f * std::max(1.0f, fx_ratio);
 
     for (MapPoint *pMP : vpLocalMapPoints)
     {
         if (pMP->isBad())
             continue;
 
+        // 避免重复匹配已经关联的地图点
         bool bAlreadyFound = false;
         for (int i = 0; i < mCurrentFrame.N; i++)
         {
@@ -542,30 +552,68 @@ bool Tracker::TrackLocalMap()
                 break;
             }
         }
-
         if (bAlreadyFound)
             continue;
 
-        // 计算相机坐标系坐标
+        // 计算地图点在当前相机坐标系下的 3D 坐标
         Eigen::Vector3f P_w = pMP->GetWorldPos();
         Eigen::Vector3f P_c = Rcw * P_w + tcw;
 
-        if (P_c[2] <= 0)
-            continue; // 剔除深度非正的点
+        // 深度检查：剔除相机后方的点
+        if (P_c[2] <= 0.0f)
+            continue;
 
-        // 计算投影像素坐标
-        float u = Frame::fx * P_c[0] / P_c[2] + Frame::cx;
-        float v = Frame::fy * P_c[1] / P_c[2] + Frame::cy;
+        // 投影到当前图像像素坐标
+        const float invz = 1.0f / P_c[2];
+        float u = Frame::fx * P_c[0] * invz + Frame::cx;
+        float v = Frame::fy * P_c[1] * invz + Frame::cy;
 
+        // 图像边界有效性检查
         if (u < Frame::mnMinX || u >= Frame::mnMaxX || v < Frame::mnMinY || v >= Frame::mnMaxY)
             continue;
 
-        // 💡 修复：扩大搜索半径（从原有的 5.0f 增加到 12.0f）以容忍小漂移
-        std::vector<size_t> vIndices = mCurrentFrame.GetFeaturesInArea(u, v, 12.0f);
+        // ================== 动态搜索半径计算开始 ==================
+        // 1. 获取地图点当前到相机光心的物理距离
+        Eigen::Vector3f vPosCamera = P_w - Ow;
+        const float dist = vPosCamera.norm();
+
+        // 2. 根据可观测距离区间估算金字塔尺度
+        // （mfMaxDistance 由 MapPoint::UpdateNormalAndDepth 维护）
+        float scaleFactor = 1.0f;
+        const float maxDistance = pMP->GetMaxDistanceInvariance();
+        const float minDistance = pMP->GetMinDistanceInvariance();
+
+        if (dist < minDistance || dist > maxDistance)
+            continue; // 超出该点的有效尺度观测范围，直接剔除
+
+        // 距离越近尺度越接近原图(1.0)，距离越远对应金字塔高层(接近最大缩放比)
+        if (maxDistance > minDistance)
+        {
+            const float ratio = dist / minDistance;
+            // 限制尺度缩放上限（例如在 1.0 到 3.0 之间）
+            scaleFactor = std::max(1.0f, std::min(ratio, 3.0f));
+        }
+
+        // 3. 计算视线夹角余弦值进行视角补偿
+        Eigen::Vector3f Pn = pMP->GetNormal();
+        float viewCos = vPosCamera.dot(Pn) / dist;
+        if (viewCos < 0.5f) // 视角倾斜大于 60 度，特征失真严重，跳过
+            continue;
+
+        // 视角越偏，允许的搜索容差越大（1.0f / viewCos 范围在 1.0 ~ 2.0）
+        const float angleFactor = 1.0f / std::max(0.5f, viewCos);
+
+        // 4. 最终动态搜索半径：基准半径 * 焦距比例 * 尺度因子 * 视角因子
+        const float dynamic_radius = base_radius * scaleFactor * angleFactor;
+        // ================== 动态搜索半径计算结束 ==================
+
+        // 在动态半径区域内查找候选特征点
+        std::vector<size_t> vIndices = mCurrentFrame.GetFeaturesInArea(u, v, dynamic_radius);
         if (vIndices.empty())
             continue;
 
-        int bestDist = 255;
+        cv::Mat dMP = pMP->GetDescriptor();
+        int bestDist = ORBmatcher::TH_HIGH; // 使用统一的汉明距离阈值上限
         int bestIdx = -1;
 
         for (size_t idx : vIndices)
@@ -573,7 +621,6 @@ bool Tracker::TrackLocalMap()
             if (mCurrentFrame.mvpMapPoints[idx])
                 continue;
 
-            cv::Mat dMP = pMP->GetDescriptor();
             cv::Mat dFrame = mCurrentFrame.mDescriptors.row(idx);
             int dist = ORBmatcher::DescriptorDistance(dMP, dFrame);
 

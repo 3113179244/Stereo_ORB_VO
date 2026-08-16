@@ -49,7 +49,7 @@ int ORBmatcher::ComputeStereoMatches(Frame &F)
     F.mvDepth = std::vector<float>(F.N, -1.0f);
 
     // 获取图像的行数（Y坐标范围）。mbInitialComputations 可能表示是否是第一帧初始化。
-    const int nRows = F.mbInitialComputations ? 480 : F.mnMaxY;
+    const int nRows = F.mImGrayLeft.rows;
 
     // vRowIndices[i] 存储在图像第 i 行的所有右目特征点的索引 (ID)
     // 这种按行索引的数据结构可以极大加速双目极线搜索（只需在对应的行中寻找匹配点）

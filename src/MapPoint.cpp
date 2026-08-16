@@ -7,11 +7,11 @@ long unsigned int MapPoint::nNextId = 0;
 std::mutex MapPoint::mGlobalMutex;
 
 // 构造函数，初始化世界坐标、参考关键帧、地图、可见/匹配次数等，并将 bad 标志位置为 false
-MapPoint::MapPoint(const Eigen::Vector3f &Pos, KeyFrame* pRefKF, Map* pMap)
+MapPoint::MapPoint(const Eigen::Vector3f &Pos, KeyFrame *pRefKF, Map *pMap)
     : mWorldPos(Pos), mpRefKF(pRefKF), mpMap(pMap), mnVisible(1), mnFound(1), mbBad(false), mpReplaced(nullptr)
 {
-    mnId = nNextId++; // 赋予独立ID
-    mNormalVector.setZero(); // 法向量初始化为0
+    mnId = nNextId++;                        // 赋予独立ID
+    mNormalVector.setZero();                 // 法向量初始化为0
     mnFirstKFid = pRefKF ? pRefKF->mnId : 0; // 记录是由哪个关键帧创建的
 }
 
@@ -37,42 +37,42 @@ Eigen::Vector3f MapPoint::GetNormal()
 }
 
 // 记录哪个关键帧的哪个特征点观测到了该地图点
-void MapPoint::AddObservation(KeyFrame* pKF, size_t idx)
+void MapPoint::AddObservation(KeyFrame *pKF, size_t idx)
 {
     std::unique_lock<std::mutex> lock(mMutexFeatures);
     // 如果已经存在该关键帧的观测，则直接返回
-    if(mObservations.count(pKF))
+    if (mObservations.count(pKF))
         return;
     mObservations[pKF] = idx;
 }
 
 // 抹除某个关键帧对该地图点的观测记录
-void MapPoint::EraseObservation(KeyFrame* pKF)
+void MapPoint::EraseObservation(KeyFrame *pKF)
 {
     bool bBad = false;
     {
         std::unique_lock<std::mutex> lock(mMutexFeatures);
-        if(mObservations.count(pKF))
+        if (mObservations.count(pKF))
         {
             mObservations.erase(pKF); // 移除观测
-            
+
             // 如果移除的恰好是参考关键帧，则需要重新指定一个存在的关键帧作为参考关键帧
-            if(mpRefKF == pKF)
+            if (mpRefKF == pKF)
                 mpRefKF = mObservations.begin()->first;
 
             // 当观测到该点的关键帧少于等于 1 个时，该点失去了三角化或者稳定约束的意义，标记为坏点
-            if(mObservations.size() <= 1)
+            if (mObservations.size() <= 1)
                 bBad = true;
         }
     }
 
     // 只有出了上面的作用域解锁后，再调用 SetBadFlag 以避免潜在的死锁
-    if(bBad)
+    if (bBad)
         SetBadFlag();
 }
 
 // 返回所有的观测字典
-std::map<KeyFrame*, size_t> MapPoint::GetObservations()
+std::map<KeyFrame *, size_t> MapPoint::GetObservations()
 {
     std::unique_lock<std::mutex> lock(mMutexFeatures);
     return mObservations;
@@ -83,35 +83,38 @@ std::map<KeyFrame*, size_t> MapPoint::GetObservations()
 void MapPoint::ComputeDistinctiveDescriptor()
 {
     std::vector<cv::Mat> vDescriptors;
-    std::map<KeyFrame*, size_t> observations;
+    std::map<KeyFrame *, size_t> observations;
 
     {
         std::unique_lock<std::mutex> lock(mMutexFeatures);
-        if(mbBad) return; // 如果已经是坏点直接返回
+        if (mbBad)
+            return; // 如果已经是坏点直接返回
         observations = mObservations;
     }
 
-    if(observations.empty()) return;
+    if (observations.empty())
+        return;
 
     vDescriptors.reserve(observations.size());
 
     // 遍历所有观测，将未被判定为坏点的关键帧中对应的特征描述子提取出来
-    for(auto mit = observations.begin(); mit != observations.end(); mit++)
+    for (auto mit = observations.begin(); mit != observations.end(); mit++)
     {
-        KeyFrame* pKF = mit->first;
-        if(!pKF->mbBad)
+        KeyFrame *pKF = mit->first;
+        if (!pKF->mbBad)
             vDescriptors.push_back(pKF->mDescriptors.row(mit->second));
     }
 
-    if(vDescriptors.empty()) return;
+    if (vDescriptors.empty())
+        return;
 
     // 计算两两之间的距离矩阵
     const size_t N = vDescriptors.size();
     float Distances[N][N];
-    for(size_t i = 0; i < N; i++)
+    for (size_t i = 0; i < N; i++)
     {
         Distances[i][i] = 0; // 自身距离为0
-        for(size_t j = i + 1; j < N; j++)
+        for (size_t j = i + 1; j < N; j++)
         {
             // 使用 OpenCV 计算汉明距离
             int dist = cv::norm(vDescriptors[i], vDescriptors[j], cv::NORM_HAMMING);
@@ -123,14 +126,14 @@ void MapPoint::ComputeDistinctiveDescriptor()
     int BestMedian = INT_MAX;
     int BestIdx = 0;
     // 遍历所有描述子，计算各自与其余描述子距离的中位数
-    for(size_t i = 0; i < N; i++)
+    for (size_t i = 0; i < N; i++)
     {
         std::vector<int> vDists(Distances[i], Distances[i] + N);
         std::sort(vDists.begin(), vDists.end()); // 排序以方便寻找中位数
         int median = vDists[0.5 * (N - 1)];      // 获取中位数
 
         // 记录中位数最小的那个描述子索引
-        if(median < BestMedian)
+        if (median < BestMedian)
         {
             BestMedian = median;
             BestIdx = i;
@@ -153,28 +156,30 @@ cv::Mat MapPoint::GetDescriptor()
 // 更新平均观测方向向量与尺度（距离）下限/上限
 void MapPoint::UpdateNormalAndDepth()
 {
-    std::map<KeyFrame*, size_t> observations;
-    KeyFrame* pRefKF;
+    std::map<KeyFrame *, size_t> observations;
+    KeyFrame *pRefKF;
     Eigen::Vector3f Pos;
 
     {
         std::unique_lock<std::mutex> lock1(mMutexFeatures);
         std::unique_lock<std::mutex> lock2(mMutexPos);
-        if(mbBad) return;
+        if (mbBad)
+            return;
         observations = mObservations;
         pRefKF = mpRefKF;
         Pos = mWorldPos;
     }
 
-    if(observations.empty()) return;
+    if (observations.empty())
+        return;
 
     Eigen::Vector3f normal = Eigen::Vector3f::Zero();
-    int n=0;
+    int n = 0;
 
     // 遍历所有观测，累加观测方向的单位向量
-    for(auto mit = observations.begin(); mit != observations.end(); mit++)
+    for (auto mit = observations.begin(); mit != observations.end(); mit++)
     {
-        KeyFrame* pKF = mit->first;
+        KeyFrame *pKF = mit->first;
         Eigen::Vector3f Owc = pKF->GetCameraCenter(); // 获取相机的光心
         Eigen::Vector3f normali = Pos - Owc;          // 从光心指向地图点的向量
         normal += normali.normalized();               // 归一化后累加
@@ -203,7 +208,7 @@ void MapPoint::UpdateNormalAndDepth()
 // 设置坏点标志
 void MapPoint::SetBadFlag()
 {
-    std::map<KeyFrame*, size_t> obs;
+    std::map<KeyFrame *, size_t> obs;
     {
         std::unique_lock<std::mutex> lock1(mMutexFeatures);
         std::unique_lock<std::mutex> lock2(mMutexPos);
@@ -211,11 +216,11 @@ void MapPoint::SetBadFlag()
         obs = mObservations;
         mObservations.clear(); // 清空本点的观测记录
     }
-    
+
     // 通知曾经观测过这个点的关键帧：抹除关键帧端指向这里的匹配引用
-    for(auto mit = obs.begin(); mit != obs.end(); mit++)
+    for (auto mit = obs.begin(); mit != obs.end(); mit++)
     {
-        KeyFrame* pKF = mit->first;
+        KeyFrame *pKF = mit->first;
         pKF->EraseMapPointMatch(mit->second);
     }
 
@@ -232,11 +237,12 @@ bool MapPoint::isBad()
 }
 
 // 用另外一个地图点替换本点 (主要发生于局部建图去重、或者闭环检测融合阶段)
-void MapPoint::Replace(MapPoint* pMP)
+void MapPoint::Replace(MapPoint *pMP)
 {
-    if(pMP->mnId == this->mnId) return; // 自己无需替换自己
+    if (pMP->mnId == this->mnId)
+        return; // 自己无需替换自己
 
-    std::map<KeyFrame*, size_t> obs;
+    std::map<KeyFrame *, size_t> obs;
     {
         std::unique_lock<std::mutex> lock1(mMutexFeatures);
         std::unique_lock<std::mutex> lock2(mMutexPos);
@@ -247,11 +253,11 @@ void MapPoint::Replace(MapPoint* pMP)
     }
 
     // 处理原来所有能看到当前旧点的关键帧
-    for(auto mit = obs.begin(); mit != obs.end(); mit++)
+    for (auto mit = obs.begin(); mit != obs.end(); mit++)
     {
-        KeyFrame* pKF = mit->first;
+        KeyFrame *pKF = mit->first;
         // 如果顶替它的新点还没有被该关键帧观测到
-        if(!pMP->IsInKeyFrame(pKF))
+        if (!pMP->IsInKeyFrame(pKF))
         {
             // 让关键帧把对应的地图点指针更新为新的点
             pKF->ReplaceMapPointMatch(mit->second, pMP);
@@ -274,17 +280,18 @@ void MapPoint::Replace(MapPoint* pMP)
 }
 
 // 查询本点是否在给定的关键帧视野内被提取出来了
-bool MapPoint::IsInKeyFrame(KeyFrame* pKF)
+bool MapPoint::IsInKeyFrame(KeyFrame *pKF)
 {
     std::unique_lock<std::mutex> lock(mMutexFeatures);
     return mObservations.count(pKF);
 }
 
 // 查询本点对应给定关键帧上的第几个特征点，若不存在返回-1
-int MapPoint::GetIndexInKeyFrame(KeyFrame* pKF)
+int MapPoint::GetIndexInKeyFrame(KeyFrame *pKF)
 {
     std::unique_lock<std::mutex> lock(mMutexFeatures);
-    if (mObservations.count(pKF)) {
+    if (mObservations.count(pKF))
+    {
         return mObservations[pKF];
     }
     return -1;
@@ -296,3 +303,14 @@ float MapPoint::GetFoundRatio()
     return static_cast<float>(mnFound) / static_cast<float>(mnVisible);
 }
 
+float MapPoint::GetMinDistanceInvariance()
+{
+    std::unique_lock<std::mutex> lock(mMutexPos);
+    return mfMinDistance;
+}
+
+float MapPoint::GetMaxDistanceInvariance()
+{
+    std::unique_lock<std::mutex> lock(mMutexPos);
+    return mfMaxDistance;
+}

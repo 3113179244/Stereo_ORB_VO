@@ -287,8 +287,8 @@ void LocalMapping::CreateNewMapPoints()
 
             const cv::KeyPoint &kp0 = mpCurrentKeyFrame->mvKeysUn[i];
             const int level0 = kp0.octave;
-
-            const float radius = 2.0f * 15.0f * mpCurrentKeyFrame->mvScaleFactors[level0];
+            const float fx_norm = mpCurrentKeyFrame->fx / 500.0f;
+            const float radius = 2.0f * (15.0f * std::max(1.0f, fx_norm)) * mpCurrentKeyFrame->mvScaleFactors[level0];
             const std::vector<size_t> vCandidates =
                 pKF2->GetFeaturesInArea(kp0.pt.x, kp0.pt.y, radius, level0 - 1, level0 + 1);
             if (vCandidates.empty())

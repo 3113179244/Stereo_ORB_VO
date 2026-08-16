@@ -58,7 +58,8 @@ public:
     void IncreaseFound(int n=1);
     // 获取匹配率（Found / Visible），用于评估该点质量
     float GetFoundRatio();
-
+    float GetMinDistanceInvariance();
+    float GetMaxDistanceInvariance();
     // 静态成员：用于生成唯一的地图点ID
     static long unsigned int nNextId;
     // 当前地图点的唯一ID
