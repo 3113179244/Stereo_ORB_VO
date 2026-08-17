@@ -302,45 +302,62 @@ void KeyFrame::SetBadFlag()
         if (mbBad)
             return;
         mbBad = true;
-        connectedKFs = mConnectedKeyFrameWeights; // 拷贝
-        pParent = mpParent;                       // 拷贝父节点
-        vChildren = mspChildren;                  // 拷贝子节点集合
+        connectedKFs = mConnectedKeyFrameWeights;
+        pParent = mpParent;
+        vChildren = mspChildren;
     }
     {
         std::unique_lock<std::mutex> lockFeat(mMutexFeatures);
-        vpMP = mvpMapPoints; // 拷贝
+        vpMP = mvpMapPoints;
     }
 
-    // 1. 维护生成树（Spanning Tree）：
-    //    1.1 先从父节点的子节点集合中移除自身
-    //    1.2 再把当前关键帧的所有子节点重新挂到父节点下，保证生成树仍然连通、仍是一棵树。
-    //        若当前关键帧本身是根（无父节点），则它的子节点将成为新的根节点。
-    //    这些调用各自会对 mMutexConnections 加锁，需在锁外执行，避免死锁。
+    // 1. 维护生成树（Spanning Tree）：把子节点重连给父节点或最佳共视帧
+    for (auto it = vChildren.begin(); it != vChildren.end(); it++)
+    {
+        KeyFrame *pChild = *it;
+        if (!pChild || pChild->mbBad)
+            continue;
+
+        KeyFrame *pNewParent = pParent;
+        if (!pNewParent || pNewParent->mbBad)
+        {
+            std::vector<KeyFrame *> vpCovisibles = pChild->GetBestCovisibilityKeyFrames(10);
+            for (KeyFrame *pCov : vpCovisibles)
+            {
+                if (pCov && !pCov->mbBad && pCov != this)
+                {
+                    pNewParent = pCov;
+                    break;
+                }
+            }
+        }
+        pChild->SetParent(pNewParent);
+    }
+
     if (pParent)
         pParent->EraseChild(this);
-    for (auto it = vChildren.begin(); it != vChildren.end(); it++)
-        (*it)->SetParent(pParent); // SetParent(nullptr) 会让子节点成为孤立根，SetParent(pParent) 则改挂到父节点
 
-    // 2. 断开与所有相连关键帧的双向共视连接（基于拷贝，安全）
+    // 2. 断开相连关键帧的双向共视连接
     for (auto mit = connectedKFs.begin(); mit != connectedKFs.end(); mit++)
         mit->first->EraseConnection(this);
 
-    // 3. 解除所有关联地图点对该关键帧的观测引用
+    // 3. 解除地图点对该关键帧的观测
     for (size_t i = 0; i < vpMP.size(); i++)
         if (vpMP[i])
             vpMP[i]->EraseObservation(this);
 
-    // 4. 清空自身的连接记录与生成树成员关系
+    // 4. 清空连接记录
     {
         std::unique_lock<std::mutex> lockCon(mMutexConnections);
         mConnectedKeyFrameWeights.clear();
         mvpOrderedConnectedKeyFrames.clear();
         mvOrderedWeights.clear();
-        mpParent = nullptr;
+        // 【关键改动】：务必注释掉下面这行！保留自己的 mpParent 指针供普通帧回溯位姿
+        // mpParent = nullptr; 
         mspChildren.clear();
     }
 
-    // 5. 从全局地图中删除自身
+    // 5. 从全局地图中删除
     mpMap->EraseKeyFrame(this);
 }
 
