@@ -40,6 +40,7 @@ public:
     int ComputeStereoMatches(Frame &F);
 
     int SearchByProjection(Frame &CurrentFrame, const Frame &LastFrame, const float th, const bool bMono = false);
+    
     /**
      * @brief 通过词袋 (BoW) 匹配 KeyFrame 与 Frame 中的特征点
      * @param pKF 关键帧指针

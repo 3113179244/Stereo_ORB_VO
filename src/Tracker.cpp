@@ -255,51 +255,66 @@ bool Tracker::StereoInitialization()
 
 bool Tracker::TrackWithMotionModel()
 {
-    // 根据恒速模型粗略预测当前位姿: T_cw = V * T_lw
+    ORBmatcher matcher(0.9f, true);
+
+    // 1. 基于恒速模型预测当前帧初始位姿
     mCurrentFrame.SetPose(mVelocity * mLastFrame.mTcw);
 
-    // 清空当前帧的地图点指针数组
-    mCurrentFrame.mvpMapPoints = std::vector<MapPoint *>(mCurrentFrame.N, static_cast<MapPoint *>(nullptr));
+    // 清理当前帧地图点
+    std::fill(mCurrentFrame.mvpMapPoints.begin(), mCurrentFrame.mvpMapPoints.end(), nullptr);
 
-    // 动态基础搜索半径：以 500.0f 为基准焦距（ORB-SLAM2 默认基准），根据当前相机焦距动态缩放
-    const float fx_norm = Frame::fx / 500.0f;
-    const float base_th = 7.0f * std::max(1.0f, fx_norm);
+    // =========================================================================
+    // 第一阶段：精细搜索 (Base Radius th = 7.0f)
+    // =========================================================================
+    int nmatches = matcher.SearchByProjection(mCurrentFrame, mLastFrame, 7.0f, false);
 
-    ORBmatcher matcher(0.9, true);
-    // SearchByProjection 内部已经会乘以该点在金字塔对应的 scaleFactor
-    int nmatches = matcher.SearchByProjection(mCurrentFrame, mLastFrame, base_th);
-
+    // 若第一次匹配点过少，直接放宽基础半径重试
     if (nmatches < 20)
     {
-        // 匹配点太少，放大搜索半径重试一次
-        mCurrentFrame.mvpMapPoints = std::vector<MapPoint *>(mCurrentFrame.N, static_cast<MapPoint *>(nullptr));
-        nmatches = matcher.SearchByProjection(mCurrentFrame, mLastFrame, 2.0f * base_th);
+        std::fill(mCurrentFrame.mvpMapPoints.begin(), mCurrentFrame.mvpMapPoints.end(), nullptr);
+        nmatches = matcher.SearchByProjection(mCurrentFrame, mLastFrame, 15.0f, false);
     }
 
-    if (nmatches < 20)
+    if (nmatches < 10)
         return false;
 
-    // 只优化当前帧位姿 (Pose Optimization / Motion-only BA)
-    int nInliers = MotionOnlyBA::Optimize(&mCurrentFrame);
+    // 2. 第一次仅位姿优化 (Motion-only BA)
+    int num_inliers = MotionOnlyBA::Optimize(&mCurrentFrame);
 
-    // 剔除优化时被判定为外点的匹配
-    for (int i = 0; i < mCurrentFrame.N; i++)
+    // =========================================================================
+    // 第二阶段：分级回退重试 (Fallback Retry for Large Rotations / Turns)
+    // =========================================================================
+    if (num_inliers < 40)
     {
-        if (mCurrentFrame.mvpMapPoints[i])
+        // 剔除第一轮中被判定为外点 (outlier) 的匹配
+        for (int i = 0; i < mCurrentFrame.N; ++i)
         {
-            if (mCurrentFrame.mvbOutlier[i])
+            if (mCurrentFrame.mvpMapPoints[i] && mCurrentFrame.mvbOutlier[i])
             {
-                mCurrentFrame.mvpMapPoints[i] = static_cast<MapPoint *>(nullptr);
-                mCurrentFrame.mvbOutlier[i] = false;
-                nmatches--;
+                mCurrentFrame.mvpMapPoints[i] = nullptr;
             }
+        }
+
+        // 使用 2 倍半径 (th = 15.0f) 补充搜索未匹配上的特征点
+        int additional_matches = matcher.SearchByProjection(mCurrentFrame, mLastFrame, 15.0f, false);
+
+        if (num_inliers + additional_matches >= 20)
+        {
+            // 用补充召回的特征点进行第二次 MotionOnlyBA 优化
+            num_inliers = MotionOnlyBA::Optimize(&mCurrentFrame);
         }
     }
 
-    mnMatchesInliers = nInliers;
+    // 剔除最终被判为 Outlier 的地图点关联
+    for (int i = 0; i < mCurrentFrame.N; ++i)
+    {
+        if (mCurrentFrame.mvpMapPoints[i] && mCurrentFrame.mvbOutlier[i])
+        {
+            mCurrentFrame.mvpMapPoints[i] = nullptr;
+        }
+    }
 
-    // 内点数满足要求则跟踪成功
-    return (nInliers >= 10);
+    return num_inliers >= 10;
 }
 
 bool Tracker::TrackReferenceKeyFrame()

@@ -297,7 +297,31 @@ int ORBmatcher::SearchByProjection(
 
     const Eigen::Matrix3f Rcw = CurrentFrame.mTcw.block<3, 3>(0, 0);
     const Eigen::Vector3f tcw = CurrentFrame.mTcw.block<3, 1>(0, 3);
+    const Eigen::Matrix3f Rlw = LastFrame.mTcw.block<3, 3>(0, 0);
 
+    // =========================================================================
+    // 1. 计算运动/角速度自适应缩放因子 (Motion & Rotation Adaptiveness)
+    // =========================================================================
+    // 计算上一帧到当前帧的相对旋转 R_c_last = R_cw * R_lw^T
+    Eigen::Matrix3f R_c_last = Rcw * Rlw.transpose();
+    
+    // 计算相对旋转角度 delta_theta (弧度)
+    double cos_angle = 0.5 * (R_c_last.trace() - 1.0);
+    cos_angle = std::max(-1.0, std::min(1.0, cos_angle));
+    double delta_theta_rad = std::acos(cos_angle);
+    double delta_theta_deg = delta_theta_rad * 180.0 / M_PI; // 角度制
+
+    // 基础运动放大因子：
+    // - 直线时 (delta_theta 近似 0)，motion_factor ≈ 1.0
+    // - 转弯时 (如旋转 3°~10°)，搜索半径平滑线性放大 1.2x ~ 2.5x，并设置上限 3.0x
+    float motion_factor = 1.0f + static_cast<float>(delta_theta_deg) * 0.15f;
+    motion_factor = std::min(std::max(motion_factor, 1.0f), 3.0f);
+
+    const float adaptive_th = th * motion_factor;
+
+    // =========================================================================
+    // 2. 遍历上一帧地图点，利用自适应半径进行投影搜索
+    // =========================================================================
     for (int i = 0; i < LastFrame.N; ++i)
     {
         MapPoint *pMP = LastFrame.mvpMapPoints[i];
@@ -317,7 +341,8 @@ int ORBmatcher::SearchByProjection(
             continue;
 
         const int lastLevel = LastFrame.mvKeysUn[i].octave;
-        const float radius = th * CurrentFrame.mpORBextractorLeft->GetScaleFactors()[lastLevel];
+        // 结合【运动自适应】与【金字塔尺度自适应】
+        const float radius = adaptive_th * CurrentFrame.mpORBextractorLeft->GetScaleFactors()[lastLevel];
 
         const std::vector<size_t> candidates =
             CurrentFrame.GetFeaturesInArea(u, v, radius, lastLevel - 1, lastLevel + 1);
@@ -367,6 +392,7 @@ int ORBmatcher::SearchByProjection(
         if (bestIdx < 0 || bestDist > TH_HIGH)
             continue;
 
+        // Ratio Test 过滤
         if (secondBestLevel >= 0 &&
             bestLevel == secondBestLevel &&
             static_cast<float>(bestDist) > mfNNratio * secondBestDist)
@@ -390,6 +416,7 @@ int ORBmatcher::SearchByProjection(
         }
     }
 
+    // 旋转一致性直方图剔除杂点
     if (mbCheckOrientation)
     {
         int idx1 = -1, idx2 = -1, idx3 = -1;
@@ -540,6 +567,141 @@ int ORBmatcher::SearchByBoW(KeyFrame *pKF, Frame &F, std::vector<MapPoint *> &vp
     {
         if (vpMapPointMatches[i])
             F.mvpMapPoints[i] = vpMapPointMatches[i];
+    }
+
+    return nmatches;
+}
+
+int ORBmatcher::SearchByProjection(Frame &F, const std::vector<MapPoint*> &vpMapPoints, const float th)
+{
+    int nmatches = 0;
+
+    const Eigen::Matrix3f Rcw = F.mTcw.block<3, 3>(0, 0);
+    const Eigen::Vector3f tcw = F.mTcw.block<3, 1>(0, 3);
+    const Eigen::Vector3f Ow  = -Rcw.transpose() * tcw;
+
+    std::vector<int> rotHist[HISTO_LENGTH];
+    int histo[HISTO_LENGTH] = {0};
+    const float rotFactor = static_cast<float>(HISTO_LENGTH) / 360.0f;
+
+    for (size_t iMP = 0; iMP < vpMapPoints.size(); ++iMP)
+    {
+        MapPoint *pMP = vpMapPoints[iMP];
+        if (!pMP || pMP->isBad())
+            continue;
+
+        // 1. 3D 点投影到相机坐标系
+        const Eigen::Vector3f Pw = pMP->GetWorldPos();
+        const Eigen::Vector3f Pc = Rcw * Pw + tcw;
+
+        // 必须在相机前方
+        if (Pc.z() <= 0.0f)
+            continue;
+
+        // 2. 视锥与距离检查 (Frustum & Distance Check)
+        const float dist = (Pw - Ow).norm();
+        const float maxDistance = pMP->GetMaxDistanceInvariance();
+        const float minDistance = pMP->GetMinDistanceInvariance();
+        if (dist < minDistance * 0.8f || dist > maxDistance * 1.2f)
+            continue;
+
+        // 视角夹角检查 (Viewing angle > 60° 剔除)
+        Eigen::Vector3f Pn = (Pw - Ow).normalized();
+        if (Pn.dot(pMP->GetNormal()) < 0.5f)
+            continue;
+
+        // 3. 计算图像像素坐标
+        const float invz = 1.0f / Pc.z();
+        const float u = Frame::fx * Pc.x() * invz + Frame::cx;
+        const float v = Frame::fy * Pc.y() * invz + Frame::cy;
+
+        if (u < Frame::mnMinX || u >= Frame::mnMaxX ||
+            v < Frame::mnMinY || v >= Frame::mnMaxY)
+            continue;
+
+        // 4. 根据当前距离估算金字塔层级与搜索半径
+        // 距离越远，层级越高，搜索半径越大
+        float ratio = dist / maxDistance;
+        int predictedLevel = 0;
+        if (ratio < 0.25f) predictedLevel = 0;
+        else if (ratio < 0.5f) predictedLevel = 1;
+        else if (ratio < 0.75f) predictedLevel = 2;
+        else predictedLevel = 3;
+
+        const float radius = th * F.mpORBextractorLeft->GetScaleFactors()[predictedLevel];
+        const std::vector<size_t> candidates =
+            F.GetFeaturesInArea(u, v, radius, predictedLevel - 1, predictedLevel + 1);
+
+        if (candidates.empty())
+            continue;
+
+        const cv::Mat &dMP = pMP->GetDescriptor();
+        int bestDist = TH_LOW;
+        int secondBestDist = TH_LOW;
+        int bestIdx = -1;
+
+        for (size_t c = 0; c < candidates.size(); ++c)
+        {
+            const size_t idx = candidates[c];
+            // 若当前特征点已经被匹配了，跳过
+            if (F.mvpMapPoints[idx])
+                continue;
+
+            const cv::Mat &dF = F.mDescriptors.row(idx);
+            const int distDesc = DescriptorDistance(dMP, dF);
+
+            if (distDesc < bestDist)
+            {
+                secondBestDist = bestDist;
+                bestDist = distDesc;
+                bestIdx = static_cast<int>(idx);
+            }
+            else if (distDesc < secondBestDist)
+            {
+                secondBestDist = distDesc;
+            }
+        }
+
+        if (bestIdx >= 0 && bestDist < TH_LOW)
+        {
+            if (static_cast<float>(bestDist) < mfNNratio * static_cast<float>(secondBestDist))
+            {
+                F.mvpMapPoints[bestIdx] = pMP;
+                ++nmatches;
+
+                if (mbCheckOrientation)
+                {
+                    // 统计方向直方图
+                    float rot = F.mvKeysUn[bestIdx].angle;
+                    int bin = cvRound(rot * rotFactor);
+                    if (bin == HISTO_LENGTH) bin = 0;
+                    rotHist[bin].push_back(bestIdx);
+                    histo[bin]++;
+                }
+            }
+        }
+    }
+
+    // 旋转一致性直方图剔除
+    if (mbCheckOrientation)
+    {
+        int idx1 = -1, idx2 = -1, idx3 = -1;
+        ComputeThreeBestIdx(histo, HISTO_LENGTH, idx1, idx2, idx3);
+
+        for (int bin = 0; bin < HISTO_LENGTH; ++bin)
+        {
+            if (bin == idx1 || bin == idx2 || bin == idx3)
+                continue;
+
+            for (int idx : rotHist[bin])
+            {
+                if (F.mvpMapPoints[idx])
+                {
+                    F.mvpMapPoints[idx] = nullptr;
+                    --nmatches;
+                }
+            }
+        }
     }
 
     return nmatches;
