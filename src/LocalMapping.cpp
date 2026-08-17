@@ -382,7 +382,8 @@ void LocalMapping::CreateNewMapPoints()
 
 void LocalMapping::SearchInNeighbors()
 {
-    const int nn = 20;
+    // 1. 获取当前关键帧的最佳共视邻居关键帧（一级邻居）
+    const int nn = 10;
     std::vector<KeyFrame *> vpNeighKFs = mpCurrentKeyFrame->GetBestCovisibilityKeyFrames(nn);
     if (vpNeighKFs.empty())
         return;
@@ -391,25 +392,27 @@ void LocalMapping::SearchInNeighbors()
     std::set<MapPoint *> vpFuseCandidates;
     const int nn2 = 5;
 
-    std::vector<MapPoint *> vpLocalMapPoints = mpCurrentKeyFrame->GetMapPointMatches();
-
+    // 收集所有候选邻居关键帧（一级邻居 + 部分二级邻居）以及它们的地图点
     for (size_t i = 0; i < vpNeighKFs.size(); i++)
     {
         KeyFrame *pKFi = vpNeighKFs[i];
-        if (pKFi->mbBad)
+        if (!pKFi || pKFi->mbBad)
             continue;
 
         vpTargetKFs.push_back(pKFi);
         std::vector<MapPoint *> vpMPi = pKFi->GetMapPointMatches();
         for (size_t j = 0; j < vpMPi.size(); j++)
+        {
             if (vpMPi[j] && !vpMPi[j]->isBad())
                 vpFuseCandidates.insert(vpMPi[j]);
+        }
 
+        // 扩展到二级邻居
         std::vector<KeyFrame *> vpNeigh2 = pKFi->GetBestCovisibilityKeyFrames(nn2);
         for (size_t j = 0; j < vpNeigh2.size(); j++)
         {
             KeyFrame *pKFi2 = vpNeigh2[j];
-            if (pKFi2->mbBad || pKFi2->mnId == mpCurrentKeyFrame->mnId)
+            if (!pKFi2 || pKFi2->mbBad || pKFi2->mnId == mpCurrentKeyFrame->mnId)
                 continue;
             if (std::find(vpTargetKFs.begin(), vpTargetKFs.end(), pKFi2) != vpTargetKFs.end())
                 continue;
@@ -417,8 +420,10 @@ void LocalMapping::SearchInNeighbors()
             vpTargetKFs.push_back(pKFi2);
             std::vector<MapPoint *> vpMP2 = pKFi2->GetMapPointMatches();
             for (size_t k = 0; k < vpMP2.size(); k++)
+            {
                 if (vpMP2[k] && !vpMP2[k]->isBad())
                     vpFuseCandidates.insert(vpMP2[k]);
+            }
         }
     }
 
@@ -429,23 +434,31 @@ void LocalMapping::SearchInNeighbors()
     const Eigen::Matrix3f Rcw = mpCurrentKeyFrame->GetRotation();
     const Eigen::Vector3f tcw = mpCurrentKeyFrame->GetTranslation();
 
+    // ==========================================
+    // 阶段 A: 将邻居的地图点投影到当前关键帧融合
+    // ==========================================
+    std::vector<MapPoint *> vpLocalMapPoints = mpCurrentKeyFrame->GetMapPointMatches();
+
     for (std::set<MapPoint *>::iterator sit = vpFuseCandidates.begin();
          sit != vpFuseCandidates.end(); sit++)
     {
         MapPoint *pMP = *sit;
-        if (pMP->isBad())
+        if (!pMP || pMP->isBad())
             continue;
 
         Eigen::Vector3f Pc = Rcw * pMP->GetWorldPos() + tcw;
         if (Pc.z() <= 0.0f)
             continue;
 
-        const float u = fx * Pc.x() / Pc.z() + cx;
-        const float v = fy * Pc.y() / Pc.z() + cy;
+        const float invz = 1.0f / Pc.z();
+        const float u = fx * Pc.x() * invz + cx;
+        const float v = fy * Pc.y() * invz + cy;
+
         if (u < mpCurrentKeyFrame->mnMinX || u >= mpCurrentKeyFrame->mnMaxX ||
             v < mpCurrentKeyFrame->mnMinY || v >= mpCurrentKeyFrame->mnMaxY)
             continue;
 
+        // 根据特征点金字塔层级设置搜索半径
         const std::vector<size_t> vCandidates = mpCurrentKeyFrame->GetFeaturesInArea(u, v, 10.0f);
         if (vCandidates.empty())
             continue;
@@ -453,6 +466,7 @@ void LocalMapping::SearchInNeighbors()
         const cv::Mat &dMP = pMP->GetDescriptor();
         int bestDist = ORBmatcher::TH_HIGH;
         int bestIdx = -1;
+
         for (size_t c = 0; c < vCandidates.size(); c++)
         {
             const size_t idx = vCandidates[c];
@@ -464,12 +478,14 @@ void LocalMapping::SearchInNeighbors()
                 bestIdx = static_cast<int>(idx);
             }
         }
+
         if (bestIdx < 0 || bestDist > ORBmatcher::TH_HIGH)
             continue;
 
-        MapPoint *pLocalMP = vpLocalMapPoints[bestIdx];
+        MapPoint *pLocalMP = mpCurrentKeyFrame->GetMapPoint(bestIdx);
         if (!pLocalMP)
         {
+            // 当前关键帧没有该点，直接建立观测关联并更新点属性
             mpCurrentKeyFrame->AddMapPoint(pMP, bestIdx);
             pMP->AddObservation(mpCurrentKeyFrame, bestIdx);
             pMP->UpdateNormalAndDepth();
@@ -477,12 +493,22 @@ void LocalMapping::SearchInNeighbors()
         }
         else if (pLocalMP->mnId != pMP->mnId)
         {
+            // 发生重复观测，选择观测更多的点进行融合替换
             if (pLocalMP->GetObservations().size() >= pMP->GetObservations().size())
+            {
                 pMP->Replace(pLocalMP);
+            }
             else
+            {
                 pLocalMP->Replace(pMP);
+            }
         }
     }
+
+    // ==========================================
+    // 阶段 B: 将当前关键帧的地图点反向投影到目标关键帧融合
+    // ==========================================
+    vpLocalMapPoints = mpCurrentKeyFrame->GetMapPointMatches(); // 重新获取更新后的点
 
     for (size_t i = 0; i < vpLocalMapPoints.size(); i++)
     {
@@ -490,10 +516,10 @@ void LocalMapping::SearchInNeighbors()
         if (!pMP || pMP->isBad())
             continue;
 
-        for (size_t k = 0; k < vpNeighKFs.size(); k++)
+        for (size_t k = 0; k < vpTargetKFs.size(); k++)
         {
-            KeyFrame *pKF = vpNeighKFs[k];
-            if (pKF->mbBad)
+            KeyFrame *pKF = vpTargetKFs[k];
+            if (!pKF || pKF->mbBad)
                 continue;
 
             const Eigen::Matrix3f Rk = pKF->GetRotation();
@@ -502,8 +528,10 @@ void LocalMapping::SearchInNeighbors()
             if (Pk.z() <= 0.0f)
                 continue;
 
-            const float uk = pKF->fx * Pk.x() / Pk.z() + pKF->cx;
-            const float vk = pKF->fy * Pk.y() / Pk.z() + pKF->cy;
+            const float invzk = 1.0f / Pk.z();
+            const float uk = pKF->fx * Pk.x() * invzk + pKF->cx;
+            const float vk = pKF->fy * Pk.y() * invzk + pKF->cy;
+
             if (uk < pKF->mnMinX || uk >= pKF->mnMaxX ||
                 vk < pKF->mnMinY || vk >= pKF->mnMaxY)
                 continue;
@@ -515,6 +543,7 @@ void LocalMapping::SearchInNeighbors()
             const cv::Mat &dMPF = pMP->GetDescriptor();
             int bestDist = ORBmatcher::TH_HIGH;
             int bestIdx = -1;
+
             for (size_t c = 0; c < vCands.size(); c++)
             {
                 const size_t idx = vCands[c];
@@ -526,6 +555,7 @@ void LocalMapping::SearchInNeighbors()
                     bestIdx = static_cast<int>(idx);
                 }
             }
+
             if (bestIdx < 0 || bestDist > ORBmatcher::TH_HIGH)
                 continue;
 
@@ -534,27 +564,52 @@ void LocalMapping::SearchInNeighbors()
             {
                 pKF->AddMapPoint(pMP, bestIdx);
                 pMP->AddObservation(pKF, bestIdx);
+                pMP->UpdateNormalAndDepth();
+                pMP->ComputeDistinctiveDescriptor();
             }
             else if (pNeighMP->mnId != pMP->mnId)
             {
                 if (pMP->GetObservations().size() >= pNeighMP->GetObservations().size())
+                {
                     pNeighMP->Replace(pMP);
+                }
                 else
+                {
                     pMP->Replace(pNeighMP);
+                }
             }
         }
     }
 
+    // ==========================================
+    // 阶段 C: 关键修复：统一清理坏点并重新计算所有更新点的几何与描述子
+    // ==========================================
+    // 1. 刷新当前帧的匹配点列表并更新点属性
+    vpLocalMapPoints = mpCurrentKeyFrame->GetMapPointMatches();
+    for (size_t i = 0; i < vpLocalMapPoints.size(); i++)
     {
-        std::vector<MapPoint *> vpMP = mpCurrentKeyFrame->GetMapPointMatches();
-        for (size_t i = 0; i < vpMP.size(); i++)
-            if (vpMP[i] && vpMP[i]->isBad())
+        MapPoint *pMP = vpLocalMapPoints[i];
+        if (pMP)
+        {
+            if (pMP->isBad())
+            {
                 mpCurrentKeyFrame->EraseMapPointMatch(i);
+            }
+            else
+            {
+                pMP->ComputeDistinctiveDescriptor();
+                pMP->UpdateNormalAndDepth();
+            }
+        }
     }
 
+    // 2. 更新 Covisibility Graph 拓扑关系
     mpCurrentKeyFrame->UpdateConnections();
     for (size_t i = 0; i < vpTargetKFs.size(); i++)
-        vpTargetKFs[i]->UpdateConnections();
+    {
+        if (vpTargetKFs[i] && !vpTargetKFs[i]->mbBad)
+            vpTargetKFs[i]->UpdateConnections();
+    }
 }
 
 void LocalMapping::KeyFrameCulling()

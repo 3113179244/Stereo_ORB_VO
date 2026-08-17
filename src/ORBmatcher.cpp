@@ -42,40 +42,26 @@ int ORBmatcher::ComputeStereoMatches(Frame &F)
 {
     int nMatches = 0;
 
-    // 初始化左右目匹配关系和深度信息为 -1
-    // mvuRight 记录左目特征点匹配到的右目特征点的横坐标 (u)
     F.mvuRight = std::vector<float>(F.N, -1.0f);
-    // mvDepth 记录通过视差计算得出的左目特征点的深度 (Z)
     F.mvDepth = std::vector<float>(F.N, -1.0f);
 
-    // 获取图像的行数（Y坐标范围）。mbInitialComputations 可能表示是否是第一帧初始化。
     const int nRows = F.mImGrayLeft.rows;
 
-    // vRowIndices[i] 存储在图像第 i 行的所有右目特征点的索引 (ID)
-    // 这种按行索引的数据结构可以极大加速双目极线搜索（只需在对应的行中寻找匹配点）
+    // 1. 按行建立右目特征点索引
     std::vector<std::vector<size_t>> vRowIndices(nRows, std::vector<size_t>());
-
-    // 预分配内存，假设每行平均有 10 个特征点
     for (int i = 0; i < nRows; i++)
         vRowIndices[i].reserve(10);
 
-    const int Nr = F.mvKeysRight.size(); // 右目图像提取到的特征点总数
-
-    // 遍历所有右目特征点，将它们分配到对应的行索引中
-    for (int iR = 0; iR < Nr; iR++)
+    const size_t Nr = F.mvKeysRight.size();
+    for (size_t iR = 0; iR < Nr; iR++)
     {
         const cv::KeyPoint &kp = F.mvKeysRight[iR];
-        const float kpY = kp.pt.y; // 右目特征点的纵坐标
-
-        // 考虑特征点所在的金字塔层级 (octave) 带来的尺度影响。
-        // 层数越高，特征点对应的实际图像区域越大，搜索范围 (半径 r) 也应相应扩大。
+        const float kpY = kp.pt.y;
         const float r = 2.0f * F.mpORBextractorRight->GetScaleFactors()[kp.octave];
 
-        // 定义垂直方向的搜索范围 [minr, maxr]，允许存在一定的极线误差
         const int maxr = ceil(kpY + r);
         const int minr = floor(kpY - r);
 
-        // 将该右目特征点的索引 iR 放入对应行的集合中
         for (int yi = minr; yi <= maxr; yi++)
         {
             if (yi >= 0 && yi < nRows)
@@ -83,68 +69,55 @@ int ORBmatcher::ComputeStereoMatches(Frame &F)
         }
     }
 
-    // 深度与视差的物理约束
-    const float minZ = F.mb;         // 最小深度等于双目基线 (通常认为小于基线的物体无法稳定观测)
-    const float minD = 0;            // 最小视差为 0 (对应无穷远)
-    const float maxD = F.mbf / minZ; // 最大视差对应最小深度。 视差 d = bf / Z
+    const float minZ = F.mb;
+    const float minD = 0.0f;
+    const float maxD = F.mbf / minZ;
 
-    // 存储距离和索引的临时容器（此代码片段中未实际发挥大作用，可能由于原版截断）
-    std::vector<std::pair<int, int>> vDistIdx;
-    vDistIdx.reserve(F.N);
+    const int thOrbDist = (ORBmatcher::TH_HIGH + ORBmatcher::TH_LOW) / 2; // 默认匹配阈值 75
 
-    // 用于旋转一致性检查的直方图（在此片段末尾未使用到该直方图的具体筛选逻辑，但预留了变量）
-    std::vector<int> rotHistogram[HISTO_LENGTH];
-    for (int i = 0; i < HISTO_LENGTH; i++)
-        rotHistogram[i].reserve(F.N);
+    // 旋转直方图，用于过滤误匹配
+    std::vector<int> rotHist[HISTO_LENGTH];
+    int histo[HISTO_LENGTH] = {0};
+    const float rotFactor = static_cast<float>(HISTO_LENGTH) / 360.0f;
 
-    const float factor = 1.0f / HISTO_LENGTH;
+    std::vector<std::pair<int, int>> vDistIdx(F.N, std::make_pair(INT_MAX, -1));
 
-    // 遍历左目图像的所有特征点，在右目图像中寻找匹配
+    // 2. 粗匹配：极线范围内的描述子汉明距离比对
     for (int iL = 0; iL < F.N; iL++)
     {
         const cv::KeyPoint &kpL = F.mvKeys[iL];
-        const int levelL = kpL.octave; // 左目特征点所在的金字塔层级
-        const float vL = kpL.pt.y;     // 左目特征点纵坐标 (v)
-        const float uL = kpL.pt.x;     // 左目特征点横坐标 (u)
+        const int levelL = kpL.octave;
+        const float vL = kpL.pt.y;
+        const float uL = kpL.pt.x;
 
-        // 取出左目特征点同一行（或极线误差范围内）的所有右目候选特征点
-        const std::vector<size_t> &vCandidates = vRowIndices[(int)vL];
+        const std::vector<size_t> &vCandidates = vRowIndices[cvRound(vL)];
         if (vCandidates.empty())
-            continue; // 如果该行没有右目特征点，则直接跳过
+            continue;
 
-        // 根据视差约束 [minD, maxD] 计算右目特征点可能存在的横坐标范围 [minU, maxU]
-        // uL - uR = d  =>  uR = uL - d
         const float minU = uL - maxD;
         const float maxU = uL - minD;
         if (maxU < 0)
-            continue; // 如果有效横坐标范围在图像外，则跳过
+            continue;
 
-        int bestDist = TH_HIGH; // 初始化最佳匹配距离为高阈值
-        size_t bestIdxR = 0;    // 最佳匹配的右目特征点索引
+        int bestDist = ORBmatcher::TH_HIGH;
+        size_t bestIdxR = 0;
 
-        // 获取左目特征点的描述子
         const cv::Mat &dL = F.mDescriptors.row(iL);
 
-        // 遍历行内的所有右目候选点
         for (size_t iC = 0; iC < vCandidates.size(); iC++)
         {
             const size_t iR = vCandidates[iC];
             const cv::KeyPoint &kpR = F.mvKeysRight[iR];
 
-            // 尺度一致性检查：左右目匹配的点，其所在的金字塔层级差异不能大于 1
             if (kpR.octave < levelL - 1 || kpR.octave > levelL + 1)
                 continue;
 
             const float uR = kpR.pt.x;
-            // 极线约束（水平方向）：右目特征点必须在理论的视差区间内
             if (uR >= minU && uR <= maxU)
             {
-                // 获取右目特征点的描述子
                 const cv::Mat &dR = F.mDescriptorsRight.row(iR);
-                // 计算汉明距离
                 const int dist = DescriptorDistance(dL, dR);
 
-                // 寻找距离最小（最匹配）的点
                 if (dist < bestDist)
                 {
                     bestDist = dist;
@@ -153,31 +126,112 @@ int ORBmatcher::ComputeStereoMatches(Frame &F)
             }
         }
 
-        // 如果找到了满足阈值的匹配点
-        if (bestDist < TH_HIGH)
+        // 3. 精细匹配：SAD 滑动窗口 + 亚像素抛物线拟合
+        if (bestDist < thOrbDist)
         {
             const cv::KeyPoint &kpR = F.mvKeysRight[bestIdxR];
-            const float uR = kpR.pt.x;
-            const float disparity = uL - uR; // 计算视差
+            const float uR0 = kpR.pt.x;
 
-            // 视差必须大于等于0
-            if (disparity >= 0)
+            const int w = 5;
+            // 边缘保护，防止滑窗越界
+            if (uL - w < 0 || uL + w >= F.mImGrayLeft.cols ||
+                vL - w < 0 || vL + w >= F.mImGrayLeft.rows ||
+                uR0 - w - 2 < 0 || uR0 + w + 2 >= F.mImGrayRight.cols)
+                continue;
+
+            int bestL = 0;
+            int distSubPixelMin = INT_MAX;
+            int vIdxToCost[5] = {0};
+
+            // 在 uR0 附近 [-2, 2] 像素范围内计算 11x11 窗口的 SAD
+            for (int incR = -2; incR <= 2; incR++)
             {
-                // 根据视差计算深度: Z = (fb) / d
-                // 注意：由于未做亚像素插值，这里的深度存在一定的量子化误差
-                const float depth = F.mbf / disparity;
+                int distSubPixel = 0;
+                for (int wy = -w; wy <= w; wy++)
+                {
+                    const uchar *pL = F.mImGrayLeft.ptr<uchar>(cvRound(vL) + wy);
+                    const uchar *pR = F.mImGrayRight.ptr<uchar>(cvRound(vL) + wy);
 
-                // 记录匹配结果
-                F.mvuRight[iL] = uR;
-                F.mvDepth[iL] = depth;
-                nMatches++; // 匹配成功数加一
+                    for (int wx = -w; wx <= w; wx++)
+                    {
+                        distSubPixel += std::abs(pL[cvRound(uL) + wx] - pR[cvRound(uR0) + incR + wx]);
+                    }
+                }
+
+                vIdxToCost[incR + 2] = distSubPixel;
+
+                if (distSubPixel < distSubPixelMin)
+                {
+                    distSubPixelMin = distSubPixel;
+                    bestL = incR;
+                }
+            }
+
+            // 极小值不能落在边界点（必须在 -1, 0, 1 内才能拟合极值点）
+            if (bestL == -2 || bestL == 2)
+                continue;
+
+            // 抛物线插值求极小值点偏移 delta
+            const float dist1 = vIdxToCost[bestL + 1]; // 左侧点
+            const float dist2 = vIdxToCost[bestL + 2]; // 极小值点
+            const float dist3 = vIdxToCost[bestL + 3]; // 右侧点
+
+            const float delta = (dist1 - dist3) / (2.0f * (dist1 + dist3 - 2.0f * dist2));
+
+            if (delta < -1.0f || delta > 1.0f)
+                continue;
+
+            // 亚像素右图横坐标与视差
+            const float bestuR = uR0 + bestL + delta;
+            float disparity = uL - bestuR;
+
+            if (disparity >= minD && disparity < maxD)
+            {
+                if (disparity <= 0)
+                    disparity = 0.01f;
+
+                F.mvDepth[iL] = F.mbf / disparity;
+                F.mvuRight[iL] = bestuR;
+                vDistIdx[iL] = std::make_pair(bestDist, bestIdxR);
+                nMatches++;
+
+                // 记录方向差直方图
+                if (mbCheckOrientation)
+                {
+                    float rot = kpL.angle - kpR.angle;
+                    if (rot < 0.0f) rot += 360.0f;
+                    int bin = cvRound(rot * rotFactor);
+                    if (bin == HISTO_LENGTH) bin = 0;
+                    rotHist[bin].push_back(iL);
+                    histo[bin]++;
+                }
+            }
+        }
+    }
+
+    // 4. 旋转一致性直方图剔除杂乱方向的误匹配
+    if (mbCheckOrientation)
+    {
+        int idx1 = -1, idx2 = -1, idx3 = -1;
+        ComputeThreeBestIdx(histo, HISTO_LENGTH, idx1, idx2, idx3);
+
+        for (int i = 0; i < HISTO_LENGTH; i++)
+        {
+            if (i == idx1 || i == idx2 || i == idx3)
+                continue;
+
+            for (size_t j = 0; j < rotHist[i].size(); j++)
+            {
+                const int idx = rotHist[i][j];
+                F.mvDepth[idx] = -1.0f;
+                F.mvuRight[idx] = -1.0f;
+                nMatches--;
             }
         }
     }
 
     return nMatches;
 }
-
 /**
  * @brief 找出直方图中票数（匹配点对数）前三名的索引
  * 该函数通常配合方向直方图使用。因为错误的匹配通常具有随机的相对旋转角度，
