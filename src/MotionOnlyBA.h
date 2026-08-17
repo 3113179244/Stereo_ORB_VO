@@ -4,7 +4,7 @@
 
 // 前向声明 Frame 类
 class Frame;
-
+class ORBextractor;
 /**
  * @brief 位姿优化类（仅优化相机运动/位姿，不优化地图点）
  */
