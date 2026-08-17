@@ -133,21 +133,16 @@ int Optimizer::PoseOptimization(Frame *pFrame)
  *           4. 构建 Ceres 问题：同时优化局部关键帧位姿与局部地图点，固定关键帧位姿置为常量；
  *           5. 分两轮优化：第一轮加入全部残差，用卡方检验剔除外点(标记坏点)，第二轮只用内点再优化一次。
  */
-void Optimizer::LocalBundleAdjustment(std::shared_ptr<Map> pMap)
+void Optimizer::LocalBundleAdjustment(KeyFrame *pCurKF, std::shared_ptr<Map> pMap)
 {
-    if (!pMap)
-        return;
-
-    std::vector<KeyFrame *> vpAllKFs = pMap->GetAllKeyFrames();
-    if (vpAllKFs.empty())
+    if (!pCurKF || !pMap || pCurKF->mbBad)
         return;
 
     // ------------------------------------------------------------------
-    // Step 1&2&3 : 选取当前关键帧、收集局部/固定关键帧与局部地图点
+    // Step 1&2&3 : 收集局部/固定关键帧与局部地图点
     // ------------------------------------------------------------------
-    KeyFrame *pCurKF = vpAllKFs.back(); // 最近插入的关键帧
-
-    // 收集局部关键帧（当前关键帧 + 高共视邻居）
+    
+    // 1. 收集局部关键帧（传入的当前关键帧 + 其高共视邻居）
     std::vector<KeyFrame *> vpLocalKFs;
     vpLocalKFs.push_back(pCurKF);
     {

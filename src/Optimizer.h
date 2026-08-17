@@ -16,7 +16,7 @@ class KeyFrame;
 class Optimizer {
 public:
     static int PoseOptimization(Frame *pFrame);
-    static void LocalBundleAdjustment(std::shared_ptr<Map> pMap);
+    static void LocalBundleAdjustment(KeyFrame *pKF, std::shared_ptr<Map> pMap);
     static void GlobalBundleAdjustment(std::shared_ptr<Map> pMap);
 };
 
