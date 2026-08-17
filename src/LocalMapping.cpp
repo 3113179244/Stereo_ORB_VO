@@ -139,8 +139,8 @@ void LocalMapping::Run()
             }
 
             // 5. 局部 BA 优化
-            // if (!CheckNewKeyFrames())
-            //     Optimizer::LocalBundleAdjustment(mpMap);
+            if (!CheckNewKeyFrames())
+                Optimizer::LocalBundleAdjustment(mpMap);
 
             // 6. 剔除冗余关键帧
             KeyFrameCulling();

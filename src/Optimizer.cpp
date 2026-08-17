@@ -44,7 +44,13 @@ namespace
             p_c[0] += pose[3];
             p_c[1] += pose[4];
             p_c[2] += pose[5];
-
+            // 安全检查：如果点在相机后面，赋予固定大残差或避免除以接近0的数
+            if (p_c[2] <= T(1e-4))
+            {
+                residuals[0] = T(0.0);
+                residuals[1] = T(0.0);
+                return false; // 返回 false 告诉 Ceres 该步不可行
+            }
             // 归一化 + 内参投影
             const T invz = T(1.0) / p_c[2];
             const T pred_u = fx_ * p_c[0] * invz + cx_;
@@ -180,7 +186,8 @@ void Optimizer::LocalBundleAdjustment(std::shared_ptr<Map> pMap)
         for (size_t j = 0; j < vpMPs.size(); ++j)
         {
             MapPoint *pMP = vpMPs[j];
-            if (pMP && !pMP->isBad() && !sLocalMPs.count(pMP))
+            // 增加 pMP->GetObservations().size() >= 2 判断
+            if (pMP && !pMP->isBad() && pMP->GetObservations().size() >= 2 && !sLocalMPs.count(pMP))
             {
                 sLocalMPs.insert(pMP);
                 vpLocalMPs.push_back(pMP);
