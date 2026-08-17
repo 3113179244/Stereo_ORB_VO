@@ -9,7 +9,8 @@
 #include <vector>
 
 /**
- * @brief 单目重投影误差残差块（2D-2D 残差，带信息权重）
+ * @brief 单目重投影误差残差块（2D-2D 残差，约束左目 u, v）
+ * 适用于：单目点 或 双目远点 (Z >= mThDepth)
  */
 struct ReprojectionErrorMonocular
 {
@@ -33,7 +34,7 @@ struct ReprojectionErrorMonocular
         T u = T(K_(0, 0)) * p_c[0] * inv_z + T(K_(0, 2));
         T v = T(K_(1, 1)) * p_c[1] * inv_z + T(K_(1, 2));
 
-        // 加权残差: (预测 - 观测) * 权重
+        // 加权残差: [uL, vL]
         residuals[0] = (u - T(observed_[0])) * T(inv_sigma_);
         residuals[1] = (v - T(observed_[1])) * T(inv_sigma_);
 
@@ -54,7 +55,8 @@ struct ReprojectionErrorMonocular
 };
 
 /**
- * @brief 双目重投影误差残差块（3D-2D 残差，包含左目 (u, v) 与右目 uR，带信息权重）
+ * @brief 双目重投影误差残差块（3D-2D 残差，约束左目 u, v 以及右目 uR）
+ * 适用于：双目近点 (0 < Z < mThDepth 且 u_r >= 0)
  */
 struct ReprojectionErrorStereo
 {
@@ -79,7 +81,7 @@ struct ReprojectionErrorStereo
         T v = T(K_(1, 1)) * p_c[1] * inv_z + T(K_(1, 2));
         T u_r = u - T(bf_) * inv_z;
 
-        // 3维残差加权: [uL, vL, uR]
+        // 加权残差: [uL, vL, uR]
         residuals[0] = (u - T(observed_[0])) * T(inv_sigma_);
         residuals[1] = (v - T(observed_[1])) * T(inv_sigma_);
         residuals[2] = (u_r - T(observed_[2])) * T(inv_sigma_);
@@ -129,10 +131,13 @@ int MotionOnlyBA::Optimize(Frame *pFrame)
     };
 
     const int its[4] = {10, 10, 10, 10};
-    const double chi2_mono = 5.991;   // 2自由度 Chi-Square 阈值
-    const double chi2_stereo = 7.815; // 3自由度 Chi-Square 阈值
+    const double chi2_mono = 5.991;   // 2自由度 Chi-Square 阈值 (95% 置信度)
+    const double chi2_stereo = 7.815; // 3自由度 Chi-Square 阈值 (95% 置信度)
+    const double thDepth = static_cast<double>(pFrame->mThDepth); // 远近点分界深度
+
     int num_inliers = 0;
 
+    // ORB-SLAM2 采用 4 轮迭代优化（前2轮开启 Huber 核函数抑制外点，后2轮关闭核函数精细收敛）
     for (int it = 0; it < 4; ++it)
     {
         ceres::Problem problem;
@@ -160,7 +165,8 @@ int MotionOnlyBA::Optimize(Frame *pFrame)
             Eigen::Vector3d P_c = cur_R * P_w + cur_t;
             double depth = P_c[2];
 
-            if (depth <= 0)
+            // 位于相机后方的点直接标记为外点
+            if (depth <= 0.0)
             {
                 pFrame->mvbOutlier[i] = true;
                 continue;
@@ -171,15 +177,21 @@ int MotionOnlyBA::Optimize(Frame *pFrame)
             const float u_r = pFrame->mvuRight[i];
 
             ceres::CostFunction *cost_function = nullptr;
-            if (u_r >= 0.0f)
+
+            // =========================================================================
+            // ORB-SLAM2 核心策略：
+            // 1. 双目近点 (u_r >= 0 且 depth < thDepth)：使用 3DoF Stereo 残差（强约束平移+旋转）
+            // 2. 双目远点 (depth >= thDepth) 或 单目点 (u_r < 0)：降级为 2DoF Monocular 残差（约束旋转）
+            // =========================================================================
+            if (u_r >= 0.0f && depth < thDepth)
             {
-                // 双目/近点
+                // 双目近点
                 Eigen::Vector3d obs(pFrame->mvKeysUn[i].pt.x, pFrame->mvKeysUn[i].pt.y, u_r);
                 cost_function = ReprojectionErrorStereo::Create(obs, P_w, K_eigen, pFrame->mbf, inv_sigma);
             }
             else
             {
-                // 单目/远点
+                // 单目点 或 双目远点
                 Eigen::Vector2d obs(pFrame->mvKeysUn[i].pt.x, pFrame->mvKeysUn[i].pt.y);
                 cost_function = ReprojectionErrorMonocular::Create(obs, P_w, K_eigen, inv_sigma);
             }
@@ -200,7 +212,7 @@ int MotionOnlyBA::Optimize(Frame *pFrame)
         ceres::Solver::Summary summary;
         ceres::Solve(options, &problem, &summary);
 
-        // 提取位姿并根据加权卡方统计量更新 Outlier
+        // 提取优化后的当前位姿
         Eigen::Vector3d opt_r(camera_pose[0], camera_pose[1], camera_pose[2]);
         Eigen::Vector3d opt_t(camera_pose[3], camera_pose[4], camera_pose[5]);
         double angle = opt_r.norm();
@@ -210,6 +222,9 @@ int MotionOnlyBA::Optimize(Frame *pFrame)
             opt_R = Eigen::AngleAxisd(angle, opt_r.normalized()).toRotationMatrix();
         }
 
+        // =========================================================================
+        // 卡方检验 (Chi-Square Test) 更新内/外点
+        // =========================================================================
         num_inliers = 0;
         for (int i = 0; i < N; ++i)
         {
@@ -219,14 +234,15 @@ int MotionOnlyBA::Optimize(Frame *pFrame)
 
             Eigen::Vector3d P_w = pMP->GetWorldPos().cast<double>();
             Eigen::Vector3d P_c = opt_R * P_w + opt_t;
+            double depth = P_c[2];
 
-            if (P_c[2] <= 0)
+            if (depth <= 0.0)
             {
                 pFrame->mvbOutlier[i] = true;
                 continue;
             }
 
-            double inv_z = 1.0 / P_c[2];
+            double inv_z = 1.0 / depth;
             double u = K_eigen(0, 0) * P_c[0] * inv_z + K_eigen(0, 2);
             double v = K_eigen(1, 1) * P_c[1] * inv_z + K_eigen(1, 2);
 
@@ -237,8 +253,10 @@ int MotionOnlyBA::Optimize(Frame *pFrame)
             double dv = v - pFrame->mvKeysUn[i].pt.y;
             const float u_r = pFrame->mvuRight[i];
 
-            if (u_r >= 0.0f)
+            // 判断该点是按 Stereo 还是 Monocular 检验
+            if (u_r >= 0.0f && depth < thDepth)
             {
+                // 双目近点：3 自由度误差
                 double u_r_proj = u - pFrame->mbf * inv_z;
                 double du_r = u_r_proj - u_r;
                 double chi2 = (du * du + dv * dv + du_r * du_r) * inv_sigma2;
@@ -255,6 +273,7 @@ int MotionOnlyBA::Optimize(Frame *pFrame)
             }
             else
             {
+                // 单目点或远点：2 自由度误差
                 double chi2 = (du * du + dv * dv) * inv_sigma2;
 
                 if (chi2 > chi2_mono)
@@ -270,7 +289,7 @@ int MotionOnlyBA::Optimize(Frame *pFrame)
         }
     }
 
-    // 写回优化后的位姿
+    // 写回最终优化位姿
     Eigen::Vector3d final_r(camera_pose[0], camera_pose[1], camera_pose[2]);
     Eigen::Vector3d final_t(camera_pose[3], camera_pose[4], camera_pose[5]);
     double angle = final_r.norm();
