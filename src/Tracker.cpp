@@ -245,6 +245,7 @@ bool Tracker::StereoInitialization()
     if (mpLocalMapper)
     {
         mpLocalMapper->InsertKeyFrame(pKFinit);
+        mpLocalMapper->RequestStopBA();
     }
 
     mpReferenceKF = pKFinit;

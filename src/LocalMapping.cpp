@@ -15,7 +15,7 @@
 LocalMapping::LocalMapping(System *pSys, std::shared_ptr<Map> pMap)
     : mpSystem(pSys), mpMap(pMap), mpTracker(nullptr),
       mpCurrentKeyFrame(nullptr), mbStopRequested(false),
-      mbStopped(false), mbNotStop(false), mbAcceptKeyFrames(true)
+      mbStopped(false), mbNotStop(false), mbAcceptKeyFrames(true), mbAbortBA(false)
 {
     mpThread = new std::thread(&LocalMapping::Run, this);
 }
@@ -116,7 +116,6 @@ static bool Triangulate(const Eigen::Matrix3f &R1, const Eigen::Vector3f &t1,
 void LocalMapping::Run()
 {
     mbStopped = false;
-
     while (1)
     {
         if (CheckNewKeyFrames())
@@ -140,7 +139,10 @@ void LocalMapping::Run()
 
             // 5. 局部 BA 优化
             if (!CheckNewKeyFrames())
-                Optimizer::LocalBundleAdjustment(mpCurrentKeyFrame, mpMap);
+            {
+                mbAbortBA = false;
+                Optimizer::LocalBundleAdjustment(mpCurrentKeyFrame, &mbAbortBA, mpMap);
+            }
 
             // 6. 剔除冗余关键帧
             KeyFrameCulling();
@@ -173,12 +175,6 @@ void LocalMapping::InsertKeyFrame(KeyFrame *pKF)
 }
 
 bool LocalMapping::CheckNewKeyFrames()
-{
-    std::unique_lock<std::mutex> lock(mMutexNewKeyBase);
-    return !mlNewKeyFrames.empty();
-}
-
-bool LocalMapping::KeyframesInQueue()
 {
     std::unique_lock<std::mutex> lock(mMutexNewKeyBase);
     return !mlNewKeyFrames.empty();
@@ -692,4 +688,16 @@ bool LocalMapping::SetNotStop()
         return false;
     mbNotStop = true;
     return true;
+}
+
+// 请求中断当前正在进行的局部 BA
+void LocalMapping::RequestStopBA()
+{
+    mbAbortBA = true;
+}
+
+int LocalMapping::KeyframesInQueue()
+{
+    std::unique_lock<std::mutex> lock(mMutexNewKeyBase);
+    return static_cast<int>(mlNewKeyFrames.size());
 }

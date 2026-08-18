@@ -34,9 +34,8 @@ public:
     bool SetNotStop();
     bool AcceptKeyFrames();
     bool GetStopRequired();
-    // 查询是否有待处理的关键帧（Tracking 线程据此判断 LocalMapping 是否空闲）
-    bool KeyframesInQueue();
-
+    void RequestStopBA();
+    int KeyframesInQueue();
 private:
     // 地图点与关键帧处理主流程函数
     void ProcessNewKeyFrame();
@@ -47,7 +46,8 @@ private:
 
     // 线程控制与标记
     bool CheckNewKeyFrames();
-
+    // 中断 BA 标志位
+    bool mbAbortBA;
     System* mpSystem;
     std::shared_ptr<Map> mpMap;
     Tracker* mpTracker;
