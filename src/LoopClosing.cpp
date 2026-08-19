@@ -59,7 +59,7 @@ void LoopClosing::Run()
             // 1. 闭环候选初筛与连续性检验
             if (DetectLoop())
             {
-                std::cout << "\033[32;1m>>> [LoopTrigger] 成功检测到连续一致性闭环候选组！<<<\033[0m" << std::endl;
+                // std::cout << "\033[32;1m>>> [LoopTrigger] 成功检测到连续一致性闭环候选组！<<<\033[0m" << std::endl;
 
                 // 2. 几何位姿求解检验 (PnP / RANSAC)
                 if (ComputeSE3())
@@ -68,17 +68,16 @@ void LoopClosing::Run()
                               << mpCurrentKF->mnId << " 与闭环KF-" << mpMatchedKF->mnId
                               << " 形成有效回环！<<<\033[0m" << std::endl;
 
-                    // 1. 真正执行闭环融合校正
+                    // 执行闭环融合
                     CorrectLoop();
 
-                    // 2. 状态重置：清空连续性组与候选缓存
-                    mvConsistentGroups.clear();
+                    // 仅清空当前候选，保留连续性分组由 DetectLoop 迭代更新
                     mvpEnoughConsistentCandidates.clear();
                 }
-                else
-                {
-                    std::cout << "\033[31m[LoopTrigger FAILED] 候选帧连续性达标，但 PnP 几何校验未通过。\033[0m" << std::endl;
-                }
+                // else
+                // {
+                //     std::cout << "\033[31m[LoopTrigger FAILED] 候选帧连续性达标，但 PnP 几何校验未通过。\033[0m" << std::endl;
+                // }
             }
         }
 
@@ -108,10 +107,9 @@ bool LoopClosing::DetectLoop()
     if (!mpCurrentKF || mpCurrentKF->mbBad)
         return false;
 
-    // 确保当前关键帧已计算 BoW
     mpCurrentKF->ComputeBoW();
 
-    // 1. 获取当前帧的所有相连共视帧，计算共视邻域内的最小 BoW 相似度得分
+    // 1. 获取共视邻域内的最小 BoW 得分
     const std::vector<KeyFrame *> vpConnectedKFs = mpCurrentKF->GetConnectedKeyFrames();
     const DBoW3::BowVector &curBow = mpCurrentKF->mBowVec;
 
@@ -126,7 +124,7 @@ bool LoopClosing::DetectLoop()
             minScore = score;
     }
 
-    // 2. 从关键帧数据库中检索候选帧
+    // 2. 数据库检索候选关键帧
     std::vector<KeyFrame *> vpCandidateKFs;
     if (mpKeyFrameDB)
     {
@@ -138,7 +136,7 @@ bool LoopClosing::DetectLoop()
         return false;
     }
 
-    // 3. 对候选帧进行共视组聚类与连续性检验 (Temporal Consistency)
+    // 3. ORB-SLAM2 官方一致性滑动窗口检查
     mvpEnoughConsistentCandidates.clear();
     std::vector<ConsistentGroup> vCurrentConsistentGroups;
     std::vector<bool> vbGroupMatched(mvConsistentGroups.size(), false);
@@ -147,11 +145,13 @@ bool LoopClosing::DetectLoop()
     {
         std::set<KeyFrame *> sGroup;
         sGroup.insert(pCandKF);
-        std::vector<KeyFrame *> vNeighs = pCandKF->GetBestCovisibilityKeyFrames(5);
+        std::vector<KeyFrame *> vNeighs = pCandKF->GetBestCovisibilityKeyFrames(10);
         for (KeyFrame *pN : vNeighs)
             sGroup.insert(pN);
 
+        int nConsistency = 1;
         bool bMatched = false;
+
         for (size_t i = 0; i < mvConsistentGroups.size(); ++i)
         {
             const std::set<KeyFrame *> &sPrevGroup = mvConsistentGroups[i].first;
@@ -159,16 +159,9 @@ bool LoopClosing::DetectLoop()
             {
                 if (sPrevGroup.count(pGKF))
                 {
-                    int nConsistency = mvConsistentGroups[i].second + 1;
-                    vCurrentConsistentGroups.push_back(std::make_pair(sGroup, nConsistency));
+                    nConsistency = mvConsistentGroups[i].second + 1;
                     vbGroupMatched[i] = true;
                     bMatched = true;
-
-                    // 连续 3 帧命中同一组共视关键帧
-                    if (nConsistency >= 3)
-                    {
-                        mvpEnoughConsistentCandidates.push_back(pCandKF);
-                    }
                     break;
                 }
             }
@@ -176,9 +169,21 @@ bool LoopClosing::DetectLoop()
                 break;
         }
 
-        if (!bMatched)
+        vCurrentConsistentGroups.push_back(std::make_pair(sGroup, nConsistency));
+
+        // 达到 3 帧连续一致性阈值
+        if (nConsistency >= 3)
         {
-            vCurrentConsistentGroups.push_back(std::make_pair(sGroup, 1));
+            mvpEnoughConsistentCandidates.push_back(pCandKF);
+        }
+    }
+
+    // 将未匹配但历史存在的组降级保留（衰减机制，防止剧烈抖动清零）
+    for (size_t i = 0; i < mvConsistentGroups.size(); ++i)
+    {
+        if (!vbGroupMatched[i] && mvConsistentGroups[i].second > 1)
+        {
+            vCurrentConsistentGroups.push_back(std::make_pair(mvConsistentGroups[i].first, 1));
         }
     }
 
@@ -198,14 +203,13 @@ bool LoopClosing::ComputeSE3()
         if (!pCandKF || pCandKF->mbBad)
             continue;
 
-        // 1. 通过词袋匹配候选帧与当前帧地图点
+        // 阶段 1: BoW 粗匹配
         std::vector<MapPoint *> vpMatchedMapPoints;
         int nmatches = matcher.SearchByBoW(mpCurrentKF, pCandKF, vpMatchedMapPoints);
 
         if (nmatches < 20)
             continue;
 
-        // 2. 构造 3D-2D 对应进行 RANSAC PnP 求解
         std::vector<cv::Point3f> vPts3D;
         std::vector<cv::Point2f> vPts2D;
         std::vector<int> vMPIndices;
@@ -222,7 +226,7 @@ bool LoopClosing::ComputeSE3()
             }
         }
 
-        if (vPts3D.size() < 15)
+        if (vPts3D.size() < 20)
             continue;
 
         cv::Mat rvec, tvec;
@@ -231,10 +235,10 @@ bool LoopClosing::ComputeSE3()
             vPts3D, vPts2D, mpCurrentKF->mK, cv::Mat::zeros(4, 1, CV_32F),
             rvec, tvec, false, 300, 8.0f, 0.99, inliers, cv::SOLVEPNP_EPNP);
 
-        if (!bOK || inliers.size() < 15)
+        if (!bOK || inliers.size() < 20)
             continue;
 
-        // 3. 转换为当前帧全局位姿 Tcw_loop
+        // 提取粗估计位姿
         cv::Mat R_cv;
         cv::Rodrigues(rvec, R_cv);
         Eigen::Matrix4f Tcw = Eigen::Matrix4f::Identity();
@@ -245,10 +249,76 @@ bool LoopClosing::ComputeSE3()
                 Tcw(r, c) = static_cast<float>(R_cv.at<double>(r, c));
         }
 
-        mpMatchedKF = pCandKF;
-        mTcw_loop = Tcw;
-        mvpLoopMatchedPoints = vpMatchedMapPoints;
-        return true;
+        // 阶段 2: ORB-SLAM2 官方投影引导二次扩充匹配
+        // 利用初解位姿将候选帧及共视邻居的地图点反投影到当前帧搜索更多匹配
+        std::vector<KeyFrame *> vpCandNeighs = pCandKF->GetBestCovisibilityKeyFrames(10);
+        vpCandNeighs.push_back(pCandKF);
+
+        std::set<MapPoint *> sCandMPs;
+        for (KeyFrame *pKFi : vpCandNeighs)
+        {
+            for (MapPoint *pMPi : pKFi->GetMapPointMatches())
+            {
+                if (pMPi && !pMPi->isBad())
+                    sCandMPs.insert(pMPi);
+            }
+        }
+
+        int nAdditionalMatches = 0;
+        const Eigen::Matrix3f Rcw = Tcw.block<3, 3>(0, 0);
+        const Eigen::Vector3f tcw = Tcw.block<3, 1>(0, 3);
+
+        for (MapPoint *pMP : sCandMPs)
+        {
+            Eigen::Vector3f Pc = Rcw * pMP->GetWorldPos() + tcw;
+            if (Pc.z() <= 0.0f)
+                continue;
+
+            float invz = 1.0f / Pc.z();
+            float u = mpCurrentKF->fx * Pc.x() * invz + mpCurrentKF->cx;
+            float v = mpCurrentKF->fy * Pc.y() * invz + mpCurrentKF->cy;
+
+            if (u < mpCurrentKF->mnMinX || u >= mpCurrentKF->mnMaxX ||
+                v < mpCurrentKF->mnMinY || v >= mpCurrentKF->mnMaxY)
+                continue;
+
+            std::vector<size_t> vIndices = mpCurrentKF->GetFeaturesInArea(u, v, 10.0f);
+            if (vIndices.empty())
+                continue;
+
+            const cv::Mat &dMP = pMP->GetDescriptor();
+            int bestDist = ORBmatcher::TH_LOW;
+            int bestIdx = -1;
+
+            for (size_t idx : vIndices)
+            {
+                if (vpMatchedMapPoints[idx])
+                    continue;
+                const cv::Mat &dF = mpCurrentKF->mDescriptors.row(idx);
+                int dist = ORBmatcher::DescriptorDistance(dMP, dF);
+                if (dist < bestDist)
+                {
+                    bestDist = dist;
+                    bestIdx = idx;
+                }
+            }
+
+            if (bestIdx >= 0)
+            {
+                vpMatchedMapPoints[bestIdx] = pMP;
+                nAdditionalMatches++;
+            }
+        }
+
+        // 阶段 3: 最终严格内点判定 (总匹配点 >= 40 彻底确认闭环)
+        int nTotalMatches = inliers.size() + nAdditionalMatches;
+        if (nTotalMatches >= 40)
+        {
+            mpMatchedKF = pCandKF;
+            mTcw_loop = Tcw;
+            mvpLoopMatchedPoints = vpMatchedMapPoints;
+            return true;
+        }
     }
 
     return false;
