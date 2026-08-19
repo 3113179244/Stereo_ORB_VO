@@ -75,7 +75,50 @@ struct LocalRepoError
     double u_, v_;
     double sqrtInvSigma2_;
 };
+/**
+ * @brief 局部 BA 用的双目重投影误差（3D-2D，带右目视差约束）
+ * 适用于：双目近点 (u_r >= 0 且 Z < mThDepth)
+ */
+struct LocalRepoErrorStereo
+{
+    LocalRepoErrorStereo(double fx, double fy, double cx, double cy, double mbf,
+                         double u, double v, double u_r, double sqrtInvSigma2)
+        : fx_(fx), fy_(fy), cx_(cx), cy_(cy), mbf_(mbf),
+          u_(u), v_(v), u_r_(u_r), sqrtInvSigma2_(sqrtInvSigma2) {}
 
+    template <typename T>
+    bool operator()(const T *const pose, const T *const point, T *residuals) const
+    {
+        T p_w[3] = {point[0], point[1], point[2]};
+        T p_c[3];
+
+        ceres::AngleAxisRotatePoint(pose, p_w, p_c);
+        p_c[0] += pose[3];
+        p_c[1] += pose[4];
+        p_c[2] += pose[5];
+
+        const T invz = T(1.0) / p_c[2];
+        const T pred_u = fx_ * p_c[0] * invz + cx_;
+        const T pred_v = fy_ * p_c[1] * invz + cy_;
+        const T pred_ur = pred_u - T(mbf_) * invz;
+
+        residuals[0] = (pred_u - T(u_)) * T(sqrtInvSigma2_);
+        residuals[1] = (pred_v - T(v_)) * T(sqrtInvSigma2_);
+        residuals[2] = (pred_ur - T(u_r_)) * T(sqrtInvSigma2_);
+        return true;
+    }
+
+    static ceres::CostFunction *Create(double fx, double fy, double cx, double cy, double mbf,
+                                       double u, double v, double u_r, double sqrtInvSigma2)
+    {
+        return new ceres::AutoDiffCostFunction<LocalRepoErrorStereo, 3, 6, 3>(
+            new LocalRepoErrorStereo(fx, fy, cx, cy, mbf, u, v, u_r, sqrtInvSigma2));
+    }
+
+    double fx_, fy_, cx_, cy_, mbf_;
+    double u_, v_, u_r_;
+    double sqrtInvSigma2_;
+};
 static void PoseToArray(KeyFrame *pKF, double out[6])
 {
     const Eigen::Matrix4f Tcw = pKF->GetPose();
@@ -140,7 +183,8 @@ void Optimizer::LocalBundleAdjustment(KeyFrame *pCurKF, bool *pbStopFlag, std::s
     std::vector<KeyFrame *> vpFixedKFs;
     for (size_t i = 0; i < vpLocalKFs.size(); ++i)
     {
-        std::vector<KeyFrame *> vNeigh = vpLocalKFs[i]->GetBestCovisibilityKeyFrames(5);
+        // 扩大固定关键帧共视搜索范围 (从 5 扩大到 10)
+        std::vector<KeyFrame *> vNeigh = vpLocalKFs[i]->GetBestCovisibilityKeyFrames(10);
         for (size_t j = 0; j < vNeigh.size(); ++j)
         {
             KeyFrame *pKF = vNeigh[j];
@@ -175,7 +219,17 @@ void Optimizer::LocalBundleAdjustment(KeyFrame *pCurKF, bool *pbStopFlag, std::s
 
     if (nLocalKFs < 2 || nLocalMPs < 5)
         return;
-
+    // 找出局部帧中 ID 最小的一帧（当没有固定关键帧时，作为局部地图坐标系的保底锚定帧）
+    KeyFrame* pAnchorKF = nullptr;
+    if (vpFixedKFs.empty() && !vpLocalKFs.empty())
+    {
+        pAnchorKF = vpLocalKFs[0];
+        for (size_t i = 1; i < vpLocalKFs.size(); ++i)
+        {
+            if (vpLocalKFs[i]->mnId < pAnchorKF->mnId)
+                pAnchorKF = vpLocalKFs[i];
+        }
+    }
     // ------------------------------------------------------------------
     // Step 4: 构建 Ceres 变量内存
     // ------------------------------------------------------------------
@@ -244,7 +298,7 @@ void Optimizer::LocalBundleAdjustment(KeyFrame *pCurKF, bool *pbStopFlag, std::s
     {
         KeyFrame *pKF = vpLocalKFs[i];
         problem1.AddParameterBlock(mapKFPose[pKF], 6);
-        if ((vpFixedKFs.empty() && i == 0) || pKF->mnId == 0)
+        if (pKF->mnId == 0 || pKF == pAnchorKF)
             problem1.SetParameterBlockConstant(mapKFPose[pKF]);
     }
 
@@ -275,9 +329,21 @@ void Optimizer::LocalBundleAdjustment(KeyFrame *pCurKF, bool *pbStopFlag, std::s
 
             const double invSigma2 = pKF->mvInvLevelSigma2[level];
             const double sqrtInvSigma2 = std::sqrt(invSigma2);
+            const float u_r = pKF->mvuRight[j];
+            const float depth = pKF->mvDepth[j];
 
-            ceres::CostFunction *cost =
-                LocalRepoError::Create(fx, fy, cx, cy, kp.pt.x, kp.pt.y, sqrtInvSigma2);
+            ceres::CostFunction *cost = nullptr;
+            // 判断是否是双目近点（带右目视差约束）
+            if (u_r >= 0.0f && depth > 0.0f && depth < pKF->mThDepth)
+            {
+                cost = LocalRepoErrorStereo::Create(fx, fy, cx, cy, pKF->mbf,
+                                                    kp.pt.x, kp.pt.y, u_r, sqrtInvSigma2);
+            }
+            else
+            {
+                cost = LocalRepoError::Create(fx, fy, cx, cy, kp.pt.x, kp.pt.y, sqrtInvSigma2);
+            }
+
             ceres::LossFunction *loss = new ceres::HuberLoss(std::sqrt(5.991));
             problem1.AddResidualBlock(cost, loss, pose, mapMPPoint[pMP]);
         }
@@ -401,7 +467,7 @@ void Optimizer::LocalBundleAdjustment(KeyFrame *pCurKF, bool *pbStopFlag, std::s
         {
             KeyFrame *pKF = vpLocalKFs[i];
             problem2.AddParameterBlock(mapKFPose[pKF], 6);
-            if ((vpFixedKFs.empty() && i == 0) || pKF->mnId == 0)
+            if (pKF->mnId == 0 || pKF == pAnchorKF)
                 problem2.SetParameterBlockConstant(mapKFPose[pKF]);
         }
 
@@ -435,9 +501,21 @@ void Optimizer::LocalBundleAdjustment(KeyFrame *pCurKF, bool *pbStopFlag, std::s
 
                 const double invSigma2 = pKF->mvInvLevelSigma2[level];
                 const double sqrtInvSigma2 = std::sqrt(invSigma2);
+                const float u_r = pKF->mvuRight[j];
+                const float depth = pKF->mvDepth[j];
 
-                ceres::CostFunction *cost =
-                    LocalRepoError::Create(fx, fy, cx, cy, kp.pt.x, kp.pt.y, sqrtInvSigma2);
+                ceres::CostFunction *cost = nullptr;
+                // 双目近点约束
+                if (u_r >= 0.0f && depth > 0.0f && depth < pKF->mThDepth)
+                {
+                    cost = LocalRepoErrorStereo::Create(fx, fy, cx, cy, pKF->mbf,
+                                                        kp.pt.x, kp.pt.y, u_r, sqrtInvSigma2);
+                }
+                else
+                {
+                    cost = LocalRepoError::Create(fx, fy, cx, cy, kp.pt.x, kp.pt.y, sqrtInvSigma2);
+                }
+
                 ceres::LossFunction *loss = new ceres::HuberLoss(std::sqrt(5.991));
                 problem2.AddResidualBlock(cost, loss, pose, mapMPPoint[pMP]);
             }
@@ -481,24 +559,25 @@ void Optimizer::LocalBundleAdjustment(KeyFrame *pCurKF, bool *pbStopFlag, std::s
     // ------------------------------------------------------------------
     // Step 5: 无论是否被打断，均将当前已优化的参数回写
     // ------------------------------------------------------------------
+    if (pbStopFlag && *pbStopFlag)
     {
-        // 加锁：确保位姿和地图点坐标的批量回写具有原子性，防止前端同时读取处于中间状态的地图
-        std::unique_lock<std::mutex> lock(pMap->mMutexMapUpdate);
+        CleanupMemory();
+        return; // 被外部打断，直接放弃本次未收敛的结果，防止地图被半成品位姿污染
+    }
 
-        for (int i = 0; i < nLocalKFs; ++i)
-            ArrayToPose(vpLocalKFs[i], mapKFPose[vpLocalKFs[i]]);
+    for (int i = 0; i < nLocalKFs; ++i)
+        ArrayToPose(vpLocalKFs[i], mapKFPose[vpLocalKFs[i]]);
 
-        for (int i = 0; i < nLocalMPs; ++i)
+    for (int i = 0; i < nLocalMPs; ++i)
+    {
+        MapPoint *pMP = vpLocalMPs[i];
+        if (sBadMPs.count(pMP))
         {
-            MapPoint *pMP = vpLocalMPs[i];
-            if (sBadMPs.count(pMP))
-            {
-                pMP->SetBadFlag();
-                continue;
-            }
-            double *p = mapMPPoint[pMP];
-            pMP->SetWorldPos(Eigen::Vector3f((float)p[0], (float)p[1], (float)p[2]));
+            pMP->SetBadFlag(); // 将检验出的外点正式标记为坏点
+            continue;
         }
+        double *p = mapMPPoint[pMP];
+        pMP->SetWorldPos(Eigen::Vector3f((float)p[0], (float)p[1], (float)p[2]));
     }
 
     // ------------------------------------------------------------------

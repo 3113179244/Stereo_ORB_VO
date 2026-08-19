@@ -305,6 +305,10 @@ void KeyFrame::SetBadFlag()
         connectedKFs = mConnectedKeyFrameWeights;
         pParent = mpParent;
         vChildren = mspChildren;
+        if (pParent)
+        {
+            mTcp = GetPose() * pParent->GetPoseInverse();
+        }
     }
     {
         std::unique_lock<std::mutex> lockFeat(mMutexFeatures);
@@ -573,4 +577,10 @@ int KeyFrame::TrackedMapPoints(const int &minObs)
         }
     }
     return nPoints;
+}
+
+Eigen::Matrix4f KeyFrame::GetRelativePoseToParent()
+{
+    std::unique_lock<std::mutex> lock(mMutexPose);
+    return mTcp;
 }

@@ -682,11 +682,11 @@ bool Tracker::TrackLocalMap()
 
 bool Tracker::NeedNewKeyFrame()
 {
-    // 确保 LocalMapping 不会被外部阻断
+    // 确保局部建图线程不处于外部请求停止状态
     if (mpLocalMapper)
         mpLocalMapper->SetNotStop();
 
-    // 1. 如果局部建图线程被暂停，不插入
+    // 1. 如果局部建图线程已被暂停，不插入
     if (mpLocalMapper && mpLocalMapper->isStopped())
         return false;
 
@@ -696,13 +696,11 @@ bool Tracker::NeedNewKeyFrame()
 
     const int nKFs = mpMap->GetKeyFramesInMap();
 
-    // 3. 【核心修复】：参考关键帧中有效的地图点总数
-    //    直接统计 mpReferenceKF 里所有非 bad 的地图点，不设 minObs 门槛！
+    // 3. 统计参考关键帧中被跟踪到的有效地图点数量
     int nRefMatches = 0;
     if (mpReferenceKF)
     {
-        // 原版 TrackedMapPoints(nMinObs) 中，只有 nKFs <= 2 时 minObs才为 2，
-        // 但最稳妥、最直观的是直接统计当前参考帧绑定的有效地图点数：
+        // 统计参考关键帧中所有非 bad 的地图点
         const std::vector<MapPoint *> vpRefMPs = mpReferenceKF->GetMapPointMatches();
         for (size_t i = 0; i < vpRefMPs.size(); i++)
         {
@@ -710,17 +708,16 @@ bool Tracker::NeedNewKeyFrame()
                 nRefMatches++;
         }
     }
-
-    // 避免除零异常
     if (nRefMatches == 0)
         nRefMatches = 1;
 
-    // 4. 双目近点统计
+    // 4. 【ORB-SLAM2 官方双目近点统计】
     int nNonTrackedClose = 0;
     int nTrackedClose = 0;
     for (int i = 0; i < mCurrentFrame.N; i++)
     {
-        if (mCurrentFrame.mvDepth[i] > 0 && mCurrentFrame.mvDepth[i] < mCurrentFrame.mThDepth)
+        // 深度在有效立体观测范围 (0, mThDepth) 内
+        if (mCurrentFrame.mvDepth[i] > 0.0f && mCurrentFrame.mvDepth[i] < mCurrentFrame.mThDepth)
         {
             if (mCurrentFrame.mvpMapPoints[i] && !mCurrentFrame.mvbOutlier[i])
                 nTrackedClose++;
@@ -729,42 +726,34 @@ bool Tracker::NeedNewKeyFrame()
         }
     }
 
-    // 触发近点补充机制
-    bool bNeedToInsertClose = (nTrackedClose < 100) && (nNonTrackedClose > 70);
+    // 【ORB-SLAM2 官方标准阈值】：已跟踪近点 < 75 且 未跟踪近点 > 100
+    bool bNeedToInsertClose = (nTrackedClose < 75) && (nNonTrackedClose > 100);
 
-    // 5. 比例与条件判断
-    float thRefRatio = (nKFs < 2) ? 0.40f : 0.75f;
+    // 5. 【ORB-SLAM2 官方四重条件判定】
     const int nFramesPassed = mCurrentFrame.mnId - mnLastKeyFrameId;
 
-    // Condition 1a: 距离上一关键帧很长时间 (>= 20 帧)
+    // 比率阈值：系统启动初期为 0.40f，平稳运行时为 0.75f
+    const float thRefRatio = (nKFs <= 2) ? 0.40f : 0.75f;
+
+    // 条件 1a: 距离上一关键帧已经超过 20 帧（防止长时间不插帧）
     const bool c1a = nFramesPassed >= 20;
 
-    // Condition 1b: 至少隔了 2 帧
-    const bool c1b = nFramesPassed >= 2;
+    // 条件 1b: 至少间隔 3 帧（严防基线过小引起的几何退化与克隆），且 LocalMapping 处于空闲状态
+    const bool c1b = (nFramesPassed >= 3) && (mpLocalMapper && mpLocalMapper->KeyframesInQueue() == 0);
 
-    // Condition 1c: 跟踪急剧衰减（跌破 25%）或急需补充近点
+    // 条件 1c: 跟踪急剧衰减（跌破 25%）或急需补充近点
     const bool c1c = (mnMatchesInliers < nRefMatches * 0.25f) || bNeedToInsertClose;
 
-    // Condition 2: 匹配点降到参考帧 75% 以下，或需要补近点；且内点 > 15
-    const bool c2 = ((mnMatchesInliers < nRefMatches * thRefRatio) || bNeedToInsertClose) && (mnMatchesInliers > 15);
+    // 条件 2: 匹配点比例跌破门槛，或需要补充近点，且当前跟踪处于安全线以上 (inliers >= 15)
+    const bool c2 = ((mnMatchesInliers < nRefMatches * thRefRatio) || bNeedToInsertClose) && (mnMatchesInliers >= 15);
 
-    // 日志打印（观察修复效果）
-    // std::cout << "[KF Check] Inliers: " << mnMatchesInliers
-    //           << " | RefMatches: " << nRefMatches
-    //           << " | Ratio: " << (float)mnMatchesInliers / nRefMatches
-    //           << " | FrameDiff: " << nFramesPassed << std::endl;
-
-    // 6. 决策
+    // 综合判断
     if ((c1a || c1b || c1c) && c2)
     {
-        // 只要队列里的阻塞数量少于 3 个，就允许插入
-        if (mpLocalMapper)
-        {
-            if (mpLocalMapper->KeyframesInQueue() < 3)
-                return true;
-            else
-                return false;
-        }
+        // 如果 LocalMapping 队列已经堆积了 3 帧以上，坚决不插入，防止后端 BA 频繁被打断
+        if (mpLocalMapper && mpLocalMapper->KeyframesInQueue() >= 3)
+            return false;
+
         return true;
     }
 

@@ -172,17 +172,15 @@ void System::SaveTrajectoryKITTI(const std::string &filename)
             KeyFrame* pCurrKF = pKF;
             int maxDepth = 0;
 
-            // 沿着生成树向上回溯，每走一层就累乘一次子节点到父节点的相对变换
-            while (pCurrKF && pCurrKF->mbBad && pCurrKF->GetParent() && maxDepth < 5)
+            // 沿着生成树向上回溯，使用被剔除时固化的相对位姿 mTcp 进行变换传递
+            while (pCurrKF && pCurrKF->mbBad && pCurrKF->GetParent() && maxDepth < 10)
             {
                 KeyFrame* pParent = pCurrKF->GetParent();
                 
-                // T_child_parent = T_child_w * T_w_parent = T_child * T_parent^-1
-                Eigen::Matrix4f T_child_w  = pCurrKF->GetPose();
-                Eigen::Matrix4f T_parent_w = pParent->GetPose();
-                Eigen::Matrix4f T_child_parent = T_child_w * T_parent_w.inverse();
+                // 【核心修改】：直接使用剔除时保存的固定相对位姿，绝不能用两帧当前不一致的绝对位姿实时计算！
+                Eigen::Matrix4f T_child_parent = pCurrKF->GetRelativePoseToParent();
 
-                // T_c_parent = T_c_child * T_child_parent
+                // 累乘相对位姿: T_c_parent = T_c_child * T_child_parent
                 T_c_curr = T_c_curr * T_child_parent;
 
                 pCurrKF = pParent;

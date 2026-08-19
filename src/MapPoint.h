@@ -81,7 +81,6 @@ private:
     // ---- 线程安全数据，防止多线程（如跟踪、局部建图、闭环）发生数据竞争 ----
     std::mutex mMutexPos;      // 保护位置数据的互斥锁
     std::mutex mMutexFeatures; // 保护特征观测数据的互斥锁
-
     Eigen::Vector3f mWorldPos;                 // 3D世界坐标
     std::map<KeyFrame*, size_t> mObservations; // 观测到该点的关键帧字典：<关键帧指针, 特征点在关键帧中的索引>
     Eigen::Vector3f mNormalVector;             // 平均观测法向量

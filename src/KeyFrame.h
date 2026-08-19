@@ -65,16 +65,18 @@ public:
     std::vector<MapPoint *> GetMapPointMatches();
     // 获取第 idx 个特征点对应的地图点
     MapPoint *GetMapPoint(const size_t &idx);
-    void SetParent(KeyFrame* pKF);
-    KeyFrame* GetParent();
-    void AddChild(KeyFrame* pKF);
-    void EraseChild(KeyFrame* pKF);
-    std::set<KeyFrame*> GetChilds();
+    void SetParent(KeyFrame *pKF);
+    KeyFrame *GetParent();
+    void AddChild(KeyFrame *pKF);
+    void EraseChild(KeyFrame *pKF);
+    std::set<KeyFrame *> GetChilds();
     // 词袋模型 (Bag of Words)
     // 计算当前关键帧的词袋向量，用于重定位和闭环检测
     void ComputeBoW();
     void SetBadFlag();
     int TrackedMapPoints(const int &minObs);
+    // 获取当自身被标记为 bad 时相对于父节点的相对位姿
+    Eigen::Matrix4f GetRelativePoseToParent();
     std::vector<size_t> GetFeaturesInArea(const float &x, const float &y, const float &r,
                                           const int minLevel = -1, const int maxLevel = -1) const;
     // 网格划分相关参数（每个关键帧独立，用于加速局部特征投影匹配）
@@ -138,7 +140,8 @@ private:
     Eigen::Matrix3f Rcw; // 旋转矩阵 (世界 -> 相机)
     Eigen::Vector3f tcw; // 平移向量 (世界 -> 相机)
     Eigen::Matrix3f Rwc; // 旋转矩阵的逆 (相机 -> 世界)
-
+                         // 保存被剔除时相对于父节点的位姿: T_child_parent
+    Eigen::Matrix4f mTcp;
     // 记录特征点关联的 3D 地图点（按特征点索引排列，空则为 nullptr）
     std::vector<MapPoint *> mvpMapPoints;
 
