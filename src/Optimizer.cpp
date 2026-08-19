@@ -210,7 +210,8 @@ void Optimizer::LocalBundleAdjustment(KeyFrame *pCurKF, bool *pbStopFlag, std::s
         vPointArrays.push_back(p);
     }
 
-    auto CleanupMemory = [&]() {
+    auto CleanupMemory = [&]()
+    {
         for (size_t i = 0; i < vPoseArrays.size(); ++i)
             delete[] vPoseArrays[i];
         for (auto &kv : mapFixedPose)
@@ -480,19 +481,24 @@ void Optimizer::LocalBundleAdjustment(KeyFrame *pCurKF, bool *pbStopFlag, std::s
     // ------------------------------------------------------------------
     // Step 5: 无论是否被打断，均将当前已优化的参数回写
     // ------------------------------------------------------------------
-    for (int i = 0; i < nLocalKFs; ++i)
-        ArrayToPose(vpLocalKFs[i], mapKFPose[vpLocalKFs[i]]);
-
-    for (int i = 0; i < nLocalMPs; ++i)
     {
-        MapPoint *pMP = vpLocalMPs[i];
-        if (sBadMPs.count(pMP))
+        // 加锁：确保位姿和地图点坐标的批量回写具有原子性，防止前端同时读取处于中间状态的地图
+        std::unique_lock<std::mutex> lock(pMap->mMutexMapUpdate);
+
+        for (int i = 0; i < nLocalKFs; ++i)
+            ArrayToPose(vpLocalKFs[i], mapKFPose[vpLocalKFs[i]]);
+
+        for (int i = 0; i < nLocalMPs; ++i)
         {
-            pMP->SetBadFlag(); // 将检验出的外点正式标记为坏点
-            continue;
+            MapPoint *pMP = vpLocalMPs[i];
+            if (sBadMPs.count(pMP))
+            {
+                pMP->SetBadFlag();
+                continue;
+            }
+            double *p = mapMPPoint[pMP];
+            pMP->SetWorldPos(Eigen::Vector3f((float)p[0], (float)p[1], (float)p[2]));
         }
-        double *p = mapMPPoint[pMP];
-        pMP->SetWorldPos(Eigen::Vector3f((float)p[0], (float)p[1], (float)p[2]));
     }
 
     // ------------------------------------------------------------------

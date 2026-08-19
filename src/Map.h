@@ -80,7 +80,8 @@ public:
      * @brief 清空地图中的所有数据（包括关键帧、地图点和参考点）
      */
     void Clear();
-
+    // 提供给外部的地图级互斥锁（保护整个地图拓扑与批量更新一致性）
+    std::mutex mMutexMapUpdate;
 private:
     // 存储地图中所有地图点的集合（使用 std::set 保证唯一性）
     std::set<MapPoint*> mspMapPoints;

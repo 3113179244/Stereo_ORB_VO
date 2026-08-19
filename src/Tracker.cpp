@@ -78,6 +78,7 @@ void Tracker::Track()
     }
     else
     {
+        UpdateLastFrame(); // 更新上一帧数据
         bool bOK = false;
         bool bFromRelocalization = false; // 标记是否是通过重定位恢复的
 
@@ -482,6 +483,7 @@ bool Tracker::Relocalize()
 
 bool Tracker::TrackLocalMap()
 {
+    std::unique_lock<std::mutex> lock(mpMap->mMutexMapUpdate);
     // 1. 搜集局部地图关键帧 (Local KeyFrames)
     std::vector<KeyFrame *> vpLocalKeyFrames;
 
@@ -830,4 +832,20 @@ void Tracker::Reset()
     mlpReferences.clear();
     mlFrameTimes.clear();
     mlbLost.clear();
+}
+
+void Tracker::UpdateLastFrame()
+{
+    // 如果没有参考关键帧，直接退出
+    if (!mpReferenceKF || mpReferenceKF->mbBad)
+        return;
+
+    // 获取上一帧相对于参考关键帧的相对位姿: T_lr = T_lw * T_rw^-1
+    // 由于在 Track() 结束时保存了 mlRelativeFramePoses 和 mlpReferences，此处更新 mLastFrame：
+    if (!mlRelativeFramePoses.empty() && mlpReferences.back() == mpReferenceKF)
+    {
+        Eigen::Matrix4f Tlr = mlRelativeFramePoses.back();
+        // 依据参考关键帧最新可能已被 LocalMapping 优化过的位姿，重新计算上一帧的绝对位姿
+        mLastFrame.SetPose(Tlr * mpReferenceKF->GetPose());
+    }
 }

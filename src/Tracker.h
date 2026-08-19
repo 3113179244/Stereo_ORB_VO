@@ -38,6 +38,7 @@ public:
     void SetViewer(std::shared_ptr<Viewer> pViewer) { mpViewer = pViewer; }
     void Reset();
     bool Relocalize();
+    void UpdateLastFrame();
     eTrackingState mState;
     // 当前帧与上一帧
     Frame mCurrentFrame;
