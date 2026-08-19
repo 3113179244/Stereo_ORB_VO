@@ -50,7 +50,7 @@ public:
      * @return 成功匹配的数量
      */
     int SearchByBoW(KeyFrame *pKF, Frame &F, std::vector<MapPoint *> &vpMapPointMatches);
-
+    int SearchByBoW(KeyFrame *pKF1, KeyFrame *pKF2, std::vector<MapPoint *> &vpMatches12);
     static const int TH_LOW;       // 匹配距离较低阈值，用于要求较高的匹配场景（如非连续帧或宽基线）
     static const int TH_HIGH;      // 匹配距离较高阈值，用于要求较宽松的场景（如连续帧追踪）
     static const int HISTO_LENGTH; // 方向直方图的 Bin 数量 (通常为 36 个 bin，每 10 度划分一个)

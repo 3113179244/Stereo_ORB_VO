@@ -706,3 +706,126 @@ int ORBmatcher::SearchByProjection(Frame &F, const std::vector<MapPoint*> &vpMap
 
     return nmatches;
 }
+
+int ORBmatcher::SearchByBoW(KeyFrame *pKF1, KeyFrame *pKF2, std::vector<MapPoint *> &vpMatches12)
+{
+    const std::vector<MapPoint*> vpMapPoints1 = pKF1->GetMapPointMatches();
+    const std::vector<MapPoint*> vpMapPoints2 = pKF2->GetMapPointMatches();
+    const cv::Mat &Descriptors1 = pKF1->mDescriptors;
+    const cv::Mat &Descriptors2 = pKF2->mDescriptors;
+
+    vpMatches12 = std::vector<MapPoint*>(pKF1->N, static_cast<MapPoint*>(nullptr));
+
+    pKF1->ComputeBoW();
+    pKF2->ComputeBoW();
+
+    int nmatches = 0;
+    std::vector<int> rotHist[HISTO_LENGTH];
+    int histo[HISTO_LENGTH] = {0};
+    const float rotFactor = static_cast<float>(HISTO_LENGTH) / 360.0f;
+
+    const DBoW3::FeatureVector &vFeatVec1 = pKF1->mFeatVec;
+    const DBoW3::FeatureVector &vFeatVec2 = pKF2->mFeatVec;
+
+    auto f1it = vFeatVec1.begin();
+    auto f2it = vFeatVec2.begin();
+    auto f1end = vFeatVec1.end();
+    auto f2end = vFeatVec2.end();
+
+    while (f1it != f1end && f2it != f2end)
+    {
+        if (f1it->first == f2it->first)
+        {
+            const std::vector<unsigned int> &vIndices1 = f1it->second;
+            const std::vector<unsigned int> &vIndices2 = f2it->second;
+
+            for (size_t i1 = 0; i1 < vIndices1.size(); i1++)
+            {
+                const unsigned int realIdx1 = vIndices1[i1];
+                MapPoint *pMP1 = vpMapPoints1[realIdx1];
+                if (!pMP1 || pMP1->isBad())
+                    continue;
+
+                const cv::Mat &d1 = Descriptors1.row(realIdx1);
+
+                int bestDist = TH_LOW;
+                int secondBestDist = TH_LOW;
+                int bestIdx2 = -1;
+
+                for (size_t i2 = 0; i2 < vIndices2.size(); i2++)
+                {
+                    const unsigned int realIdx2 = vIndices2[i2];
+                    MapPoint *pMP2 = vpMapPoints2[realIdx2];
+                    if (!pMP2 || pMP2->isBad())
+                        continue;
+
+                    const cv::Mat &d2 = Descriptors2.row(realIdx2);
+                    int dist = DescriptorDistance(d1, d2);
+
+                    if (dist < bestDist)
+                    {
+                        secondBestDist = bestDist;
+                        bestDist = dist;
+                        bestIdx2 = realIdx2;
+                    }
+                    else if (dist < secondBestDist)
+                    {
+                        secondBestDist = dist;
+                    }
+                }
+
+                if (bestDist < TH_LOW)
+                {
+                    if (static_cast<float>(bestDist) < mfNNratio * static_cast<float>(secondBestDist))
+                    {
+                        vpMatches12[realIdx1] = vpMapPoints2[bestIdx2];
+
+                        if (mbCheckOrientation)
+                        {
+                            float rot = pKF1->mvKeysUn[realIdx1].angle - pKF2->mvKeysUn[bestIdx2].angle;
+                            if (rot < 0.0f) rot += 360.0f;
+                            int bin = cvRound(rot * rotFactor);
+                            if (bin == HISTO_LENGTH) bin = 0;
+                            rotHist[bin].push_back(realIdx1);
+                            histo[bin]++;
+                        }
+                        nmatches++;
+                    }
+                }
+            }
+            f1it++;
+            f2it++;
+        }
+        else if (f1it->first < f2it->first)
+        {
+            f1it++;
+        }
+        else
+        {
+            f2it++;
+        }
+    }
+
+    if (mbCheckOrientation)
+    {
+        int idx1 = -1, idx2 = -1, idx3 = -1;
+        ComputeThreeBestIdx(histo, HISTO_LENGTH, idx1, idx2, idx3);
+
+        for (int i = 0; i < HISTO_LENGTH; i++)
+        {
+            if (i == idx1 || i == idx2 || i == idx3)
+                continue;
+            for (size_t j = 0; j < rotHist[i].size(); j++)
+            {
+                int idx = rotHist[i][j];
+                if (vpMatches12[idx])
+                {
+                    vpMatches12[idx] = nullptr;
+                    nmatches--;
+                }
+            }
+        }
+    }
+
+    return nmatches;
+}

@@ -161,3 +161,123 @@ std::vector<KeyFrame*> KeyFrameDatabase::DetectRelocalizationCandidates(Frame* p
 
     return vpRelocCandidates;
 }
+
+std::vector<KeyFrame*> KeyFrameDatabase::DetectLoopCandidates(KeyFrame* pKF, float minScore)
+{
+    // 1. 搜集当前关键帧自身以及直接相连的共视关键帧[cite: 3]
+    std::set<KeyFrame*> spConnectedKeyFrames;
+    const std::vector<KeyFrame*> vpConn = pKF->GetConnectedKeyFrames(); //[cite: 3]
+    spConnectedKeyFrames.insert(pKF);
+    for (size_t i = 0; i < vpConn.size(); i++)
+        spConnectedKeyFrames.insert(vpConn[i]);
+
+    // 2. 统计与当前关键帧共享 BoW Word 的历史关键帧及词数
+    std::map<KeyFrame*, int> KFsharingWords;
+    {
+        std::unique_lock<std::mutex> lock(mMutex);
+
+        for (auto vit = pKF->mBowVec.begin(); vit != pKF->mBowVec.end(); vit++)
+        {
+            if (vit->first >= mvInvertedFile.size())
+                continue;
+
+            const std::list<KeyFrame*>& lKFs = mvInvertedFile[vit->first];
+
+            for (KeyFrame* pKFi : lKFs)
+            {
+                if (spConnectedKeyFrames.count(pKFi))
+                    continue; // 排除共视组邻居
+
+                KFsharingWords[pKFi]++;
+            }
+        }
+    }
+
+    if (KFsharingWords.empty())
+        return std::vector<KeyFrame*>();
+
+    // 3. 计算最大共享单词数并进行初筛（共享单词数需达到最大值的 80%）
+    int maxCommonWords = 0;
+    for (auto& mit : KFsharingWords)
+    {
+        if (mit.second > maxCommonWords)
+            maxCommonWords = mit.second;
+    }
+
+    int minCommonWords = static_cast<int>(maxCommonWords * 0.8f);
+
+    std::map<KeyFrame*, float> KFScoreMap;
+    std::list<std::pair<float, KeyFrame*>> lScoreAndMatch;
+
+    // 4. 计算 BoW 相似度得分并按 minScore 过滤[cite: 12]
+    for (auto& mit : KFsharingWords)
+    {
+        KeyFrame* pKFi = mit.first;
+        if (mit.second > minCommonWords)
+        {
+            float score = mpVoc->score(pKF->mBowVec, pKFi->mBowVec); //[cite: 12]
+            KFScoreMap[pKFi] = score;
+            if (score >= minScore)
+            {
+                lScoreAndMatch.push_back(std::make_pair(score, pKFi));
+            }
+        }
+    }
+
+    if (lScoreAndMatch.empty())
+        return std::vector<KeyFrame*>();
+
+    // 5. 累加每个候选关键帧及其前 10 个共视邻居的总得分[cite: 3, 12]
+    std::list<std::pair<float, KeyFrame*>> lAccScoreAndMatch;
+    float bestAccScore = minScore;
+
+    for (auto it = lScoreAndMatch.begin(); it != lScoreAndMatch.end(); it++)
+    {
+        KeyFrame* pKFi = it->second;
+        std::vector<KeyFrame*> vpNeighKFs = pKFi->GetBestCovisibilityKeyFrames(10); //[cite: 3, 12]
+
+        float bestScore = it->first;
+        float accScore = it->first;
+        KeyFrame* pBestKF = pKFi;
+
+        for (KeyFrame* pNeighKF : vpNeighKFs)
+        {
+            auto scoreIt = KFScoreMap.find(pNeighKF);
+            if (scoreIt != KFScoreMap.end() && scoreIt->second > 0.0f)
+            {
+                accScore += scoreIt->second;
+                if (scoreIt->second > bestScore)
+                {
+                    pBestKF = pNeighKF;
+                    bestScore = scoreIt->second;
+                }
+            }
+        }
+
+        lAccScoreAndMatch.push_back(std::make_pair(accScore, pBestKF));
+        if (accScore > bestAccScore)
+            bestAccScore = accScore;
+    }
+
+    // 6. 筛选出累加得分高于最高分 75% 的候选帧[cite: 12]
+    float minAccScore = 0.75f * bestAccScore; //[cite: 12]
+
+    std::set<KeyFrame*> spAlreadyAddedKF;
+    std::vector<KeyFrame*> vpLoopCandidates;
+    vpLoopCandidates.reserve(lAccScoreAndMatch.size());
+
+    for (auto it = lAccScoreAndMatch.begin(); it != lAccScoreAndMatch.end(); it++)
+    {
+        if (it->first > minAccScore)
+        {
+            KeyFrame* pKFi = it->second;
+            if (!spAlreadyAddedKF.count(pKFi))
+            {
+                vpLoopCandidates.push_back(pKFi);
+                spAlreadyAddedKF.insert(pKFi);
+            }
+        }
+    } 
+
+    return vpLoopCandidates;
+}

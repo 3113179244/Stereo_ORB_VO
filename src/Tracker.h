@@ -17,7 +17,7 @@ class ORBmatcher;
 class MotionOnlyBA;
 class LocalMapping;
 class KeyFrameDatabase;
-
+class LoopClosing;
 class Tracker
 {
 public:
@@ -36,6 +36,7 @@ public:
     Eigen::Matrix4f GrabImageStereo(const cv::Mat &imRectLeft, const cv::Mat &imRectRight, const double &timestamp);
     void SetLocalMapper(LocalMapping *pLocalMapper) { mpLocalMapper = pLocalMapper; }
     void SetViewer(std::shared_ptr<Viewer> pViewer) { mpViewer = pViewer; }
+    void SetLoopClosing(LoopClosing* pLoopCloser) { mpLoopCloser = pLoopCloser; }
     void Reset();
     bool Relocalize();
     void UpdateLastFrame();
@@ -63,6 +64,7 @@ private:
     std::shared_ptr<Viewer> mpViewer;
     ORBVocabulary* mpORBVocabulary;
     LocalMapping *mpLocalMapper;
+    LoopClosing* mpLoopCloser;
     // 特征提取器指针 (双目需要左右各一个 extractor)
     std::unique_ptr<ORBextractor> mpORBextractorLeft;
     std::unique_ptr<ORBextractor> mpORBextractorRight;

@@ -42,15 +42,25 @@ System::System(const std::string &strConfigFile, const std::string &strVocFile, 
     std::cout << "Vocabulary loaded successfully." << std::endl;
     // 初始化全局地图 Map
     mpMap = std::make_shared<Map>();
-    mpFrameDrawer = std::make_shared<FrameDrawer>(mpMap.get()); 
+
+    mpFrameDrawer = std::make_shared<FrameDrawer>(mpMap.get());
+
     mpKeyFrameDatabase = new KeyFrameDatabase(mpVocabulary.get());
-    // 初始化前端 Tracker
+
     mpTracker = std::make_shared<Tracker>(this, mpVocabulary.get(), mpKeyFrameDatabase, mpMap, sensor);
-    mpTracker->SetFrameDrawer(mpFrameDrawer);
+
     mpLocalMapper = std::make_shared<LocalMapping>(this, mpMap);
+
+    mpLoopCloser = std::make_shared<LoopClosing>(mpMap.get(), mpKeyFrameDatabase, mpVocabulary.get(), true);
+
+    mpTracker->SetFrameDrawer(mpFrameDrawer);
     mpTracker->SetLocalMapper(mpLocalMapper.get());
+    mpTracker->SetLoopClosing(mpLoopCloser.get()); 
+
     mpLocalMapper->SetTracker(mpTracker.get());
-   
+
+    mpLoopCloser->SetTracker(mpTracker.get());    
+    mpLoopCloser->SetLocalMapper(mpLocalMapper.get()); 
     if (bUseViewer)
     {
         mpViewer = std::make_shared<Viewer>(this, mpMap);
@@ -62,6 +72,11 @@ System::System(const std::string &strConfigFile, const std::string &strVocFile, 
 System::~System()
 {
     Shutdown();
+    if (mpKeyFrameDatabase)
+    {
+        delete mpKeyFrameDatabase;
+        mpKeyFrameDatabase = nullptr;
+    }
 }
 
 cv::Mat System::DrawFrame()
@@ -125,7 +140,7 @@ void System::SaveTrajectoryKITTI(const std::string &filename)
         std::cerr << "[System 警告] 单目模式下 KITTI 轨迹尺度未定，可能需要尺度对齐。" << std::endl;
     }
 
-    std::vector<KeyFrame*> vpKFs = mpMap->GetAllKeyFrames();
+    std::vector<KeyFrame *> vpKFs = mpMap->GetAllKeyFrames();
     if (vpKFs.empty())
     {
         std::cerr << "[System 错误] 地图中无关键帧，无法生成轨迹！" << std::endl;
@@ -133,7 +148,8 @@ void System::SaveTrajectoryKITTI(const std::string &filename)
     }
 
     std::sort(vpKFs.begin(), vpKFs.end(),
-              [](KeyFrame *a, KeyFrame *b) { return a->mnId < b->mnId; });
+              [](KeyFrame *a, KeyFrame *b)
+              { return a->mnId < b->mnId; });
 
     Eigen::Matrix4f Two = vpKFs[0]->GetPoseInverse().inverse();
 
@@ -146,8 +162,8 @@ void System::SaveTrajectoryKITTI(const std::string &filename)
     f << std::fixed << std::setprecision(9);
 
     auto lRit = mpTracker->mlpReferences.begin();
-    auto lT   = mpTracker->mlFrameTimes.begin();
-    auto lbL  = mpTracker->mlbLost.begin();
+    auto lT = mpTracker->mlFrameTimes.begin();
+    auto lbL = mpTracker->mlbLost.begin();
 
     Eigen::Matrix4f lastValidTwc = Eigen::Matrix4f::Identity();
     int nValid = 0;
@@ -158,7 +174,7 @@ void System::SaveTrajectoryKITTI(const std::string &filename)
          ++lit, ++lRit, ++lT, ++lbL)
     {
         nTotal++;
-        KeyFrame* pKF = *lRit;
+        KeyFrame *pKF = *lRit;
         Eigen::Matrix4f Tcr = *lit;
         bool bLost = *lbL;
 
@@ -169,14 +185,14 @@ void System::SaveTrajectoryKITTI(const std::string &filename)
         {
             // 严格的坐标链变换：记录从当前帧向上传递的相对位姿
             Eigen::Matrix4f T_c_curr = Tcr;
-            KeyFrame* pCurrKF = pKF;
+            KeyFrame *pCurrKF = pKF;
             int maxDepth = 0;
 
             // 沿着生成树向上回溯，使用被剔除时固化的相对位姿 mTcp 进行变换传递
             while (pCurrKF && pCurrKF->mbBad && pCurrKF->GetParent() && maxDepth < 10)
             {
-                KeyFrame* pParent = pCurrKF->GetParent();
-                
+                KeyFrame *pParent = pCurrKF->GetParent();
+
                 // 【核心修改】：直接使用剔除时保存的固定相对位姿，绝不能用两帧当前不一致的绝对位姿实时计算！
                 Eigen::Matrix4f T_child_parent = pCurrKF->GetRelativePoseToParent();
 
@@ -212,13 +228,13 @@ void System::SaveTrajectoryKITTI(const std::string &filename)
 
         Eigen::Matrix4f T = Two * Twc;
 
-        f << T(0,0) << " " << T(0,1) << " " << T(0,2) << " " << T(0,3) << " "
-          << T(1,0) << " " << T(1,1) << " " << T(1,2) << " " << T(1,3) << " "
-          << T(2,0) << " " << T(2,1) << " " << T(2,2) << " " << T(2,3) << "\n";
+        f << T(0, 0) << " " << T(0, 1) << " " << T(0, 2) << " " << T(0, 3) << " "
+          << T(1, 0) << " " << T(1, 1) << " " << T(1, 2) << " " << T(1, 3) << " "
+          << T(2, 0) << " " << T(2, 1) << " " << T(2, 2) << " " << T(2, 3) << "\n";
     }
 
     f.flush();
     f.close();
-    std::cout << "[System] KITTI 轨迹保存成功！有效帧: " << nValid 
+    std::cout << "[System] KITTI 轨迹保存成功！有效帧: " << nValid
               << " / 总记录帧数: " << nTotal << std::endl;
 }

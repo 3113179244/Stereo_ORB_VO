@@ -806,7 +806,11 @@ void Tracker::CreateNewKeyFrame()
     {
         mpLocalMapper->InsertKeyFrame(pKF);
     }
-
+    
+    if (mpLoopCloser)
+    {
+        mpLoopCloser->InsertKeyFrame(pKF);
+    }
     mpReferenceKF = pKF;
     mnLastKeyFrameId = mCurrentFrame.mnId;
 }

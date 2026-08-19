@@ -48,6 +48,7 @@ add_library(${PROJECT_NAME}_lib
   src/FrameDrawer.cpp
   src/KeyFrameDatabase.cpp
   src/LocalMapping.cpp
+  src/LoopClosing.cpp
 )
 
 target_link_libraries(${PROJECT_NAME}_lib

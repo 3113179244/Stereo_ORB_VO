@@ -28,7 +28,7 @@ public:
 
     // 关键接口：检测用于重定位的候选关键帧集合
     std::vector<KeyFrame*> DetectRelocalizationCandidates(Frame* pF);
-    
+    std::vector<KeyFrame*> DetectLoopCandidates(KeyFrame* pKF, float minScore);
 protected:
     // ORB 词典指针
     ORBVocabulary* mpVoc;

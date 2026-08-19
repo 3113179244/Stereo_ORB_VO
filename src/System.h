@@ -10,6 +10,7 @@
 #include <opencv2/opencv.hpp>
 #include <Eigen/Core>
 #include <DBoW3/DBoW3.h>
+#include "LoopClosing.h"
 // 前向声明
 class Map;
 class Tracker;
@@ -53,6 +54,7 @@ private:
     std::shared_ptr<Tracker> mpTracker;
     std::shared_ptr<Viewer> mpViewer;
     std::shared_ptr<LocalMapping> mpLocalMapper;
+    std::shared_ptr<LoopClosing> mpLoopCloser;
     // 可视化与后台线程句柄
     std::thread *mpViewerThread;
     std::shared_ptr<FrameDrawer> mpFrameDrawer;
