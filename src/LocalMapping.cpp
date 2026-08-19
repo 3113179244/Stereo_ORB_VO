@@ -118,6 +118,26 @@ void LocalMapping::Run()
     mbStopped = false;
     while (1)
     {
+        // 【修改点 1】优先处理停止请求，避免卡死在内部死循环中
+        if (GetStopRequired())
+        {
+            {
+                std::unique_lock<std::mutex> lock(mMutexStop);
+                mbStopped = true;
+            }
+            
+            // 使用 mbStopRequested 作为循环判断条件，配合外部的 Release() 唤醒
+            while (GetStopRequired())
+            {
+                usleep(3000);
+            }
+            
+            {
+                std::unique_lock<std::mutex> lock(mMutexStop);
+                mbStopped = false;
+            }
+        }
+
         if (CheckNewKeyFrames())
         {
             SetNotStop();
@@ -132,13 +152,13 @@ void LocalMapping::Run()
             CreateNewMapPoints();
 
             // 4. 重复点融合
-            if (!CheckNewKeyFrames())
+            if (!CheckNewKeyFrames() && !GetStopRequired())
             {
                 SearchInNeighbors();
             }
 
             // 5. 局部 BA 优化
-            if (!CheckNewKeyFrames())
+            if (!CheckNewKeyFrames() && !GetStopRequired())
             {
                 mbAbortBA = false;
                 Optimizer::LocalBundleAdjustment(mpCurrentKeyFrame, &mbAbortBA, mpMap);
@@ -150,17 +170,6 @@ void LocalMapping::Run()
             {
                 std::unique_lock<std::mutex> lock(mMutexStop);
                 mbNotStop = false;
-            }
-        }
-
-        // 处理停止请求
-        if (GetStopRequired())
-        {
-            std::unique_lock<std::mutex> lock(mMutexStop);
-            mbStopped = true;
-            while (isStopped())
-            {
-                usleep(3000);
             }
         }
 
@@ -700,4 +709,12 @@ int LocalMapping::KeyframesInQueue()
 {
     std::unique_lock<std::mutex> lock(mMutexNewKeyBase);
     return static_cast<int>(mlNewKeyFrames.size());
+}
+
+void LocalMapping::Release()
+{
+    std::unique_lock<std::mutex> lock(mMutexStop);
+    mbStopRequested = false;
+    mbStopped = false;
+    mbNotStop = false;
 }

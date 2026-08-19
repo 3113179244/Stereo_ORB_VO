@@ -11,7 +11,7 @@
 #include <unistd.h>
 #include <algorithm>
 
-LoopClosing::LoopClosing(Map* pMap, KeyFrameDatabase* pDB, DBoW3::Vocabulary* pVoc, const bool bFixScale)
+LoopClosing::LoopClosing(Map *pMap, KeyFrameDatabase *pDB, DBoW3::Vocabulary *pVoc, const bool bFixScale)
     : mpMap(pMap), mpKeyFrameDB(pDB), mpORBVocabulary(pVoc), mpTracker(nullptr), mpLocalMapper(nullptr),
       mbFixScale(bFixScale), mpCurrentKF(nullptr), mpMatchedKF(nullptr),
       mbStopRequested(false), mbStopped(false), mbResetRequested(false)
@@ -29,7 +29,7 @@ LoopClosing::~LoopClosing()
     }
 }
 
-void LoopClosing::InsertKeyFrame(KeyFrame* pKF)
+void LoopClosing::InsertKeyFrame(KeyFrame *pKF)
 {
     std::unique_lock<std::mutex> lock(mMutexLoopQueue);
     if (pKF->mnId != 0)
@@ -64,12 +64,16 @@ void LoopClosing::Run()
                 // 2. 几何位姿求解检验 (PnP / RANSAC)
                 if (ComputeSE3())
                 {
-                    std::cout << "\033[32;1m>>> [LoopTrigger SUCCESS] 闭环几何校验完全通过！当前KF-" 
-                              << mpCurrentKF->mnId << " 与闭环KF-" << mpMatchedKF->mnId 
+                    std::cout << "\033[32;1m>>> [LoopTrigger SUCCESS] 闭环几何校验完全通过！当前KF-"
+                              << mpCurrentKF->mnId << " 与闭环KF-" << mpMatchedKF->mnId
                               << " 形成有效回环！<<<\033[0m" << std::endl;
 
-                    // 校验通过，执行点融合与连通图更新
-                    // CorrectLoop();
+                    // 1. 真正执行闭环融合校正
+                    CorrectLoop();
+
+                    // 2. 状态重置：清空连续性组与候选缓存
+                    mvConsistentGroups.clear();
+                    mvpEnoughConsistentCandidates.clear();
                 }
                 else
                 {
@@ -108,13 +112,14 @@ bool LoopClosing::DetectLoop()
     mpCurrentKF->ComputeBoW();
 
     // 1. 获取当前帧的所有相连共视帧，计算共视邻域内的最小 BoW 相似度得分
-    const std::vector<KeyFrame*> vpConnectedKFs = mpCurrentKF->GetConnectedKeyFrames();
-    const DBoW3::BowVector& curBow = mpCurrentKF->mBowVec;
+    const std::vector<KeyFrame *> vpConnectedKFs = mpCurrentKF->GetConnectedKeyFrames();
+    const DBoW3::BowVector &curBow = mpCurrentKF->mBowVec;
 
     float minScore = 1.0f;
-    for (KeyFrame* pKF : vpConnectedKFs)
+    for (KeyFrame *pKF : vpConnectedKFs)
     {
-        if (pKF->mbBad) continue;
+        if (pKF->mbBad)
+            continue;
         pKF->ComputeBoW();
         float score = mpORBVocabulary->score(curBow, pKF->mBowVec);
         if (score < minScore)
@@ -122,7 +127,7 @@ bool LoopClosing::DetectLoop()
     }
 
     // 2. 从关键帧数据库中检索候选帧
-    std::vector<KeyFrame*> vpCandidateKFs;
+    std::vector<KeyFrame *> vpCandidateKFs;
     if (mpKeyFrameDB)
     {
         vpCandidateKFs = mpKeyFrameDB->DetectLoopCandidates(mpCurrentKF, minScore);
@@ -138,19 +143,19 @@ bool LoopClosing::DetectLoop()
     std::vector<ConsistentGroup> vCurrentConsistentGroups;
     std::vector<bool> vbGroupMatched(mvConsistentGroups.size(), false);
 
-    for (KeyFrame* pCandKF : vpCandidateKFs)
+    for (KeyFrame *pCandKF : vpCandidateKFs)
     {
-        std::set<KeyFrame*> sGroup;
+        std::set<KeyFrame *> sGroup;
         sGroup.insert(pCandKF);
-        std::vector<KeyFrame*> vNeighs = pCandKF->GetBestCovisibilityKeyFrames(5);
-        for (KeyFrame* pN : vNeighs)
+        std::vector<KeyFrame *> vNeighs = pCandKF->GetBestCovisibilityKeyFrames(5);
+        for (KeyFrame *pN : vNeighs)
             sGroup.insert(pN);
 
         bool bMatched = false;
         for (size_t i = 0; i < mvConsistentGroups.size(); ++i)
         {
-            const std::set<KeyFrame*>& sPrevGroup = mvConsistentGroups[i].first;
-            for (KeyFrame* pGKF : sGroup)
+            const std::set<KeyFrame *> &sPrevGroup = mvConsistentGroups[i].first;
+            for (KeyFrame *pGKF : sGroup)
             {
                 if (sPrevGroup.count(pGKF))
                 {
@@ -167,7 +172,8 @@ bool LoopClosing::DetectLoop()
                     break;
                 }
             }
-            if (bMatched) break;
+            if (bMatched)
+                break;
         }
 
         if (!bMatched)
@@ -187,13 +193,13 @@ bool LoopClosing::ComputeSE3()
 {
     ORBmatcher matcher(0.75f, true);
 
-    for (KeyFrame* pCandKF : mvpEnoughConsistentCandidates)
+    for (KeyFrame *pCandKF : mvpEnoughConsistentCandidates)
     {
         if (!pCandKF || pCandKF->mbBad)
             continue;
 
         // 1. 通过词袋匹配候选帧与当前帧地图点
-        std::vector<MapPoint*> vpMatchedMapPoints;
+        std::vector<MapPoint *> vpMatchedMapPoints;
         int nmatches = matcher.SearchByBoW(mpCurrentKF, pCandKF, vpMatchedMapPoints);
 
         if (nmatches < 20)
@@ -206,7 +212,7 @@ bool LoopClosing::ComputeSE3()
 
         for (int i = 0; i < mpCurrentKF->N; ++i)
         {
-            MapPoint* pMP = vpMatchedMapPoints[i];
+            MapPoint *pMP = vpMatchedMapPoints[i];
             if (pMP && !pMP->isBad())
             {
                 Eigen::Vector3f Pw = pMP->GetWorldPos();
@@ -256,7 +262,7 @@ void LoopClosing::CorrectLoop()
     std::cout << "[LoopClosing] 发现有效闭环！当前关键帧: " << mpCurrentKF->mnId
               << " <---> 闭环关键帧: " << mpMatchedKF->mnId << std::endl;
 
-    // 1. 请求暂停 LocalMapping，防止新点生成和局部 BA 产生数据竞争
+    // 1. 请求暂停 LocalMapping
     if (mpLocalMapper)
     {
         mpLocalMapper->RequestStop();
@@ -270,37 +276,23 @@ void LoopClosing::CorrectLoop()
     // 确保当前关键帧连接关系最新
     mpCurrentKF->UpdateConnections();
 
-    // 2. 闭环侧位姿传播：计算当前帧校正前后的漂移变换 dT = Tcw_corrected * Tcw_uncorrected^-1
-    Eigen::Matrix4f Tcw_old = mpCurrentKF->GetPose();
-    Eigen::Matrix4f Twc_old = mpCurrentKF->GetPoseInverse();
-    Eigen::Matrix4f dT = mTcw_loop * Twc_old;
-
-    // 收集当前关键帧及其相连共视帧
-    std::vector<KeyFrame*> vpCurrentConnectedKFs = mpCurrentKF->GetConnectedKeyFrames();
-    vpCurrentConnectedKFs.push_back(mpCurrentKF);
-
-    for (KeyFrame* pKFi : vpCurrentConnectedKFs)
-    {
-        Eigen::Matrix4f Ti_old = pKFi->GetPose();
-        Eigen::Matrix4f Ti_new = Ti_old * dT.inverse(); // 修正相邻帧位姿
-        pKFi->SetPose(Ti_new);
-    }
-
-    // 3. 将闭环组相连关键帧中的地图点投影到当前相连帧中，进行点融合
-    std::vector<KeyFrame*> vpLoopConnectedKFs = mpMatchedKF->GetConnectedKeyFrames();
+    // 2. 将闭环组相连关键帧中的地图点投影到当前相连帧中，进行点融合
+    std::vector<KeyFrame *> vpLoopConnectedKFs = mpMatchedKF->GetConnectedKeyFrames();
     vpLoopConnectedKFs.push_back(mpMatchedKF);
     SearchAndFuse(vpLoopConnectedKFs);
 
-    // 4. 更新闭环区域涉及的所有关键帧共视边
-    for (KeyFrame* pKFi : vpCurrentConnectedKFs)
+    // 3. 重新获取当前关键帧及其相连帧，并更新共视边
+    std::vector<KeyFrame *> vpCurrentConnectedKFs = mpCurrentKF->GetConnectedKeyFrames();
+    vpCurrentConnectedKFs.push_back(mpCurrentKF);
+    for (KeyFrame *pKFi : vpCurrentConnectedKFs)
     {
         pKFi->UpdateConnections();
     }
 
-    // 5. 唤醒并恢复 LocalMapping 线程
+    // 4. 唤醒并恢复 LocalMapping 线程
     if (mpLocalMapper)
     {
-        mpLocalMapper->SetNotStop();
+        mpLocalMapper->Release();
     }
 
     std::cout << "[LoopClosing] 闭环校正与融合完成。" << std::endl;
@@ -309,14 +301,14 @@ void LoopClosing::CorrectLoop()
 // -----------------------------------------------------------------------------
 // 辅助函数: 闭环区域地图点投影融合
 // -----------------------------------------------------------------------------
-void LoopClosing::SearchAndFuse(const std::vector<KeyFrame*>& vpLoopConnectedKFs)
+void LoopClosing::SearchAndFuse(const std::vector<KeyFrame *> &vpLoopConnectedKFs)
 {
     // 收集闭环侧所有地图点
-    std::set<MapPoint*> sLoopMPs;
-    for (KeyFrame* pKF : vpLoopConnectedKFs)
+    std::set<MapPoint *> sLoopMPs;
+    for (KeyFrame *pKF : vpLoopConnectedKFs)
     {
-        std::vector<MapPoint*> vpMPs = pKF->GetMapPointMatches();
-        for (MapPoint* pMP : vpMPs)
+        std::vector<MapPoint *> vpMPs = pKF->GetMapPointMatches();
+        for (MapPoint *pMP : vpMPs)
         {
             if (pMP && !pMP->isBad())
                 sLoopMPs.insert(pMP);
@@ -324,15 +316,15 @@ void LoopClosing::SearchAndFuse(const std::vector<KeyFrame*>& vpLoopConnectedKFs
     }
 
     // 投影到当前帧及其相连帧中并执行 Replace
-    std::vector<KeyFrame*> vpCurrentConnectedKFs = mpCurrentKF->GetConnectedKeyFrames();
+    std::vector<KeyFrame *> vpCurrentConnectedKFs = mpCurrentKF->GetConnectedKeyFrames();
     vpCurrentConnectedKFs.push_back(mpCurrentKF);
 
-    for (KeyFrame* pKF : vpCurrentConnectedKFs)
+    for (KeyFrame *pKF : vpCurrentConnectedKFs)
     {
         const Eigen::Matrix3f Rcw = pKF->GetRotation();
         const Eigen::Vector3f tcw = pKF->GetTranslation();
 
-        for (MapPoint* pMP : sLoopMPs)
+        for (MapPoint *pMP : sLoopMPs)
         {
             if (!pMP || pMP->isBad())
                 continue;
@@ -369,7 +361,7 @@ void LoopClosing::SearchAndFuse(const std::vector<KeyFrame*>& vpLoopConnectedKFs
 
             if (bestIdx >= 0)
             {
-                MapPoint* pMPinKF = pKF->GetMapPoint(bestIdx);
+                MapPoint *pMPinKF = pKF->GetMapPoint(bestIdx);
                 if (!pMPinKF)
                 {
                     pKF->AddMapPoint(pMP, bestIdx);
