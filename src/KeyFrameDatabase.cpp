@@ -164,12 +164,18 @@ std::vector<KeyFrame*> KeyFrameDatabase::DetectRelocalizationCandidates(Frame* p
 
 std::vector<KeyFrame*> KeyFrameDatabase::DetectLoopCandidates(KeyFrame* pKF, float minScore)
 {
-    // 1. 搜集当前关键帧自身以及直接相连的共视关键帧[cite: 3]
+    // 1. 搜集当前关键帧自身以及直接相连与二级相连的共视关键帧
     std::set<KeyFrame*> spConnectedKeyFrames;
-    const std::vector<KeyFrame*> vpConn = pKF->GetConnectedKeyFrames(); //[cite: 3]
+    const std::vector<KeyFrame*> vpConn = pKF->GetConnectedKeyFrames();
     spConnectedKeyFrames.insert(pKF);
     for (size_t i = 0; i < vpConn.size(); i++)
+    {
         spConnectedKeyFrames.insert(vpConn[i]);
+        // 扩展排除二级共视邻居，防止直线上刚滑出视野的近邻帧被召回
+        const std::vector<KeyFrame*> vpConn2 = vpConn[i]->GetConnectedKeyFrames();
+        for (size_t j = 0; j < vpConn2.size(); j++)
+            spConnectedKeyFrames.insert(vpConn2[j]);
+    }
 
     // 2. 统计与当前关键帧共享 BoW Word 的历史关键帧及词数
     std::map<KeyFrame*, int> KFsharingWords;
@@ -186,7 +192,11 @@ std::vector<KeyFrame*> KeyFrameDatabase::DetectLoopCandidates(KeyFrame* pKF, flo
             for (KeyFrame* pKFi : lKFs)
             {
                 if (spConnectedKeyFrames.count(pKFi))
-                    continue; // 排除共视组邻居
+                    continue; // 排除一/二级共视组邻居
+
+                // 【核心修复】：排除距离当前帧过近的邻近关键帧（如刚刚走过的 15 帧内）
+                if (std::abs(static_cast<long int>(pKFi->mnId) - static_cast<long int>(pKF->mnId)) < 15)
+                    continue;
 
                 KFsharingWords[pKFi]++;
             }

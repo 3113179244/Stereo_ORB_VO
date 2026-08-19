@@ -59,10 +59,6 @@ private:
     // 局部地图点投影融合辅助函数
     void SearchAndFuse(const std::vector<KeyFrame*>& vpLoopConnectedKFs);
 
-    // 位姿图优化 (Essential Graph Optimization)
-    void OptimizeEssentialGraph(KeyFrame* pCurKF, KeyFrame* pMatchedKF, 
-                                const Eigen::Matrix4f& g2oCorrectedTcw);
-
 private:
     Map* mpMap;
     KeyFrameDatabase* mpKeyFrameDB;
