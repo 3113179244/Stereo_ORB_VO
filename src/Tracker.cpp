@@ -425,7 +425,7 @@ bool Tracker::Relocalize()
 
         bool bPnPSuccess = cv::solvePnPRansac(
             vPts3D, vPts2D,
-            mCurrentFrame.mK, mCurrentFrame.mDistCoef,
+            mCurrentFrame.mK, cv::Mat(),
             rvec, tvec,
             false, 300, 8.0f, 0.99, inliersPnP, cv::SOLVEPNP_EPNP);
 
@@ -677,7 +677,7 @@ bool Tracker::TrackLocalMap()
         }
     }
 
-    return mnMatchesInliers >= 12;
+    return mnMatchesInliers >= 8;
 }
 
 bool Tracker::NeedNewKeyFrame()

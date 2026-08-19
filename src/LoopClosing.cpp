@@ -329,10 +329,10 @@ bool LoopClosing::ComputeSE3()
 // -----------------------------------------------------------------------------
 void LoopClosing::CorrectLoop()
 {
-    std::cout << "[LoopClosing] 发现有效闭环！当前关键帧: " << mpCurrentKF->mnId
-              << " <---> 闭环关键帧: " << mpMatchedKF->mnId << std::endl;
+    std::cout << "\033[33;1m[LoopClosing] 触发闭环检测点：当前关键帧 KF-" << mpCurrentKF->mnId
+              << " <---> 闭环关键帧 KF-" << mpMatchedKF->mnId << "\033[0m" << std::endl;
 
-    // 1. 请求暂停 LocalMapping
+    // 1. 暂停 LocalMapping 线程，防止并发修改地图
     if (mpLocalMapper)
     {
         mpLocalMapper->RequestStop();
@@ -343,21 +343,20 @@ void LoopClosing::CorrectLoop()
         }
     }
 
-    // 确保当前关键帧连接关系最新
+    // 2. 打印几何解算出的位姿对比，验证 PnP 解算的合理性（不写入地图和关键帧）
+    Eigen::Matrix4f Tcw_old = mpCurrentKF->GetPose();
+    Eigen::Matrix4f Tcw_loop = mTcw_loop;
+
+    Eigen::Vector3f t_old = Tcw_old.block<3, 1>(0, 3);
+    Eigen::Vector3f t_loop = Tcw_loop.block<3, 1>(0, 3);
+    Eigen::Vector3f t_diff = t_loop - t_old;
+
+    std::cout << "  ├─ 原始位姿平移 t_old  : [" << t_old.transpose() << "]" << std::endl;
+    std::cout << "  ├─ PnP闭环位姿平移 t_pnp: [" << t_loop.transpose() << "]" << std::endl;
+    std::cout << "  └─ 闭环修正漂移量 delta_t: [" << t_diff.transpose() << "] (平移漂移: " << t_diff.norm() << " m)" << std::endl;
+
+    // 3. 确保共视连接关系最新
     mpCurrentKF->UpdateConnections();
-
-    // 2. 将闭环组相连关键帧中的地图点投影到当前相连帧中，进行点融合
-    std::vector<KeyFrame *> vpLoopConnectedKFs = mpMatchedKF->GetConnectedKeyFrames();
-    vpLoopConnectedKFs.push_back(mpMatchedKF);
-    SearchAndFuse(vpLoopConnectedKFs);
-
-    // 3. 重新获取当前关键帧及其相连帧，并更新共视边
-    std::vector<KeyFrame *> vpCurrentConnectedKFs = mpCurrentKF->GetConnectedKeyFrames();
-    vpCurrentConnectedKFs.push_back(mpCurrentKF);
-    for (KeyFrame *pKFi : vpCurrentConnectedKFs)
-    {
-        pKFi->UpdateConnections();
-    }
 
     // 4. 唤醒并恢复 LocalMapping 线程
     if (mpLocalMapper)
@@ -365,7 +364,7 @@ void LoopClosing::CorrectLoop()
         mpLocalMapper->Release();
     }
 
-    std::cout << "[LoopClosing] 闭环校正与融合完成。" << std::endl;
+    std::cout << "[LoopClosing] 安全校验完成（已跳过位姿与地图点写入）。" << std::endl;
 }
 
 // -----------------------------------------------------------------------------
