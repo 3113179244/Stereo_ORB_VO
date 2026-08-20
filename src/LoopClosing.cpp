@@ -421,6 +421,9 @@ void LoopClosing::CorrectLoop()
         if (pKFm && !pKFm->mbBad)
             pKFm->UpdateConnections();
     }
+    // std::map<KeyFrame*, Eigen::Matrix4f> dummy1, dummy2;
+    // std::map<KeyFrame*, std::set<KeyFrame*>> dummy3;
+    // Optimizer::OptimizeEssentialGraph(mpMap, mpMatchedKF, mpCurrentKF, dummy1, dummy2, dummy3);
     if (mpTracker)
     {
         mpTracker->ResetVelocity();
