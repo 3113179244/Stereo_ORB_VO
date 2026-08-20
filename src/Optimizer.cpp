@@ -120,66 +120,52 @@ struct LocalRepoErrorStereo
     double sqrtInvSigma2_;
 };
 
-// 6自由度 SE3 位姿图边残差: 约束帧 i 与 帧 j 的相对位姿 T_ij
+// 6自由度 SE3 位姿图残差: 约束帧 i 到 帧 j 的相对测量 T_ij = T_iw * (T_jw)^-1
 struct PoseGraphEdgeError {
     PoseGraphEdgeError(const Eigen::Matrix4f& T_ij_meas) {
-        // T_ij_meas 表示从 j 到 i 的相对变换: T_i_j = T_i_w * (T_j_w)^-1
         Eigen::Matrix3d R_ij = T_ij_meas.block<3,3>(0,0).cast<double>();
         Eigen::Vector3d t_ij = T_ij_meas.block<3,1>(0,3).cast<double>();
-
-        Eigen::AngleAxisd aa(R_ij);
-        r_ij_ = aa.angle() * aa.axis();
+        r_ij_ = Eigen::AngleAxisd(R_ij).angle() * Eigen::AngleAxisd(R_ij).axis();
         t_ij_ = t_ij;
     }
 
     template <typename T>
     bool operator()(const T* const pose_i, const T* const pose_j, T* residuals) const {
-        // pose: [rx, ry, rz, tx, ty, tz] (世界到相机的变换 Tcw)
-        // 目标预测: T_pred_i_j = T_i * (T_j)^-1
-        // R_pred = R_i * R_j^T,  t_pred = t_i - R_pred * t_j
-        
-        T r_i[3] = {pose_i[0], pose_i[1], pose_i[2]};
+        // pose: [rx, ry, rz, tx, ty, tz]
+        T p_i[3] = {pose_i[0], pose_i[1], pose_i[2]};
         T t_i[3] = {pose_i[3], pose_i[4], pose_i[5]};
-        T r_j[3] = {pose_j[0], pose_j[1], pose_j[2]};
+        T p_j[3] = {pose_j[0], pose_j[1], pose_j[2]};
         T t_j[3] = {pose_j[3], pose_j[4], pose_j[5]};
 
-        // 1. 计算 -r_j (求 R_j^T)
-        T r_j_inv[3] = {-r_j[0], -r_j[1], -r_j[2]};
-
-        // 2. 计算 R_pred * t_j = R_i * (R_j^T * t_j)
-        // 等价于 t_pred = t_i - R_i * R_j^T * t_j
-        T temp_t[3];
-        ceres::AngleAxisRotatePoint(r_j_inv, t_j, temp_t);
-        T rot_tj[3];
-        ceres::AngleAxisRotatePoint(r_i, temp_t, rot_tj);
-
-        T t_pred[3] = {t_i[0] - rot_tj[0], t_i[1] - rot_tj[1], t_i[2] - rot_tj[2]};
-
-        // 平移残差: t_pred - t_ij_meas
-        residuals[0] = t_pred[0] - T(t_ij_[0]);
-        residuals[1] = t_pred[1] - T(t_ij_[1]);
-        residuals[2] = t_pred[2] - T(t_ij_[2]);
-
-        // 3. 计算相对旋转残差: R_meas^T * (R_i * R_j^T)
-        // 转为四元数做相对旋转差更精确稳定
+        // 1. 相对旋转 R_pred = R_i * R_j^T
         T q_i[4], q_j[4];
-        ceres::AngleAxisToQuaternion(r_i, q_i);
-        ceres::AngleAxisToQuaternion(r_j, q_j);
-
+        ceres::AngleAxisToQuaternion(p_i, q_i);
+        ceres::AngleAxisToQuaternion(p_j, q_j);
+        
         // q_j_inv = [-q_j[1], -q_j[2], -q_j[3], q_j[0]]
         T q_j_inv[4] = {q_j[0], -q_j[1], -q_j[2], -q_j[3]};
         T q_pred[4];
         ceres::QuaternionProduct(q_i, q_j_inv, q_pred);
 
-        T r_meas[3] = {T(r_ij_[0]), T(r_ij_[1]), T(r_ij_[2])};
+        // 2. 相对平移 t_pred = t_i - R_i * R_j^T * t_j
+        T t_j_rotated[3];
+        ceres::QuaternionRotatePoint(q_pred, t_j, t_j_rotated);
+        T t_pred[3] = {t_i[0] - t_j_rotated[0], t_i[1] - t_j_rotated[1], t_i[2] - t_j_rotated[2]};
+
+        // 平移误差
+        residuals[0] = t_pred[0] - T(t_ij_[0]);
+        residuals[1] = t_pred[1] - T(t_ij_[1]);
+        residuals[2] = t_pred[2] - T(t_ij_[2]);
+
+        // 旋转误差
         T q_meas[4];
+        T r_meas[3] = {T(r_ij_[0]), T(r_ij_[1]), T(r_ij_[2])};
         ceres::AngleAxisToQuaternion(r_meas, q_meas);
         T q_meas_inv[4] = {q_meas[0], -q_meas[1], -q_meas[2], -q_meas[3]};
 
         T q_diff[4];
         ceres::QuaternionProduct(q_meas_inv, q_pred, q_diff);
 
-        // 取四元数的虚部乘以 2 作为李代数旋转残差
         residuals[3] = T(2.0) * q_diff[1];
         residuals[4] = T(2.0) * q_diff[2];
         residuals[5] = T(2.0) * q_diff[3];
@@ -663,10 +649,7 @@ void Optimizer::LocalBundleAdjustment(KeyFrame *pCurKF, bool *pbStopFlag, std::s
     CleanupMemory();
 }
 
-void Optimizer::OptimizeEssentialGraph(Map* pMap, KeyFrame* pLoopKF, KeyFrame* pCurKF,
-                                       const std::map<KeyFrame*, Eigen::Matrix4f>& NonCorrectedSim3,
-                                       const std::map<KeyFrame*, Eigen::Matrix4f>& CorrectedSim3,
-                                       const std::map<KeyFrame*, std::set<KeyFrame*>>& LoopConnections)
+void Optimizer::OptimizeEssentialGraph(Map* pMap, KeyFrame* pLoopKF, KeyFrame* pCurKF, const Eigen::Matrix4f& Tcw_loop)
 {
     std::vector<KeyFrame*> vpKFs = pMap->GetAllKeyFrames();
     const int N = vpKFs.size();
@@ -675,11 +658,10 @@ void Optimizer::OptimizeEssentialGraph(Map* pMap, KeyFrame* pLoopKF, KeyFrame* p
     ceres::Problem problem;
     ceres::LossFunction* loss_function = new ceres::HuberLoss(1.0);
 
-    // 记录优化前所有帧的位姿，用于后续纠正地图点
+    // 1. 记录优化前所有关键帧的平滑位姿（生成树边必须基于该位姿计算相对变换）
     std::map<KeyFrame*, Eigen::Matrix4f> mapOldPoses;
-
-    // 为每个关键帧分配优化变量 [rx, ry, rz, tx, ty, tz]
     std::map<KeyFrame*, double*> mapPoses;
+
     for (KeyFrame* pKF : vpKFs) {
         if (!pKF || pKF->mbBad) continue;
         double* pose = new double[6];
@@ -698,19 +680,19 @@ void Optimizer::OptimizeEssentialGraph(Map* pMap, KeyFrame* pLoopKF, KeyFrame* p
         mapPoses[pKF] = pose;
         problem.AddParameterBlock(pose, 6);
 
-        // 固定闭环匹配关键帧作为绝对锚点
+        // 固定闭环匹配关键帧作为绝对不动锚点
         if (pKF == pLoopKF || pKF->mnId == 0) {
             problem.SetParameterBlockConstant(pose);
         }
     }
 
-    // 1. 添加生成树（Spanning Tree）边：使用优化前两帧之间的相对位姿作为固定测量值
+    // 2. 添加生成树（Spanning Tree）边：使用优化前两帧之间连续记录的相对里程计
     for (KeyFrame* pKF : vpKFs) {
         if (!pKF || pKF->mbBad || pKF->mnId == 0) continue;
         KeyFrame* pParent = pKF->GetParent();
         if (!pParent || !mapPoses.count(pParent) || !mapPoses.count(pKF)) continue;
 
-        // 优化前的真实相对变换: T_child_parent = T_child_w * (T_parent_w)^-1
+        // 真实未被破坏的相对变换: T_child_parent = T_child_w * (T_parent_w)^-1
         Eigen::Matrix4f T_child_parent = mapOldPoses[pKF] * mapOldPoses[pParent].inverse();
         
         problem.AddResidualBlock(PoseGraphEdgeError::Create(T_child_parent),
@@ -718,25 +700,26 @@ void Optimizer::OptimizeEssentialGraph(Map* pMap, KeyFrame* pLoopKF, KeyFrame* p
                                  mapPoses[pKF], mapPoses[pParent]);
     }
 
-    // 2. 添加回环闭合边 (Loop Edge): 由 PnP 确定的当前帧与闭环帧的强约束
+    // 3. 添加回环闭合边 (Loop Edge): 由 PnP 解算得到的 Tcw_loop 与 pLoopKF 的相对位姿强约束
     if (mapPoses.count(pCurKF) && mapPoses.count(pLoopKF)) {
-        // pCurKF 在闭环校正中刚刚设置的位姿即为对齐 pLoopKF 的准确相对位姿
-        Eigen::Matrix4f T_cur_loop = pCurKF->GetPose() * pLoopKF->GetPose().inverse();
+        // 计算当前帧与闭环帧之间精准的相对测量值: T_cur_loop = T_cur_loop_pnp * (T_loop_w)^-1
+        Eigen::Matrix4f T_cur_loop = Tcw_loop * mapOldPoses[pLoopKF].inverse();
+        
         problem.AddResidualBlock(PoseGraphEdgeError::Create(T_cur_loop),
-                                 nullptr, // 闭环边使用强约束，不加核函数
+                                 nullptr, // 闭环边作为强拉直约束，不加核函数
                                  mapPoses[pCurKF], mapPoses[pLoopKF]);
     }
 
-    // 配置求解器
+    // 4. 配置并求解
     ceres::Solver::Options options;
     options.linear_solver_type = ceres::SPARSE_NORMAL_CHOLESKY;
-    options.max_num_iterations = 20;
+    options.max_num_iterations = 30;
     options.minimizer_progress_to_stdout = false;
 
     ceres::Solver::Summary summary;
     ceres::Solve(options, &problem, &summary);
 
-    // 3. 回写优化后的关键帧位姿
+    // 5. 回写优化后的所有关键帧位姿
     std::map<KeyFrame*, Eigen::Matrix4f> mapNewPoses;
     for (auto& kv : mapPoses) {
         KeyFrame* pKF = kv.first;
@@ -758,14 +741,13 @@ void Optimizer::OptimizeEssentialGraph(Map* pMap, KeyFrame* pLoopKF, KeyFrame* p
         delete[] pose;
     }
 
-    // 4. 【关键修复】依据各关键帧的位姿校正量，同步更新地图点 3D 坐标
+    // 6. 根据各关键帧优化前后的位姿差，同步更新所有 3D 地图点
     std::vector<MapPoint*> vpAllMPs = pMap->GetAllMapPoints();
     for (MapPoint* pMP : vpAllMPs) {
         if (!pMP || pMP->isBad()) continue;
         KeyFrame* pRefKF = pMP->GetReferenceKeyFrame();
         if (!pRefKF || !mapOldPoses.count(pRefKF) || !mapNewPoses.count(pRefKF)) continue;
 
-        // 点在旧世界系 -> 参考帧相机坐标系 -> 新世界系
         Eigen::Matrix4f T_old_cw = mapOldPoses[pRefKF];
         Eigen::Matrix4f T_new_wc = mapNewPoses[pRefKF].inverse();
 

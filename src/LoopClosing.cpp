@@ -340,7 +340,7 @@ bool LoopClosing::ComputeSE3()
 // -----------------------------------------------------------------------------
 void LoopClosing::CorrectLoop()
 {
-    std::cout << "\033[33;1m[LoopClosing] 开始执行闭环校正 (ORB-SLAM2 标准局部修正)... 当前KF-" 
+    std::cout << "\033[33;1m[LoopClosing] 开始执行闭环校正与位姿图优化... 当前KF-" 
               << mpCurrentKF->mnId << " <---> 闭环KF-" << mpMatchedKF->mnId << "\033[0m" << std::endl;
 
     // 1. 请求暂停 LocalMapping 线程并中断局部 BA
@@ -360,68 +360,20 @@ void LoopClosing::CorrectLoop()
     // 确保当前关键帧连接关系最新
     mpCurrentKF->UpdateConnections();
 
-    // 2. ORB-SLAM2 官方策略：仅获取强共视邻居（权重 >= 15 或前 15 个最佳邻居），严防带入历史远端
+    // =========================================================================
+    // 【核心调整】：先执行全局位姿图优化（将误差平摊至整个大环）
+    // =========================================================================
+    Optimizer::OptimizeEssentialGraph(mpMap, mpMatchedKF, mpCurrentKF, mTcw_loop);
+
+    // 2. 闭环侧地图点投影融合 (SearchAndFuse)
+    std::vector<KeyFrame*> vpLoopConnectedKFs = mpMatchedKF->GetBestCovisibilityKeyFrames(10);
+    vpLoopConnectedKFs.push_back(mpMatchedKF);
+    SearchAndFuse(vpLoopConnectedKFs);
+
+    // 3. 更新所有相连帧的共视图拓扑
     std::vector<KeyFrame*> vpCurrentConnectedKFs = mpCurrentKF->GetBestCovisibilityKeyFrames(15);
     vpCurrentConnectedKFs.push_back(mpCurrentKF);
 
-    // 3. 计算当前帧的闭环校正增量：T_correct = Tcw_loop * (Tcw_old)^-1
-    Eigen::Matrix4f Tcw_old = mpCurrentKF->GetPose();
-    Eigen::Matrix4f Tcw_loop = mTcw_loop; // 由 ComputeSE3 解得的位姿
-    Eigen::Matrix4f T_correct = Tcw_loop * mpCurrentKF->GetPoseInverse();
-
-    // 4. 计算当前共视组中所有局部关键帧的修正位姿（排除首帧和无效帧）
-    std::map<KeyFrame*, Eigen::Matrix4f> CorrectedPoses;
-    CorrectedPoses[mpCurrentKF] = Tcw_loop;
-
-    for (KeyFrame* pKFi : vpCurrentConnectedKFs)
-    {
-        if (pKFi == mpCurrentKF || !pKFi || pKFi->mbBad || pKFi->mnId == 0)
-            continue;
-
-        // 依据当前帧校正前后的相对变换进行位姿传递: Ti_w_corrected = Ti_c * T_c_w_loop
-        Eigen::Matrix4f Ti_c = pKFi->GetPose() * mpCurrentKF->GetPoseInverse();
-        Eigen::Matrix4f Ti_w_corrected = Ti_c * Tcw_loop;
-        CorrectedPoses[pKFi] = Ti_w_corrected;
-    }
-
-    // 5. 对当前共视组拥有且以其为参考帧的地图点进行 3D 坐标校正
-    for (auto& kv : CorrectedPoses)
-    {
-        KeyFrame* pKFi = kv.first;
-        Eigen::Matrix4f Tcw_new = kv.second;
-        Eigen::Matrix4f Twc_new = Tcw_new.inverse();
-        Eigen::Matrix4f Tcw_prev = pKFi->GetPose();
-
-        std::vector<MapPoint*> vpMPs = pKFi->GetMapPointMatches();
-        for (size_t i = 0; i < vpMPs.size(); ++i)
-        {
-            MapPoint* pMP = vpMPs[i];
-            if (!pMP || pMP->isBad())
-                continue;
-
-            // 仅当该地图点的参考关键帧是当前局部帧时才校正，避免点被多次变换
-            if (pMP->GetReferenceKeyFrame() == pKFi)
-            {
-                Eigen::Vector3f Pw_old = pMP->GetWorldPos();
-                Eigen::Vector4f Pw_homo(Pw_old.x(), Pw_old.y(), Pw_old.z(), 1.0f);
-                
-                Eigen::Vector4f Pw_new = Twc_new * (Tcw_prev * Pw_homo);
-                pMP->SetWorldPos(Pw_new.head<3>());
-                pMP->UpdateNormalAndDepth();
-            }
-        }
-
-        // 正式更新当前局部关键帧位姿
-        pKFi->SetPose(Tcw_new);
-    }
-
-    // 6. 闭环侧地图点投影融合 (SearchAndFuse)
-    std::vector<KeyFrame*> vpLoopConnectedKFs = mpMatchedKF->GetBestCovisibilityKeyFrames(10);
-    vpLoopConnectedKFs.push_back(mpMatchedKF);
-
-    SearchAndFuse(vpLoopConnectedKFs);
-
-    // 7. 更新共视关系，建立闭环侧与当前侧的高权重连接
     for (KeyFrame* pKFi : vpCurrentConnectedKFs)
     {
         if (pKFi && !pKFi->mbBad)
@@ -432,20 +384,19 @@ void LoopClosing::CorrectLoop()
         if (pKFm && !pKFm->mbBad)
             pKFm->UpdateConnections();
     }
-    // std::map<KeyFrame*, Eigen::Matrix4f> dummy1, dummy2;
-    // std::map<KeyFrame*, std::set<KeyFrame*>> dummy3;
-    // Optimizer::OptimizeEssentialGraph(mpMap, mpMatchedKF, mpCurrentKF, dummy1, dummy2, dummy3);
+
     if (mpTracker)
     {
         mpTracker->ResetVelocity();
     }
-    // 8. 恢复 LocalMapping 线程
+
+    // 4. 恢复 LocalMapping 线程
     if (mpLocalMapper)
     {
         mpLocalMapper->Release();
     }
 
-    std::cout << "\033[32;1m[LoopClosing] ORB-SLAM2 阶段 1 & 2 校正完成！\033[0m" << std::endl;
+    std::cout << "\033[32;1m[LoopClosing] 闭环校正与位姿图优化完成！\033[0m" << std::endl;
 }
 
 // -----------------------------------------------------------------------------
