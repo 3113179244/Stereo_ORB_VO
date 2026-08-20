@@ -109,19 +109,25 @@ bool LoopClosing::DetectLoop()
 
     mpCurrentKF->ComputeBoW();
 
-    // 1. 获取共视邻域内的最小 BoW 得分
-    const std::vector<KeyFrame *> vpConnectedKFs = mpCurrentKF->GetConnectedKeyFrames();
+    // 1. ORB-SLAM2 官方做法：仅获取权重 >= 20 的共视邻域计算 minScore
+    const std::vector<KeyFrame *> vpConnectedKFs = mpCurrentKF->GetCovisibleByWeight(20);
     const DBoW3::BowVector &curBow = mpCurrentKF->mBowVec;
 
     float minScore = 1.0f;
-    for (KeyFrame *pKF : vpConnectedKFs)
+    if (!vpConnectedKFs.empty())
     {
-        if (pKF->mbBad)
-            continue;
-        pKF->ComputeBoW();
-        float score = mpORBVocabulary->score(curBow, pKF->mBowVec);
-        if (score < minScore)
-            minScore = score;
+        for (KeyFrame *pKF : vpConnectedKFs)
+        {
+            if (pKF->mbBad) continue;
+            pKF->ComputeBoW();
+            float score = mpORBVocabulary->score(curBow, pKF->mBowVec);
+            if (score < minScore)
+                minScore = score;
+        }
+    }
+    else
+    {
+        minScore = 0.2f;
     }
 
     // 2. 数据库检索候选关键帧
@@ -130,13 +136,21 @@ bool LoopClosing::DetectLoop()
     {
         vpCandidateKFs = mpKeyFrameDB->DetectLoopCandidates(mpCurrentKF, minScore);
     }
+
+    // 【修改】：无候选帧时不要直接清空，按原版让历史组自然衰减
     if (vpCandidateKFs.empty())
     {
-        mvConsistentGroups.clear();
+        std::vector<ConsistentGroup> vCurrentConsistentGroups;
+        for (size_t i = 0; i < mvConsistentGroups.size(); ++i)
+        {
+            if (mvConsistentGroups[i].second > 1)
+                vCurrentConsistentGroups.push_back(std::make_pair(mvConsistentGroups[i].first, 1));
+        }
+        mvConsistentGroups = vCurrentConsistentGroups;
         return false;
     }
 
-    // 3. ORB-SLAM2 官方一致性滑动窗口检查
+    // 3. ORB-SLAM2 官方连续性检查
     mvpEnoughConsistentCandidates.clear();
     std::vector<ConsistentGroup> vCurrentConsistentGroups;
     std::vector<bool> vbGroupMatched(mvConsistentGroups.size(), false);
@@ -150,10 +164,11 @@ bool LoopClosing::DetectLoop()
             sGroup.insert(pN);
 
         int nConsistency = 1;
-        bool bMatched = false;
 
         for (size_t i = 0; i < mvConsistentGroups.size(); ++i)
         {
+            if (vbGroupMatched[i]) continue; // 防止同一组在同帧被多次匹配覆盖
+
             const std::set<KeyFrame *> &sPrevGroup = mvConsistentGroups[i].first;
             for (KeyFrame *pGKF : sGroup)
             {
@@ -161,24 +176,21 @@ bool LoopClosing::DetectLoop()
                 {
                     nConsistency = mvConsistentGroups[i].second + 1;
                     vbGroupMatched[i] = true;
-                    bMatched = true;
                     break;
                 }
             }
-            if (bMatched)
-                break;
+            if (vbGroupMatched[i]) break;
         }
 
         vCurrentConsistentGroups.push_back(std::make_pair(sGroup, nConsistency));
 
-        // 达到 3 帧连续一致性阈值
+        // 达到 3 帧一致性要求
         if (nConsistency >= 3)
         {
             mvpEnoughConsistentCandidates.push_back(pCandKF);
         }
     }
 
-    // 将未匹配但历史存在的组降级保留（衰减机制，防止剧烈抖动清零）
     for (size_t i = 0; i < mvConsistentGroups.size(); ++i)
     {
         if (!vbGroupMatched[i] && mvConsistentGroups[i].second > 1)
@@ -235,7 +247,7 @@ bool LoopClosing::ComputeSE3()
             vPts3D, vPts2D, mpCurrentKF->mK, cv::Mat::zeros(4, 1, CV_32F),
             rvec, tvec, false, 300, 8.0f, 0.99, inliers, cv::SOLVEPNP_EPNP);
 
-        if (!bOK || inliers.size() < 20)
+        if (!bOK || inliers.size() < 15)
             continue;
 
         // 提取粗估计位姿
@@ -310,9 +322,8 @@ bool LoopClosing::ComputeSE3()
             }
         }
 
-        // 阶段 3: 最终严格内点判定 (总匹配点 >= 40 彻底确认闭环)
         int nTotalMatches = inliers.size() + nAdditionalMatches;
-        if (nTotalMatches >= 40)
+        if (nTotalMatches >= 20)
         {
             mpMatchedKF = pCandKF;
             mTcw_loop = Tcw;

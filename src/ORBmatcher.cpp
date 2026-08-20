@@ -715,6 +715,7 @@ int ORBmatcher::SearchByBoW(KeyFrame *pKF1, KeyFrame *pKF2, std::vector<MapPoint
     const cv::Mat &Descriptors2 = pKF2->mDescriptors;
 
     vpMatches12 = std::vector<MapPoint*>(pKF1->N, static_cast<MapPoint*>(nullptr));
+    std::vector<bool> vbMatched2(pKF2->N, false);
 
     pKF1->ComputeBoW();
     pKF2->ComputeBoW();
@@ -755,6 +756,11 @@ int ORBmatcher::SearchByBoW(KeyFrame *pKF1, KeyFrame *pKF2, std::vector<MapPoint
                 for (size_t i2 = 0; i2 < vIndices2.size(); i2++)
                 {
                     const unsigned int realIdx2 = vIndices2[i2];
+                    
+                    // 【新增】：如果 pKF2 的该点已被匹配过，跳过
+                    if (vbMatched2[realIdx2])
+                        continue;
+
                     MapPoint *pMP2 = vpMapPoints2[realIdx2];
                     if (!pMP2 || pMP2->isBad())
                         continue;
@@ -779,6 +785,7 @@ int ORBmatcher::SearchByBoW(KeyFrame *pKF1, KeyFrame *pKF2, std::vector<MapPoint
                     if (static_cast<float>(bestDist) < mfNNratio * static_cast<float>(secondBestDist))
                     {
                         vpMatches12[realIdx1] = vpMapPoints2[bestIdx2];
+                        vbMatched2[bestIdx2] = true; // 【新增】：标记占用
 
                         if (mbCheckOrientation)
                         {
