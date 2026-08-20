@@ -421,7 +421,10 @@ void LoopClosing::CorrectLoop()
         if (pKFm && !pKFm->mbBad)
             pKFm->UpdateConnections();
     }
-
+    if (mpTracker)
+    {
+        mpTracker->ResetVelocity();
+    }
     // 8. 恢复 LocalMapping 线程
     if (mpLocalMapper)
     {

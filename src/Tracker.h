@@ -40,6 +40,7 @@ public:
     void Reset();
     bool Relocalize();
     void UpdateLastFrame();
+    void ResetVelocity();
     eTrackingState mState;
     // 当前帧与上一帧
     Frame mCurrentFrame;

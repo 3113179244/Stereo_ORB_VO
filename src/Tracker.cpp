@@ -842,3 +842,9 @@ void Tracker::UpdateLastFrame()
         mLastFrame.SetPose(Tlr * mpReferenceKF->GetPose());
     }
 }
+
+void Tracker::ResetVelocity()
+{
+    // 将恒速模型速度矩阵重置为单位矩阵，下一帧将退化为基于上一帧重投影搜索
+    mVelocity.setIdentity();
+}
