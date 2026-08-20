@@ -185,7 +185,7 @@ bool LoopClosing::DetectLoop()
         vCurrentConsistentGroups.push_back(std::make_pair(sGroup, nConsistency));
 
         // 达到 3 帧一致性要求
-        if (nConsistency >= 3)
+        if (nConsistency >= 2)
         {
             mvpEnoughConsistentCandidates.push_back(pCandKF);
         }
@@ -219,7 +219,7 @@ bool LoopClosing::ComputeSE3()
         std::vector<MapPoint *> vpMatchedMapPoints;
         int nmatches = matcher.SearchByBoW(mpCurrentKF, pCandKF, vpMatchedMapPoints);
 
-        if (nmatches < 20)
+        if (nmatches < 15)
             continue;
 
         std::vector<cv::Point3f> vPts3D;
@@ -238,7 +238,7 @@ bool LoopClosing::ComputeSE3()
             }
         }
 
-        if (vPts3D.size() < 20)
+        if (vPts3D.size() < 15)
             continue;
 
         cv::Mat rvec, tvec;
@@ -247,7 +247,7 @@ bool LoopClosing::ComputeSE3()
             vPts3D, vPts2D, mpCurrentKF->mK, cv::Mat::zeros(4, 1, CV_32F),
             rvec, tvec, false, 300, 8.0f, 0.99, inliers, cv::SOLVEPNP_EPNP);
 
-        if (!bOK || inliers.size() < 15)
+        if (!bOK || inliers.size() < 12)
             continue;
 
         // 提取粗估计位姿
@@ -323,7 +323,7 @@ bool LoopClosing::ComputeSE3()
         }
 
         int nTotalMatches = inliers.size() + nAdditionalMatches;
-        if (nTotalMatches >= 20)
+        if (nTotalMatches >= 25)
         {
             mpMatchedKF = pCandKF;
             mTcw_loop = Tcw;
