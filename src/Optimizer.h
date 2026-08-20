@@ -18,6 +18,10 @@ public:
     static int PoseOptimization(Frame *pFrame);
     static void LocalBundleAdjustment(KeyFrame *pCurKF, bool *pbStopFlag, std::shared_ptr<Map> pMap);
     static void GlobalBundleAdjustment(std::shared_ptr<Map> pMap);
+    static void OptimizeEssentialGraph(Map* pMap, KeyFrame* pLoopKF, KeyFrame* pCurKF,
+                                       const std::map<KeyFrame*, Eigen::Matrix4f>& NonCorrectedSim3,
+                                       const std::map<KeyFrame*, Eigen::Matrix4f>& CorrectedSim3,
+                                       const std::map<KeyFrame*, std::set<KeyFrame*>>& LoopConnections);
 };
 
 #endif // OPTIMIZER_H

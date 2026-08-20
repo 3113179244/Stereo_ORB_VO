@@ -19,7 +19,7 @@ class Map;
 class Tracker;
 class LocalMapping;
 class KeyFrameDatabase;
-
+class Optimizer;
 class LoopClosing
 {
 public:

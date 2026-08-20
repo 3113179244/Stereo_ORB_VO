@@ -60,6 +60,7 @@ public:
     float GetFoundRatio();
     float GetMinDistanceInvariance();
     float GetMaxDistanceInvariance();
+    KeyFrame* GetReferenceKeyFrame() { return mpRefKF; }
     // 静态成员：用于生成唯一的地图点ID
     static long unsigned int nNextId;
     // 当前地图点的唯一ID

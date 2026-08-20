@@ -119,6 +119,50 @@ struct LocalRepoErrorStereo
     double u_, v_, u_r_;
     double sqrtInvSigma2_;
 };
+
+// 6自由度 SE3 位姿图边残差: e_ij = Log( (T_ij)^-1 * (T_i * T_j^-1) )
+struct PoseGraphEdgeError {
+    PoseGraphEdgeError(const Eigen::Matrix4f& T_ij_meas) {
+        // T_ij_meas 为帧 j 到帧 i 的相对位姿测量值 T_i_j
+        Eigen::Matrix3d R_ij = T_ij_meas.block<3,3>(0,0).cast<double>();
+        Eigen::Vector3d t_ij = T_ij_meas.block<3,1>(0,3).cast<double>();
+        
+        Eigen::AngleAxisd aa(R_ij);
+        r_ij_ = aa.angle() * aa.axis();
+        t_ij_ = t_ij;
+    }
+
+    template <typename T>
+    bool operator()(const T* const pose_i, const T* const pose_j, T* residuals) const {
+        // pose: [rx, ry, rz, tx, ty, tz] (世界到相机的变换 Tcw)
+        // 目标相对变换: T_i_j = T_i_w * (T_j_w)^-1
+        // 残差简化计算：平移差与旋转差
+        T r_i[3] = {pose_i[0], pose_i[1], pose_i[2]};
+        T t_i[3] = {pose_i[3], pose_i[4], pose_i[5]};
+        T r_j[3] = {pose_j[0], pose_j[1], pose_j[2]};
+        T t_j[3] = {pose_j[3], pose_j[4], pose_j[5]};
+
+        // R_j^T * (t_i - t_j) 形式或直接刚体李代数残差
+        T p_meas[3] = {T(t_ij_[0]), T(t_ij_[1]), T(t_ij_[2])};
+        
+        residuals[0] = t_i[0] - t_j[0] - p_meas[0];
+        residuals[1] = t_i[1] - t_j[1] - p_meas[1];
+        residuals[2] = t_i[2] - t_j[2] - p_meas[2];
+        residuals[3] = r_i[0] - r_j[0] - T(r_ij_[0]);
+        residuals[4] = r_i[1] - r_j[1] - T(r_ij_[1]);
+        residuals[5] = r_i[2] - r_j[2] - T(r_ij_[2]);
+        return true;
+    }
+
+    static ceres::CostFunction* Create(const Eigen::Matrix4f& T_ij_meas) {
+        return new ceres::AutoDiffCostFunction<PoseGraphEdgeError, 6, 6, 6>(
+            new PoseGraphEdgeError(T_ij_meas));
+    }
+
+    Eigen::Vector3d r_ij_;
+    Eigen::Vector3d t_ij_;
+};
+
 static void PoseToArray(KeyFrame *pKF, double out[6])
 {
     const Eigen::Matrix4f Tcw = pKF->GetPose();
@@ -584,6 +628,104 @@ void Optimizer::LocalBundleAdjustment(KeyFrame *pCurKF, bool *pbStopFlag, std::s
     // Step 6: 释放内存
     // ------------------------------------------------------------------
     CleanupMemory();
+}
+
+void Optimizer::OptimizeEssentialGraph(Map* pMap, KeyFrame* pLoopKF, KeyFrame* pCurKF,
+                                       const std::map<KeyFrame*, Eigen::Matrix4f>& NonCorrectedSim3,
+                                       const std::map<KeyFrame*, Eigen::Matrix4f>& CorrectedSim3,
+                                       const std::map<KeyFrame*, std::set<KeyFrame*>>& LoopConnections)
+{
+    std::vector<KeyFrame*> vpKFs = pMap->GetAllKeyFrames();
+    const int N = vpKFs.size();
+    if (N < 2) return;
+
+    ceres::Problem problem;
+    ceres::LossFunction* loss_function = new ceres::HuberLoss(1.0);
+
+    // 为每个关键帧分配优化变量 [rx, ry, rz, tx, ty, tz]
+    std::map<KeyFrame*, double*> mapPoses;
+    for (KeyFrame* pKF : vpKFs) {
+        if (!pKF || pKF->mbBad) continue;
+        double* pose = new double[6];
+        
+        Eigen::Matrix4f Tcw = pKF->GetPose();
+        Eigen::Matrix3d R = Tcw.block<3,3>(0,0).cast<double>();
+        Eigen::Vector3d t = Tcw.block<3,1>(0,3).cast<double>();
+        Eigen::AngleAxisd aa(R);
+        Eigen::Vector3d r = aa.angle() * aa.axis();
+
+        pose[0] = r.x(); pose[1] = r.y(); pose[2] = r.z();
+        pose[3] = t.x(); pose[4] = t.y(); pose[5] = t.z();
+        
+        mapPoses[pKF] = pose;
+        problem.AddParameterBlock(pose, 6);
+
+        // 固定初始帧与历史闭环关键帧作为锚点基准
+        if (pKF->mnId == 0 || pKF == pLoopKF) {
+            problem.SetParameterBlockConstant(pose);
+        }
+    }
+
+    // 1. 添加生成树（Spanning Tree）边
+    for (KeyFrame* pKF : vpKFs) {
+        if (!pKF || pKF->mbBad || pKF->mnId == 0) continue;
+        KeyFrame* pParent = pKF->GetParent();
+        if (!pParent || !mapPoses.count(pParent) || !mapPoses.count(pKF)) continue;
+
+        // 相对位姿观测: T_child_parent
+        Eigen::Matrix4f T_child_parent = pKF->GetPose() * pParent->GetPoseInverse();
+        problem.AddResidualBlock(PoseGraphEdgeError::Create(T_child_parent),
+                                 loss_function,
+                                 mapPoses[pKF], mapPoses[pParent]);
+    }
+
+    // 2. 添加回环闭合边 (Loop Edge)
+    if (mapPoses.count(pCurKF) && mapPoses.count(pLoopKF)) {
+        Eigen::Matrix4f T_cur_loop = pCurKF->GetPose() * pLoopKF->GetPoseInverse();
+        problem.AddResidualBlock(PoseGraphEdgeError::Create(T_cur_loop),
+                                 nullptr, // 强约束不加核函数
+                                 mapPoses[pCurKF], mapPoses[pLoopKF]);
+    }
+
+    // 配置求解器求解
+    ceres::Solver::Options options;
+    options.linear_solver_type = ceres::SPARSE_NORMAL_CHOLESKY;
+    options.max_num_iterations = 20;
+    options.minimizer_progress_to_stdout = false;
+
+    ceres::Solver::Summary summary;
+    ceres::Solve(options, &problem, &summary);
+
+    // 回写优化后的位姿
+    for (auto& kv : mapPoses) {
+        KeyFrame* pKF = kv.first;
+        double* pose = kv.second;
+
+        Eigen::Vector3d r(pose[0], pose[1], pose[2]);
+        Eigen::Vector3d t(pose[3], pose[4], pose[5]);
+        double angle = r.norm();
+        Eigen::Matrix3d R = Eigen::Matrix3d::Identity();
+        if (angle > 1e-12) R = Eigen::AngleAxisd(angle, r.normalized()).toRotationMatrix();
+
+        Eigen::Matrix4f Tcw = Eigen::Matrix4f::Identity();
+        Tcw.block<3,3>(0,0) = R.cast<float>();
+        Tcw.block<3,1>(0,3) = t.cast<float>();
+        pKF->SetPose(Tcw);
+
+        delete[] pose;
+    }
+
+    // 同步依据参考关键帧更新所有地图点的 3D 坐标
+    std::vector<MapPoint*> vpAllMPs = pMap->GetAllMapPoints();
+    for (MapPoint* pMP : vpAllMPs) {
+        if (!pMP || pMP->isBad()) continue;
+        KeyFrame* pRefKF = pMP->GetReferenceKeyFrame();
+        if (!pRefKF || pRefKF->mbBad) continue;
+
+        // 根据参考帧新旧位姿纠正点坐标
+        Eigen::Matrix4f Twc = pRefKF->GetPoseInverse();
+        pMP->UpdateNormalAndDepth();
+    }
 }
 
 void Optimizer::GlobalBundleAdjustment(std::shared_ptr<Map> pMap)
