@@ -282,9 +282,9 @@ void Optimizer::LocalBundleAdjustment(KeyFrame *pCurKF, bool *pbStopFlag, std::s
 
     if (nLocalKFs < 2 || nLocalMPs < 5)
         return;
-    // 找出局部帧中 ID 最小的一帧（当没有固定关键帧时，作为局部地图坐标系的保底锚定帧）
+    // 始终在局部帧中找出 ID 最小的一帧作为刚性锚定帧，防止固定帧无残差约束时系统自由度丢失
     KeyFrame* pAnchorKF = nullptr;
-    if (vpFixedKFs.empty() && !vpLocalKFs.empty())
+    if (!vpLocalKFs.empty())
     {
         pAnchorKF = vpLocalKFs[0];
         for (size_t i = 1; i < vpLocalKFs.size(); ++i)
