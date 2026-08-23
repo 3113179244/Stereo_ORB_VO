@@ -619,37 +619,48 @@ void LocalMapping::SearchInNeighbors()
 
 void LocalMapping::KeyFrameCulling()
 {
-    std::vector<KeyFrame *> vpConnectedKeyFrames = mpCurrentKeyFrame->GetConnectedKeyFrames();
+    // 1. 获取当前关键帧所有的共视关键帧
+    std::vector<KeyFrame *> vpLocalKeyFrames = mpCurrentKeyFrame->GetConnectedKeyFrames();
 
-    for (auto pKF : vpConnectedKeyFrames)
+    for (std::vector<KeyFrame *>::iterator vit = vpLocalKeyFrames.begin(), vend = vpLocalKeyFrames.end(); vit != vend; vit++)
     {
-        if (!pKF || pKF->mbBad || pKF->mnId <= 1)
+        KeyFrame *pKF = *vit;
+        // 保护第一帧不被剔除
+        if (pKF->mnId == 0)
             continue;
 
-        std::vector<MapPoint *> vpMapPoints = pKF->GetMapPointMatches();
+        const std::vector<MapPoint *> vpMapPoints = pKF->GetMapPointMatches();
+
+        // 设定冗余判定的观测次数门槛（双目标准：近点 3 次，远点由于深度不确定性不计入或要求更高）
         int nRedundantObservations = 0;
         int nTotalObservations = 0;
 
+        // 2. 遍历该关键帧下的所有特征地图点
         for (size_t i = 0; i < vpMapPoints.size(); i++)
         {
             MapPoint *pMP = vpMapPoints[i];
             if (pMP && !pMP->isBad())
             {
+                // 双目专属逻辑：只考虑深度有效的近点来进行冗余评估（远点不作为主冗余依据）
+                if (pKF->mvDepth[i] > 0.0f && pKF->mvDepth[i] > pKF->mThDepth)
+                    continue;
+
                 nTotalObservations++;
 
-                // 获取当前特征点的金字塔层级
+                // 该地图点在当前帧对应的金字塔层级
                 const int scaleLevel = pKF->mvKeysUn[i].octave;
                 const std::map<KeyFrame *, size_t> observations = pMP->GetObservations();
 
                 int nObs = 0;
-                for (auto mit = observations.begin(); mit != observations.end(); mit++)
+                for (std::map<KeyFrame *, size_t>::const_iterator mit = observations.begin(), mend = observations.end(); mit != mend; mit++)
                 {
                     KeyFrame *pKFi = mit->first;
                     if (pKFi == pKF || pKFi->mbBad)
                         continue;
 
                     const int scaleLeveli = pKFi->mvKeysUn[mit->second].octave;
-                    // 只有在邻居关键帧中的观测尺度优于或接近当前尺度时，才算作有效冗余观测
+
+                    // 尺度准则：只有其它关键帧的观测分辨率优于或等同于当前帧时（即层级 scaleLeveli <= scaleLevel + 1），才算作有效冗余观测
                     if (scaleLeveli <= scaleLevel + 1)
                     {
                         nObs++;
@@ -665,7 +676,8 @@ void LocalMapping::KeyFrameCulling()
             }
         }
 
-        if (nTotalObservations > 0 && (float)nRedundantObservations / nTotalObservations > 0.90f)
+        // 3. 官方冗余判定：有效观测点数充足且冗余率达到 90% 时标记剔除
+        if (nTotalObservations > 20 && (float)nRedundantObservations / (float)nTotalObservations > 0.90f)
         {
             pKF->SetBadFlag();
         }

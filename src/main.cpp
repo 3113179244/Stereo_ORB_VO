@@ -3,6 +3,8 @@
 #include <vector>
 #include <string>
 #include <iomanip>
+#include <chrono>
+#include <thread>
 #include <opencv2/opencv.hpp>
 #include <opencv2/core/utils/filesystem.hpp>
 #include "System.h"
@@ -11,29 +13,30 @@
 int main(int argc, char **argv)
 {
     // 设置默认路径
+    std::string strVocFile = "/home/wzj/DBow3/orbvoc.dbow3";
     std::string strConfigFile = "/home/wzj/Stereo_ORB_VO/config/KITTI04-12.yaml";
     std::string strSequenceDir = "/home/wzj/KITTI/data_odometry_gray/dataset/sequences/07";
-    std::string strVocFile = "/home/wzj/DBow3/orbvoc.dbow3";
-    // 解析命令行参数
+
+    // 按照 ./Stereo_ORB_VO <VocFile> <ConfigFile> <SequenceDir> 解析命令行参数
     if (argc >= 2)
     {
-        strConfigFile = argv[1];
+        strVocFile = argv[1];
     }
     if (argc >= 3)
     {
-        strSequenceDir = argv[2];
+        strConfigFile = argv[2];
     }
     if (argc >= 4) 
     {
-        strVocFile = argv[3];
+        strSequenceDir = argv[3];
     }
+
     // 确保序列路径末尾有 '/'
     if (!strSequenceDir.empty() && strSequenceDir.back() != '/' && strSequenceDir.back() != '\\')
     {
         strSequenceDir += "/";
     }
 
-    // 更新完 strSequenceDir 之后，再拼接子目录路径！
     std::string strLeftDir = strSequenceDir + "image_0/";
     std::string strRightDir = strSequenceDir + "image_1/";
     std::string strTimesPath = strSequenceDir + "times.txt";
@@ -44,6 +47,7 @@ int main(int argc, char **argv)
         std::cerr << "错误: 找不到路径 " << strLeftDir << " 或 " << strRightDir << " ！" << std::endl;
         return -1;
     }
+
     // 加载时间戳文件
     std::vector<double> vdTimestamps;
     std::ifstream fileTimes(strTimesPath);
@@ -64,9 +68,11 @@ int main(int argc, char **argv)
     std::cout << "  - 空格键 (Space): 暂停/恢复播放" << std::endl;
     std::cout << "  - Q 键           : 恢复播放" << std::endl;
     std::cout << "  - ESC 键         : 退出程序" << std::endl;
+
     System SLAM(strConfigFile, strVocFile, System::STEREO, true);
     int nFrameId = 0;
     bool bIsPaused = false;
+
     // 循环处理每一帧
     while (true)
     {
@@ -94,8 +100,14 @@ int main(int argc, char **argv)
                 std::cerr << "错误: 无法读取图像: " << strFilename << std::endl;
                 break;
             }
-            double dTimestamp = vdTimestamps[nFrameId];
-            Eigen::Matrix4f Tcw = SLAM.TrackStereo(image0, image1, dTimestamp);
+
+            double dCurrentTimestamp = vdTimestamps[nFrameId];
+
+            // 记录当前帧跟踪开始时间
+            auto t_start = std::chrono::steady_clock::now();
+
+            Eigen::Matrix4f Tcw = SLAM.TrackStereo(image0, image1, dCurrentTimestamp);
+
             if (!image0.empty() && !image1.empty())
             {
                 cv::Mat imDraw = SLAM.DrawFrame();
@@ -104,9 +116,30 @@ int main(int argc, char **argv)
                     cv::imshow("ORB-SLAM2 Frame Drawer", imDraw);
                 }
             }
+
+            // 记录当前帧跟踪结束时间并计算处理耗时 (单位: 秒)
+            auto t_end = std::chrono::steady_clock::now();
+            double dTrackElapsed = std::chrono::duration_cast<std::chrono::duration<double>>(t_end - t_start).count();
+
+            // 计算与下一帧之间的时间间隔，保持真实时间速率喂图
+            double dWaitTimeSec = 0.0;
+            if (nFrameId + 1 < static_cast<int>(vdTimestamps.size()))
+            {
+                double dNextTimestamp = vdTimestamps[nFrameId + 1];
+                double dDeltaTime = dNextTimestamp - dCurrentTimestamp;
+                dWaitTimeSec = dDeltaTime - dTrackElapsed;
+            }
+
+            // 若处理耗时小于两帧真实间隔，则休眠补足差值，为后端 LocalMapping 与 LoopClosing 留出处理时间
+            if (dWaitTimeSec > 0.0)
+            {
+                std::this_thread::sleep_for(std::chrono::duration<double>(dWaitTimeSec));
+            }
+
             nFrameId++;
         }
-        int nWaitTime = bIsPaused ? 10 : 20;
+
+        int nWaitTime = bIsPaused ? 10 : 1;
         char cKey = static_cast<char>(cv::waitKey(nWaitTime));
 
         if (cKey == 27) // ESC
