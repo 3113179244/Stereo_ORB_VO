@@ -56,9 +56,13 @@ private:
     bool TrackWithMotionModel();
     bool TrackReferenceKeyFrame();
     bool TrackLocalMap();
-    std::shared_ptr<FrameDrawer> mpFrameDrawer;
+    void UpdateLocalMap();
+    void UpdateLocalKeyFrames();
+    void UpdateLocalPoints();
+    void SearchLocalPoints();
     bool NeedNewKeyFrame();
     void CreateNewKeyFrame();
+    std::shared_ptr<FrameDrawer> mpFrameDrawer;
     System *mpSystem;
     KeyFrameDatabase* mpKeyFrameDB;
     std::shared_ptr<Map> mpMap;
@@ -69,7 +73,9 @@ private:
     // 特征提取器指针 (双目需要左右各一个 extractor)
     std::unique_ptr<ORBextractor> mpORBextractorLeft;
     std::unique_ptr<ORBextractor> mpORBextractorRight;
-
+    // 局部地图缓存容器
+    std::vector<KeyFrame*> mvpLocalKeyFrames;
+    std::vector<MapPoint*> mvpLocalMapPoints;
     // 恒速模型：相对位姿速度 Velocity (T_current_last = T_c_w * T_w_last)
     Eigen::Matrix4f mVelocity;
 

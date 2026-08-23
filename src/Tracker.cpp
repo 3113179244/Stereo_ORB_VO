@@ -481,185 +481,21 @@ bool Tracker::Relocalize()
     return false;
 }
 
+/**
+ * @brief 局部地图跟踪顶层控制
+ */
 bool Tracker::TrackLocalMap()
 {
-    std::unique_lock<std::mutex> lock(mpMap->mMutexMapUpdate);
-    // 1. 搜集局部地图关键帧 (Local KeyFrames)
-    std::vector<KeyFrame *> vpLocalKeyFrames;
+    // 1. 更新局部关键帧与局部地图点
+    UpdateLocalMap();
 
-    for (int i = 0; i < mCurrentFrame.N; i++)
-    {
-        if (mCurrentFrame.mvpMapPoints[i])
-        {
-            MapPoint *pMP = mCurrentFrame.mvpMapPoints[i];
-            if (!pMP->isBad())
-            {
-                const std::map<KeyFrame *, size_t> observations = pMP->GetObservations();
-                for (auto mit = observations.begin(); mit != observations.end(); mit++)
-                {
-                    if (!mit->first->mbBad)
-                        vpLocalKeyFrames.push_back(mit->first);
-                }
-            }
-        }
-    }
+    // 2. 投影匹配局部地图点
+    SearchLocalPoints();
 
-    if (vpLocalKeyFrames.empty())
-        return false;
-
-    std::sort(vpLocalKeyFrames.begin(), vpLocalKeyFrames.end());
-    vpLocalKeyFrames.erase(std::unique(vpLocalKeyFrames.begin(), vpLocalKeyFrames.end()), vpLocalKeyFrames.end());
-
-    // 2. 增加每个局部关键帧的最佳共视邻居
-    std::vector<KeyFrame *> vpLocalKFWithNeighbors = vpLocalKeyFrames;
-    for (KeyFrame *pKF : vpLocalKeyFrames)
-    {
-        if (pKF->mbBad)
-            continue;
-        std::vector<KeyFrame *> vNeighs = pKF->GetBestCovisibilityKeyFrames(10);
-        for (KeyFrame *pN : vNeighs)
-        {
-            if (pN && !pN->mbBad)
-                vpLocalKFWithNeighbors.push_back(pN);
-        }
-    }
-    std::sort(vpLocalKFWithNeighbors.begin(), vpLocalKFWithNeighbors.end());
-    vpLocalKFWithNeighbors.erase(std::unique(vpLocalKFWithNeighbors.begin(), vpLocalKFWithNeighbors.end()),
-                                 vpLocalKFWithNeighbors.end());
-
-    // 3. 搜集局部地图点 (Local MapPoints)
-    std::vector<MapPoint *> vpLocalMapPoints;
-    for (KeyFrame *pKF : vpLocalKFWithNeighbors)
-    {
-        std::vector<MapPoint *> vpMPs = pKF->GetMapPointMatches();
-        for (MapPoint *pMP : vpMPs)
-        {
-            if (!pMP || pMP->isBad())
-                continue;
-            if (std::find(vpLocalMapPoints.begin(), vpLocalMapPoints.end(), pMP) == vpLocalMapPoints.end())
-            {
-                vpLocalMapPoints.push_back(pMP);
-            }
-        }
-    }
-
-    // 4. 将局部地图点投影到当前帧进行匹配
-    ORBmatcher matcher(0.8, true);
-    int nMatches = 0;
-
-    Eigen::Matrix3f Rcw = mCurrentFrame.mTcw.block<3, 3>(0, 0);
-    Eigen::Vector3f tcw = mCurrentFrame.mTcw.block<3, 1>(0, 3);
-    Eigen::Vector3f Ow = -Rcw.transpose() * tcw; // 当前相机在世界坐标系下的中心
-
-    // 计算焦距缩放基准（以 500.0f 为基准焦距，基准半径设为 5.0 像素）
-    const float fx_ratio = Frame::fx / 500.0f;
-    const float base_radius = 5.0f * std::max(1.0f, fx_ratio);
-
-    for (MapPoint *pMP : vpLocalMapPoints)
-    {
-        if (pMP->isBad())
-            continue;
-
-        // 避免重复匹配已经关联的地图点
-        bool bAlreadyFound = false;
-        for (int i = 0; i < mCurrentFrame.N; i++)
-        {
-            if (mCurrentFrame.mvpMapPoints[i] == pMP)
-            {
-                bAlreadyFound = true;
-                break;
-            }
-        }
-        if (bAlreadyFound)
-            continue;
-
-        // 计算地图点在当前相机坐标系下的 3D 坐标
-        Eigen::Vector3f P_w = pMP->GetWorldPos();
-        Eigen::Vector3f P_c = Rcw * P_w + tcw;
-
-        // 深度检查：剔除相机后方的点
-        if (P_c[2] <= 0.0f)
-            continue;
-
-        // 投影到当前图像像素坐标
-        const float invz = 1.0f / P_c[2];
-        float u = Frame::fx * P_c[0] * invz + Frame::cx;
-        float v = Frame::fy * P_c[1] * invz + Frame::cy;
-
-        // 图像边界有效性检查
-        if (u < Frame::mnMinX || u >= Frame::mnMaxX || v < Frame::mnMinY || v >= Frame::mnMaxY)
-            continue;
-
-        // ================== 动态搜索半径计算开始 ==================
-        // 1. 获取地图点当前到相机光心的物理距离
-        Eigen::Vector3f vPosCamera = P_w - Ow;
-        const float dist = vPosCamera.norm();
-
-        // 2. 根据可观测距离区间估算金字塔尺度
-        // （mfMaxDistance 由 MapPoint::UpdateNormalAndDepth 维护）
-        float scaleFactor = 1.0f;
-        const float maxDistance = pMP->GetMaxDistanceInvariance();
-        const float minDistance = pMP->GetMinDistanceInvariance();
-
-        if (dist < minDistance || dist > maxDistance)
-            continue; // 超出该点的有效尺度观测范围，直接剔除
-
-        // 距离越近尺度越接近原图(1.0)，距离越远对应金字塔高层(接近最大缩放比)
-        if (maxDistance > minDistance)
-        {
-            const float ratio = dist / minDistance;
-            // 限制尺度缩放上限（例如在 1.0 到 3.0 之间）
-            scaleFactor = std::max(1.0f, std::min(ratio, 3.0f));
-        }
-
-        // 3. 计算视线夹角余弦值进行视角补偿
-        Eigen::Vector3f Pn = pMP->GetNormal();
-        float viewCos = vPosCamera.dot(Pn) / dist;
-        if (viewCos < 0.5f) // 视角倾斜大于 60 度，特征失真严重，跳过
-            continue;
-
-        // 视角越偏，允许的搜索容差越大（1.0f / viewCos 范围在 1.0 ~ 2.0）
-        const float angleFactor = 1.0f / std::max(0.5f, viewCos);
-
-        // 4. 最终动态搜索半径：基准半径 * 焦距比例 * 尺度因子 * 视角因子
-        const float dynamic_radius = base_radius * scaleFactor * angleFactor;
-        // ================== 动态搜索半径计算结束 ==================
-
-        // 在动态半径区域内查找候选特征点
-        std::vector<size_t> vIndices = mCurrentFrame.GetFeaturesInArea(u, v, dynamic_radius);
-        if (vIndices.empty())
-            continue;
-
-        cv::Mat dMP = pMP->GetDescriptor();
-        int bestDist = ORBmatcher::TH_HIGH; // 使用统一的汉明距离阈值上限
-        int bestIdx = -1;
-
-        for (size_t idx : vIndices)
-        {
-            if (mCurrentFrame.mvpMapPoints[idx])
-                continue;
-
-            cv::Mat dFrame = mCurrentFrame.mDescriptors.row(idx);
-            int dist = ORBmatcher::DescriptorDistance(dMP, dFrame);
-
-            if (dist < bestDist)
-            {
-                bestDist = dist;
-                bestIdx = idx;
-            }
-        }
-
-        if (bestDist < ORBmatcher::TH_HIGH && bestIdx >= 0)
-        {
-            mCurrentFrame.mvpMapPoints[bestIdx] = pMP;
-            nMatches++;
-        }
-    }
-
-    // 5. 位姿优化 (Motion-Only BA)
+    // 3. 位姿优化 (Motion-Only BA)
     int nInliers = MotionOnlyBA::Optimize(&mCurrentFrame);
 
-    // 6. 更新内点标记
+    // 4. 更新内点标记并剔除外点
     mnMatchesInliers = 0;
     for (int i = 0; i < mCurrentFrame.N; i++)
     {
@@ -676,7 +512,10 @@ bool Tracker::TrackLocalMap()
             }
         }
     }
-    mpMap->SetReferenceMapPoints(vpLocalMapPoints);
+
+    // 5. 将当前局部地图点同步到 Map 供可视化渲染
+    mpMap->SetReferenceMapPoints(mvpLocalMapPoints);
+
     return mnMatchesInliers >= 8;
 }
 
@@ -830,4 +669,227 @@ void Tracker::ResetVelocity()
 {
     // 将恒速模型速度矩阵重置为单位矩阵，下一帧将退化为基于上一帧重投影搜索
     mVelocity.setIdentity();
+}
+
+/**
+ * @brief 调度更新局部地图
+ */
+void Tracker::UpdateLocalMap()
+{
+    UpdateLocalKeyFrames();
+    UpdateLocalPoints();
+}
+
+/**
+ * @brief 搜集局部关键帧 (当前帧观测帧 + 一级共视邻居 + 二级共视邻居)
+ */
+void Tracker::UpdateLocalKeyFrames()
+{
+    mvpLocalKeyFrames.clear();
+
+    // 1. 统计当前帧所有已匹配地图点的所有有效观测关键帧
+    std::map<KeyFrame*, int> keyframeCounter;
+    for (int i = 0; i < mCurrentFrame.N; i++)
+    {
+        MapPoint *pMP = mCurrentFrame.mvpMapPoints[i];
+        if (pMP && !pMP->isBad())
+        {
+            const std::map<KeyFrame *, size_t> observations = pMP->GetObservations();
+            for (auto mit = observations.begin(); mit != observations.end(); ++mit)
+            {
+                if (!mit->first->mbBad)
+                    keyframeCounter[mit->first]++;
+            }
+        }
+    }
+
+    if (keyframeCounter.empty())
+        return;
+
+    int maxObs = 0;
+    KeyFrame *pKFmax = nullptr;
+    mvpLocalKeyFrames.reserve(3 * keyframeCounter.size());
+
+    // 2. 加入当前帧直接观测到的关键帧，并选出共视点最多的作为参考关键帧
+    for (auto &mit : keyframeCounter)
+    {
+        KeyFrame *pKF = mit.first;
+        if (!pKF->mbBad)
+        {
+            mvpLocalKeyFrames.push_back(pKF);
+            if (mit.second > maxObs)
+            {
+                maxObs = mit.second;
+                pKFmax = pKF;
+            }
+        }
+    }
+
+    if (pKFmax)
+        mpReferenceKF = pKFmax;
+
+    // 3. 扩充一级共视邻居、二级共视邻居、子节点与父节点
+    std::vector<KeyFrame*> vpLocalKFWithNeighbors = mvpLocalKeyFrames;
+    for (KeyFrame *pKF : mvpLocalKeyFrames)
+    {
+        if (pKF->mbBad)
+            continue;
+
+        // (a) 最佳共视前 10 个邻居
+        const std::vector<KeyFrame *> vNeighs = pKF->GetBestCovisibilityKeyFrames(10);
+        for (KeyFrame *pN : vNeighs)
+        {
+            if (pN && !pN->mbBad)
+                vpLocalKFWithNeighbors.push_back(pN);
+        }
+
+        // (b) 生成树子节点与父节点
+        const std::set<KeyFrame *> spChildren = pKF->GetChilds();
+        for (KeyFrame *pChild : spChildren)
+        {
+            if (pChild && !pChild->mbBad)
+                vpLocalKFWithNeighbors.push_back(pChild);
+        }
+
+        KeyFrame *pParent = pKF->GetParent();
+        if (pParent && !pParent->mbBad)
+            vpLocalKFWithNeighbors.push_back(pParent);
+    }
+
+    // 4. 排序与去重
+    std::sort(vpLocalKFWithNeighbors.begin(), vpLocalKFWithNeighbors.end());
+    vpLocalKFWithNeighbors.erase(
+        std::unique(vpLocalKFWithNeighbors.begin(), vpLocalKFWithNeighbors.end()),
+        vpLocalKFWithNeighbors.end());
+
+    mvpLocalKeyFrames = vpLocalKFWithNeighbors;
+}
+
+/**
+ * @brief 搜集局部地图点 (从局部关键帧中提取并去重)
+ */
+void Tracker::UpdateLocalPoints()
+{
+    mvpLocalMapPoints.clear();
+
+    for (KeyFrame *pKF : mvpLocalKeyFrames)
+    {
+        if (!pKF || pKF->mbBad)
+            continue;
+
+        std::vector<MapPoint *> vpMPs = pKF->GetMapPointMatches();
+        for (MapPoint *pMP : vpMPs)
+        {
+            if (!pMP || pMP->isBad())
+                continue;
+
+            // 避免重复收集
+            if (std::find(mvpLocalMapPoints.begin(), mvpLocalMapPoints.end(), pMP) == mvpLocalMapPoints.end())
+            {
+                mvpLocalMapPoints.push_back(pMP);
+            }
+        }
+    }
+}
+
+/**
+ * @brief 投影搜索局部地图点
+ */
+void Tracker::SearchLocalPoints()
+{
+    if (mvpLocalMapPoints.empty())
+        return;
+
+    Eigen::Matrix3f Rcw = mCurrentFrame.mTcw.block<3, 3>(0, 0);
+    Eigen::Vector3f tcw = mCurrentFrame.mTcw.block<3, 1>(0, 3);
+    Eigen::Vector3f Ow = -Rcw.transpose() * tcw;
+
+    const float fx_ratio = Frame::fx / 500.0f;
+    const float base_radius = 5.0f * std::max(1.0f, fx_ratio);
+
+    for (MapPoint *pMP : mvpLocalMapPoints)
+    {
+        if (pMP->isBad())
+            continue;
+
+        // 避免重复匹配当前帧中已存在的关联
+        bool bAlreadyFound = false;
+        for (int i = 0; i < mCurrentFrame.N; i++)
+        {
+            if (mCurrentFrame.mvpMapPoints[i] == pMP)
+            {
+                bAlreadyFound = true;
+                break;
+            }
+        }
+        if (bAlreadyFound)
+            continue;
+
+        // 1. 坐标投影与前方可见性检验
+        Eigen::Vector3f P_w = pMP->GetWorldPos();
+        Eigen::Vector3f P_c = Rcw * P_w + tcw;
+        if (P_c[2] <= 0.0f)
+            continue;
+
+        const float invz = 1.0f / P_c[2];
+        float u = Frame::fx * P_c[0] * invz + Frame::cx;
+        float v = Frame::fy * P_c[1] * invz + Frame::cy;
+
+        if (u < Frame::mnMinX || u >= Frame::mnMaxX || v < Frame::mnMinY || v >= Frame::mnMaxY)
+            continue;
+
+        // 2. 距离与尺度不变性范围检查
+        Eigen::Vector3f vPosCamera = P_w - Ow;
+        const float dist = vPosCamera.norm();
+        const float maxDistance = pMP->GetMaxDistanceInvariance();
+        const float minDistance = pMP->GetMinDistanceInvariance();
+
+        if (dist < minDistance || dist > maxDistance)
+            continue;
+
+        float scaleFactor = 1.0f;
+        if (maxDistance > minDistance)
+        {
+            const float ratio = dist / minDistance;
+            scaleFactor = std::max(1.0f, std::min(ratio, 3.0f));
+        }
+
+        // 3. 视角倾角检查
+        Eigen::Vector3f Pn = pMP->GetNormal();
+        float viewCos = vPosCamera.dot(Pn) / dist;
+        if (viewCos < 0.5f)
+            continue;
+
+        const float angleFactor = 1.0f / std::max(0.5f, viewCos);
+        const float dynamic_radius = base_radius * scaleFactor * angleFactor;
+
+        // 4. 网格局部特征点匹配
+        std::vector<size_t> vIndices = mCurrentFrame.GetFeaturesInArea(u, v, dynamic_radius);
+        if (vIndices.empty())
+            continue;
+
+        cv::Mat dMP = pMP->GetDescriptor();
+        int bestDist = ORBmatcher::TH_HIGH;
+        int bestIdx = -1;
+
+        for (size_t idx : vIndices)
+        {
+            if (mCurrentFrame.mvpMapPoints[idx])
+                continue;
+
+            cv::Mat dFrame = mCurrentFrame.mDescriptors.row(idx);
+            int distDesc = ORBmatcher::DescriptorDistance(dMP, dFrame);
+
+            if (distDesc < bestDist)
+            {
+                bestDist = distDesc;
+                bestIdx = idx;
+            }
+        }
+
+        if (bestDist < ORBmatcher::TH_HIGH && bestIdx >= 0)
+        {
+            mCurrentFrame.mvpMapPoints[bestIdx] = pMP;
+        }
+    }
 }
