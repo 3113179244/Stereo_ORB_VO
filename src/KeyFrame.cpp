@@ -21,9 +21,9 @@ KeyFrame::KeyFrame(Frame &F, Map *pMap)
       mvInvLevelSigma2(F.mpORBextractorLeft->GetInverseScaleSigmaSquares()),
       mbBad(false), mpMap(pMap), mpORBvocabulary(F.mpORBvocabulary), mpParent(nullptr)
 {
-    mnId = nNextId++;             // 分配新的关键帧 ID
-    mvpMapPoints = F.mvpMapPoints;// 继承普通帧中已经匹配好的 3D 地图点
-    SetPose(F.mTcw);              // 设置关键帧的初始位姿
+    mnId = nNextId++;              // 分配新的关键帧 ID
+    mvpMapPoints = F.mvpMapPoints; // 继承普通帧中已经匹配好的 3D 地图点
+    SetPose(F.mTcw);               // 设置关键帧的初始位姿
     AssignFeaturesToGrid();
 }
 
@@ -104,9 +104,9 @@ void KeyFrame::UpdateConnections()
         for (auto mit = observations.begin(); mit != observations.end(); mit++)
         {
             KeyFrame *pKF = mit->first;
-            if (pKF->mnId == mnId)  // 跳过自身
+            if (pKF->mnId == mnId) // 跳过自身
                 continue;
-            KFcounter[pKF]++;       // 累加共视地图点数
+            KFcounter[pKF]++; // 累加共视地图点数
         }
     }
 
@@ -116,7 +116,7 @@ void KeyFrame::UpdateConnections()
     // 2. 找出共视点最多（nmax）的关键帧，作为无门槛邻居时的保底连接
     int nmax = 0;
     KeyFrame *pKFmax = nullptr;
-    const int th = 15;  // 共视门槛：至少共享15个地图点才算有效连接
+    const int th = 15; // 共视门槛：至少共享15个地图点才算有效连接
 
     std::vector<std::pair<int, KeyFrame *>> vPairs;
     vPairs.reserve(KFcounter.size());
@@ -154,7 +154,7 @@ void KeyFrame::UpdateConnections()
     {
         std::unique_lock<std::mutex> lockCon(mMutexConnections);
         mConnectedKeyFrameWeights = KFcounter;
-        mvpOrderedConnectedKeyFrames = vNeighbors;  // 降序
+        mvpOrderedConnectedKeyFrames = vNeighbors; // 降序
         mvOrderedWeights = vWeights;
     }
 
@@ -244,7 +244,7 @@ std::vector<KeyFrame *> KeyFrame::GetBestCovisibilityKeyFrames(const int &N)
 }
 
 // 添加特征点与 3D 地图点之间的绑定关联
-void KeyFrame::AddMapPoint(MapPoint* pMP, const size_t &idx)
+void KeyFrame::AddMapPoint(MapPoint *pMP, const size_t &idx)
 {
     std::unique_lock<std::mutex> lock(mMutexFeatures);
     mvpMapPoints[idx] = pMP;
@@ -258,11 +258,11 @@ void KeyFrame::EraseMapPointMatch(const size_t &idx)
 }
 
 // 根据地图点指针解除匹配关系
-void KeyFrame::EraseMapPointMatch(MapPoint* pMP)
+void KeyFrame::EraseMapPointMatch(MapPoint *pMP)
 {
     // 先获取该地图点在当前关键帧中的索引
     int idx = pMP->GetIndexInKeyFrame(this);
-    if(idx >= 0)
+    if (idx >= 0)
     {
         std::unique_lock<std::mutex> lock(mMutexFeatures);
         mvpMapPoints[idx] = nullptr;
@@ -270,21 +270,21 @@ void KeyFrame::EraseMapPointMatch(MapPoint* pMP)
 }
 
 // 替换对应位置的地图点匹配（如闭环融合后将旧点换成新点）
-void KeyFrame::ReplaceMapPointMatch(const size_t &idx, MapPoint* pMP)
+void KeyFrame::ReplaceMapPointMatch(const size_t &idx, MapPoint *pMP)
 {
     std::unique_lock<std::mutex> lock(mMutexFeatures);
     mvpMapPoints[idx] = pMP;
 }
 
 // 获取本关键帧中所有的地图点匹配列表
-std::vector<MapPoint*> KeyFrame::GetMapPointMatches()
+std::vector<MapPoint *> KeyFrame::GetMapPointMatches()
 {
     std::unique_lock<std::mutex> lock(mMutexFeatures);
     return mvpMapPoints;
 }
 
 // 获取某个特定特征点关联的地图点
-MapPoint* KeyFrame::GetMapPoint(const size_t &idx)
+MapPoint *KeyFrame::GetMapPoint(const size_t &idx)
 {
     std::unique_lock<std::mutex> lock(mMutexFeatures);
     return mvpMapPoints[idx];
@@ -357,7 +357,7 @@ void KeyFrame::SetBadFlag()
         mvpOrderedConnectedKeyFrames.clear();
         mvOrderedWeights.clear();
         // 【关键改动】：务必注释掉下面这行！保留自己的 mpParent 指针供普通帧回溯位姿
-        // mpParent = nullptr; 
+        // mpParent = nullptr;
         mspChildren.clear();
     }
 
@@ -381,10 +381,10 @@ void KeyFrame::EraseConnection(KeyFrame *pKF)
         UpdateBestCovisibles();
 }
 
-std::vector<KeyFrame*> KeyFrame::GetConnectedKeyFrames()
+std::vector<KeyFrame *> KeyFrame::GetConnectedKeyFrames()
 {
     std::unique_lock<std::mutex> lock(mMutexConnections);
-    std::vector<KeyFrame*> vKF;
+    std::vector<KeyFrame *> vKF;
     vKF.reserve(mConnectedKeyFrameWeights.size());
     for (auto mit = mConnectedKeyFrameWeights.begin(); mit != mConnectedKeyFrameWeights.end(); mit++)
     {
@@ -426,25 +426,25 @@ int KeyFrame::GetWeight(KeyFrame *pKF)
 
 void KeyFrame::ComputeBoW()
 {
-    if(!mpORBvocabulary)
+    if (!mpORBvocabulary)
     {
         std::cerr << "[ERROR] KeyFrame::ComputeBoW(): mpORBvocabulary is nullptr!" << std::endl;
         return;
     }
 
-    if(mDescriptors.empty())
+    if (mDescriptors.empty())
     {
         return;
     }
 
-    if(mBowVec.empty())
+    if (mBowVec.empty())
     {
         // 将 cv::Mat 矩阵按行转换为 DBoW3 要求的 std::vector<cv::Mat>
         std::vector<cv::Mat> vCurrentDesc;
         vCurrentDesc.reserve(mDescriptors.rows);
         for (int i = 0; i < mDescriptors.rows; i++)
         {
-            vCurrentDesc.push_back(mDescriptors.row(i));
+            vCurrentDesc.push_back(mDescriptors.row(i).clone());
         }
 
         // 调用 DBoW3 的 transform 接口
@@ -458,9 +458,11 @@ void KeyFrame::AssignFeaturesToGrid()
     // （Frame::ComputeImageBounds 用真实的 imLeft.cols/rows 设定，位于图像网格内）。
     // 之前用 2.0f*cx / 2.0f*cy 推导会导致主点 cx != cols/2 时边界不准确，
     // 使图像边缘的特征点被漏搜。
-    mnMinX = Frame::mnMinX; mnMinY = Frame::mnMinY;
-    mnMaxX = Frame::mnMaxX; mnMaxY = Frame::mnMaxY;
-    mfGridElementWidthInv  = static_cast<float>(mnGridCols) / (mnMaxX - mnMinX);
+    mnMinX = Frame::mnMinX;
+    mnMinY = Frame::mnMinY;
+    mnMaxX = Frame::mnMaxX;
+    mnMaxY = Frame::mnMaxY;
+    mfGridElementWidthInv = static_cast<float>(mnGridCols) / (mnMaxX - mnMinX);
     mfGridElementHeightInv = static_cast<float>(mnGridRows) / (mnMaxY - mnMinY);
 
     // 预分配
@@ -493,21 +495,26 @@ std::vector<size_t> KeyFrame::GetFeaturesInArea(
     vIndices.reserve(N);
 
     const int nMinCellX = std::max(0, (int)floor((x - mnMinX - r) * mfGridElementWidthInv));
-    if (nMinCellX >= FRAME_GRID_COLS) return vIndices;
+    if (nMinCellX >= FRAME_GRID_COLS)
+        return vIndices;
     const int nMaxCellX = std::min((int)FRAME_GRID_COLS - 1, (int)ceil((x - mnMinX + r) * mfGridElementWidthInv));
-    if (nMaxCellX < 0) return vIndices;
+    if (nMaxCellX < 0)
+        return vIndices;
 
     const int nMinCellY = std::max(0, (int)floor((y - mnMinY - r) * mfGridElementHeightInv));
-    if (nMinCellY >= FRAME_GRID_ROWS) return vIndices;
+    if (nMinCellY >= FRAME_GRID_ROWS)
+        return vIndices;
     const int nMaxCellY = std::min((int)FRAME_GRID_ROWS - 1, (int)ceil((y - mnMinY + r) * mfGridElementHeightInv));
-    if (nMaxCellY < 0) return vIndices;
+    if (nMaxCellY < 0)
+        return vIndices;
 
     for (int ix = nMinCellX; ix <= nMaxCellX; ix++)
     {
         for (int iy = nMinCellY; iy <= nMaxCellY; iy++)
         {
             const std::vector<size_t> &vCell = mGrid[ix][iy];
-            if (vCell.empty()) continue;
+            if (vCell.empty())
+                continue;
             for (size_t j = 0; j < vCell.size(); j++)
             {
                 const cv::KeyPoint &kpUn = mvKeysUn[vCell[j]];
@@ -564,7 +571,7 @@ int KeyFrame::TrackedMapPoints(const int &minObs)
     const bool bCheckObs = minObs > 0;
     for (int i = 0; i < N; i++)
     {
-        MapPoint* pMP = mvpMapPoints[i];
+        MapPoint *pMP = mvpMapPoints[i];
         if (pMP && !pMP->isBad())
         {
             if (bCheckObs)

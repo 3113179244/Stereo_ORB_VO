@@ -4,8 +4,8 @@
 #include <thread>
 #include <cmath>
 #include "Config.h"
-#include <algorithm>   
-#include <limits> 
+#include <algorithm>
+#include <limits>
 #include "MapPoint.h"
 long unsigned int Frame::nNextId = 0;
 bool Frame::mbInitialComputations = true;
@@ -26,8 +26,11 @@ Frame::Frame(const cv::Mat &imLeft, const cv::Mat &imRight, const double &timeSt
     mnId = nNextId++;
 
     // 多线程并发提取左右图 ORB 特征，以加速前端处理
-    std::thread threadLeft(&Frame::ExtractORB, this, 0, imLeft);
-    std::thread threadRight(&Frame::ExtractORB, this, 1, imRight);
+    mImGrayLeft = imLeft.clone();
+    mImGrayRight = imRight.clone();
+
+    std::thread threadLeft(&Frame::ExtractORB, this, 0, mImGrayLeft);
+    std::thread threadRight(&Frame::ExtractORB, this, 1, mImGrayRight);
     threadLeft.join();
     threadRight.join();
 
@@ -139,9 +142,9 @@ void Frame::ComputeStereoMatches()
     }
 
     // 搜索参数定义
-    const float minZ = mb;          // 最小有效深度 (基线长度)
-    const float minD = 0.0f;        // 最小视差
-    const float maxD = mbf / minZ;  // 最大视差
+    const float minZ = mb;         // 最小有效深度 (基线长度)
+    const float minD = 0.0f;       // 最小视差
+    const float maxD = mbf / minZ; // 最大视差
 
     // 保存最佳匹配信息
     std::vector<std::pair<int, int>> vDistIdx;
@@ -382,25 +385,25 @@ std::vector<size_t> Frame::GetFeaturesInArea(const float &x, const float &y, con
 
 void Frame::ComputeBoW()
 {
-    if(!mpORBvocabulary)
+    if (!mpORBvocabulary)
     {
         std::cerr << "[ERROR] Frame::ComputeBoW(): mpORBvocabulary is nullptr!" << std::endl;
         return;
     }
 
-    if(mDescriptors.empty())
+    if (mDescriptors.empty())
     {
         return;
     }
 
-    if(mBowVec.empty())
+    if (mBowVec.empty())
     {
         // 转换格式适配 DBoW3
         std::vector<cv::Mat> vCurrentDesc;
         vCurrentDesc.reserve(mDescriptors.rows);
         for (int i = 0; i < mDescriptors.rows; i++)
         {
-            vCurrentDesc.push_back(mDescriptors.row(i));
+            vCurrentDesc.push_back(mDescriptors.row(i).clone());
         }
 
         mpORBvocabulary->transform(vCurrentDesc, mBowVec, mFeatVec, 4);
@@ -409,7 +412,8 @@ void Frame::ComputeBoW()
 
 bool Frame::isNear(int i) const
 {
-    if (i < 0 || i >= N) return false;
+    if (i < 0 || i >= N)
+        return false;
 
     // 优先使用当前帧已经算好的双目/RGBD深度值
     float z = mvDepth[i];
@@ -429,7 +433,8 @@ bool Frame::isNear(int i) const
 
 bool Frame::isFar(int i) const
 {
-    if (i < 0 || i >= N) return false;
+    if (i < 0 || i >= N)
+        return false;
 
     float z = mvDepth[i];
     if (z > 0.0f)
@@ -445,9 +450,10 @@ bool Frame::isFar(int i) const
     return false;
 }
 
-bool Frame::isMapPointNear(MapPoint* pMP) const
+bool Frame::isMapPointNear(MapPoint *pMP) const
 {
-    if (!pMP || pMP->isBad()) return false;
+    if (!pMP || pMP->isBad())
+        return false;
 
     // 计算地图点在当前相机坐标系下的坐标 P_c = R_cw * P_w + t_cw
     Eigen::Vector3f P_w = pMP->GetWorldPos();
@@ -457,9 +463,10 @@ bool Frame::isMapPointNear(MapPoint* pMP) const
     return (P_c.z() > 0.0f && P_c.z() < mThDepth);
 }
 
-bool Frame::isMapPointFar(MapPoint* pMP) const
+bool Frame::isMapPointFar(MapPoint *pMP) const
 {
-    if (!pMP || pMP->isBad()) return false;
+    if (!pMP || pMP->isBad())
+        return false;
 
     Eigen::Vector3f P_w = pMP->GetWorldPos();
     Eigen::Vector3f P_c = mRcw * P_w + mtcw;

@@ -95,13 +95,16 @@ Eigen::Matrix4f System::TrackStereo(const cv::Mat &imLeft, const cv::Mat &imRigh
     }
 
     // 彩色/灰度检查
-    cv::Mat imLeftGray = imLeft;
-    cv::Mat imRightGray = imRight;
-
+    cv::Mat imLeftGray, imRightGray;
     if (imLeft.channels() == 3)
     {
         cv::cvtColor(imLeft, imLeftGray, cv::COLOR_BGR2GRAY);
         cv::cvtColor(imRight, imRightGray, cv::COLOR_BGR2GRAY);
+    }
+    else
+    {
+        imLeftGray = imLeft.clone();
+        imRightGray = imRight.clone();
     }
 
     // 调用 Tracker 执行跟踪主流程

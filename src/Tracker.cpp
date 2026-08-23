@@ -32,28 +32,18 @@ Tracker::~Tracker() {}
 
 Eigen::Matrix4f Tracker::GrabImageStereo(const cv::Mat &imRectLeft, const cv::Mat &imRectRight, const double &timestamp)
 {
-    imRectLeft.copyTo(mImGray);
+    mImGray = imRectLeft.clone();
+
     // 构建内参矩阵与畸变矩阵
     cv::Mat K = (cv::Mat_<float>(3, 3) << Config::g_dFx, 0, Config::g_dCx,
                  0, Config::g_dFy, Config::g_dCy,
                  0, 0, 1);
     cv::Mat DistCoef = (cv::Mat_<float>(4, 1) << Config::g_dK1, Config::g_dK2, Config::g_dP1, Config::g_dP2);
 
-    // 实例化当前帧 (内部自动触发多线程特征提取 + 双目匹配计算深度)
-    mCurrentFrame = Frame(imRectLeft, imRectRight, timestamp,
+    mCurrentFrame = Frame(imRectLeft.clone(), imRectRight.clone(), timestamp,
                           mpORBextractorLeft.get(), mpORBextractorRight.get(),
                           mpORBVocabulary, K, DistCoef, Config::g_dBf, Config::g_dThDepth);
-    // 打印左右目图像的特征点，双目匹配成功点数
-    // int nLeft = mCurrentFrame.mvKeys.size();
-    // int nRight = mCurrentFrame.mvKeysRight.size();
-    // int nMatches = std::count_if(mCurrentFrame.mvuRight.begin(), mCurrentFrame.mvuRight.end(),
-    //                              [](float d)
-    //                              { return d >= 0; }); // 或 mvDepth[i] > 0
 
-    // std::cout << "Frame " << mCurrentFrame.mnId
-    //           << " | Left features: " << nLeft
-    //           << " | Right features: " << nRight
-    //           << " | Stereo matches: " << nMatches << std::endl;
     // 执行跟踪状态机主逻辑
     Track();
 
