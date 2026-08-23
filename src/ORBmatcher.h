@@ -31,14 +31,6 @@ public:
      */
     static int DescriptorDistance(const cv::Mat &a, const cv::Mat &b);
 
-    /**
-     * @brief 双目极线搜索匹配：在左右目图像中匹配特征点，并直接计算视差 (Disparity) 和深度 (Depth)
-     * 假设图像已经过极线矫正，因此匹配点只在同一行（或相近行）中搜索。
-     * @param F 包含左右图像特征信息的 Frame 引用
-     * @return 成功建立双目匹配的特征点数量
-     */
-    int ComputeStereoMatches(Frame &F);
-
     int SearchByProjection(Frame &CurrentFrame, const Frame &LastFrame, const float th, const bool bMono = false);
     // 2. 局部地图点投影匹配（TrackLocalMap 使用）
     int SearchByProjection(Frame &F, const std::vector<MapPoint *> &vpMapPoints, const float th = 3.0f);

@@ -790,96 +790,35 @@ void Tracker::SearchLocalPoints()
     if (mvpLocalMapPoints.empty())
         return;
 
-    Eigen::Matrix3f Rcw = mCurrentFrame.mTcw.block<3, 3>(0, 0);
-    Eigen::Vector3f tcw = mCurrentFrame.mTcw.block<3, 1>(0, 3);
-    Eigen::Vector3f Ow = -Rcw.transpose() * tcw;
-
-    const float fx_ratio = Frame::fx / 500.0f;
-    const float base_radius = 5.0f * std::max(1.0f, fx_ratio);
+    // 1. 过滤掉当前帧中已经匹配上的地图点，避免重复搜索
+    std::vector<MapPoint*> vpCandidateMPs;
+    vpCandidateMPs.reserve(mvpLocalMapPoints.size());
 
     for (MapPoint *pMP : mvpLocalMapPoints)
     {
-        if (pMP->isBad())
+        if (!pMP || pMP->isBad())
             continue;
 
-        // 避免重复匹配当前帧中已存在的关联
-        bool bAlreadyFound = false;
-        for (int i = 0; i < mCurrentFrame.N; i++)
+        bool bAlreadyTracked = false;
+        for (int i = 0; i < mCurrentFrame.N; ++i)
         {
             if (mCurrentFrame.mvpMapPoints[i] == pMP)
             {
-                bAlreadyFound = true;
+                bAlreadyTracked = true;
                 break;
             }
         }
-        if (bAlreadyFound)
-            continue;
 
-        // 1. 坐标投影与前方可见性检验
-        Eigen::Vector3f P_w = pMP->GetWorldPos();
-        Eigen::Vector3f P_c = Rcw * P_w + tcw;
-        if (P_c[2] <= 0.0f)
-            continue;
-
-        const float invz = 1.0f / P_c[2];
-        float u = Frame::fx * P_c[0] * invz + Frame::cx;
-        float v = Frame::fy * P_c[1] * invz + Frame::cy;
-
-        if (u < Frame::mnMinX || u >= Frame::mnMaxX || v < Frame::mnMinY || v >= Frame::mnMaxY)
-            continue;
-
-        // 2. 距离与尺度不变性范围检查
-        Eigen::Vector3f vPosCamera = P_w - Ow;
-        const float dist = vPosCamera.norm();
-        const float maxDistance = pMP->GetMaxDistanceInvariance();
-        const float minDistance = pMP->GetMinDistanceInvariance();
-
-        if (dist < minDistance || dist > maxDistance)
-            continue;
-
-        float scaleFactor = 1.0f;
-        if (maxDistance > minDistance)
+        if (!bAlreadyTracked)
         {
-            const float ratio = dist / minDistance;
-            scaleFactor = std::max(1.0f, std::min(ratio, 3.0f));
-        }
-
-        // 3. 视角倾角检查
-        Eigen::Vector3f Pn = pMP->GetNormal();
-        float viewCos = vPosCamera.dot(Pn) / dist;
-        if (viewCos < 0.5f)
-            continue;
-
-        const float angleFactor = 1.0f / std::max(0.5f, viewCos);
-        const float dynamic_radius = base_radius * scaleFactor * angleFactor;
-
-        // 4. 网格局部特征点匹配
-        std::vector<size_t> vIndices = mCurrentFrame.GetFeaturesInArea(u, v, dynamic_radius);
-        if (vIndices.empty())
-            continue;
-
-        cv::Mat dMP = pMP->GetDescriptor();
-        int bestDist = ORBmatcher::TH_HIGH;
-        int bestIdx = -1;
-
-        for (size_t idx : vIndices)
-        {
-            if (mCurrentFrame.mvpMapPoints[idx])
-                continue;
-
-            cv::Mat dFrame = mCurrentFrame.mDescriptors.row(idx);
-            int distDesc = ORBmatcher::DescriptorDistance(dMP, dFrame);
-
-            if (distDesc < bestDist)
-            {
-                bestDist = distDesc;
-                bestIdx = idx;
-            }
-        }
-
-        if (bestDist < ORBmatcher::TH_HIGH && bestIdx >= 0)
-        {
-            mCurrentFrame.mvpMapPoints[bestIdx] = pMP;
+            vpCandidateMPs.push_back(pMP);
         }
     }
+
+    if (vpCandidateMPs.empty())
+        return;
+
+    // 2. 调用已实现金字塔层级预测、视锥检查、Ratio Test与旋转直方图校验的匹配器
+    ORBmatcher matcher(0.8f, true);
+    matcher.SearchByProjection(mCurrentFrame, vpCandidateMPs, 5.0f);
 }
