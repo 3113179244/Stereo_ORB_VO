@@ -360,7 +360,7 @@ std::vector<size_t> Frame::GetFeaturesInArea(const float &x, const float &y, con
     {
         for (int iy = nMinCellY; iy <= nMaxCellY; iy++)
         {
-            const std::vector<size_t> vCell = mGrid[ix][iy]; // 取出该网格内的所有特征点索引
+            const std::vector<size_t> &vCell = mGrid[ix][iy]; // 取出该网格内的所有特征点索引
             if (vCell.empty())
                 continue;
 
