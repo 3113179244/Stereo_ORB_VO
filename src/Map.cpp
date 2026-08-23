@@ -62,6 +62,24 @@ std::vector<MapPoint*> Map::GetAllMapPoints()
 }
 
 /**
+ * @brief 获取参考地图点（局部地图点）的副本
+ */
+std::vector<MapPoint*> Map::GetReferenceMapPoints()
+{
+    std::unique_lock<std::mutex> lock(mMutexMap);
+    return mvpReferenceMapPoints;
+}
+
+/**
+ * @brief 设置参考地图点（由 Tracker 更新）
+ */
+void Map::SetReferenceMapPoints(const std::vector<MapPoint*> &vpMPs)
+{
+    std::unique_lock<std::mutex> lock(mMutexMap);
+    mvpReferenceMapPoints = vpMPs;
+}
+
+/**
  * @brief 获取当前地图点的总数
  */
 long unsigned int Map::GetMapPointsInMap()

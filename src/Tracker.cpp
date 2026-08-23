@@ -676,7 +676,7 @@ bool Tracker::TrackLocalMap()
             }
         }
     }
-
+    mpMap->SetReferenceMapPoints(vpLocalMapPoints);
     return mnMatchesInliers >= 8;
 }
 

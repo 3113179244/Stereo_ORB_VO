@@ -33,14 +33,18 @@ public:
     // 线程控制
     void RequestStop();
     bool isStopped();
+    bool Stop();
+    void Release();
+
     void RequestFinish();
     bool isFinished();
+    bool CheckFinish();
+    void SetFinish();
 
 private:
     void DrawMapPoints();
     void DrawKeyFrames(bool bDrawKF, bool bDrawGraph);
     void DrawCurrentCamera(pangolin::OpenGlMatrix &M);
-    void DrawTrajectory();
 
     void GetCurrentOpenGLCameraMatrix(pangolin::OpenGlMatrix &M);
     void SetCurrentCameraPose(const Eigen::Matrix4f &Tcw);
@@ -50,13 +54,18 @@ private:
     Tracker *mpTracker;
     std::shared_ptr<FrameDrawer> mpFrameDrawer;
 
-    // 绘制尺寸参数
+    // 绘制尺寸与视角参数
     float mCameraSize;
     float mCameraLineWidth;
     float mPointSize;
     float mKeyFrameSize;
     float mKeyFrameLineWidth;
     float mGraphLineWidth;
+
+    float mViewpointX;
+    float mViewpointY;
+    float mViewpointZ;
+    float mViewpointF;
 
     Eigen::Matrix4f mCameraPose;
     std::mutex mMutexCamera;

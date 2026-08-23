@@ -36,6 +36,7 @@ public:
     ~System();
     cv::Mat DrawFrame();
     std::shared_ptr<FrameDrawer> GetFrameDrawer() const { return mpFrameDrawer; }
+    std::shared_ptr<Viewer> GetViewer() const { return mpViewer; }
     // 核心输入接口：传入左右目图像和时间戳，返回世界到相机的变换 Tcw
     Eigen::Matrix4f TrackStereo(const cv::Mat &imLeft, const cv::Mat &imRight, const double &timestamp);
     ORBVocabulary *GetVocabulary() const { return mpVocabulary.get(); }

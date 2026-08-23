@@ -65,6 +65,12 @@ public:
     std::vector<MapPoint*> GetReferenceMapPoints();
 
     /**
+     * @brief 设置参考地图点（局部地图点）
+     * @param vpMPs 参考地图点指针容器
+     */
+    void SetReferenceMapPoints(const std::vector<MapPoint*> &vpMPs);
+
+    /**
      * @brief 获取地图中当前地图点的总数量
      * @return 地图点数量
      */

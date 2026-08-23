@@ -9,7 +9,7 @@
 #include <opencv2/core/utils/filesystem.hpp>
 #include "System.h"
 #include "Config.h"
-
+#include "Viewer.h"
 int main(int argc, char **argv)
 {
     // 设置默认路径
@@ -170,6 +170,13 @@ int main(int argc, char **argv)
     cv::utils::fs::createDirectories(strTrajDir); 
     std::string strTrajFile = strTrajDir + "/CameraTrajectory.txt";
     SLAM.SaveTrajectoryKITTI(strTrajFile);
-
+    if (SLAM.GetViewer())
+    {
+        while (!SLAM.GetViewer()->isFinished())
+        {
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        }
+    }
+    SLAM.Shutdown();
     return 0;
 }
