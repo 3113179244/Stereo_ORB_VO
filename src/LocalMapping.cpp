@@ -7,6 +7,7 @@
 #include "ORBmatcher.h"
 #include "ORBextractor.h"
 #include "Optimizer.h"
+#include "LoopClosing.h"
 #include <Eigen/SVD>
 #include <unistd.h>
 #include <algorithm>
@@ -125,13 +126,13 @@ void LocalMapping::Run()
                 std::unique_lock<std::mutex> lock(mMutexStop);
                 mbStopped = true;
             }
-            
+
             // 使用 mbStopRequested 作为循环判断条件，配合外部的 Release() 唤醒
             while (GetStopRequired())
             {
                 usleep(3000);
             }
-            
+
             {
                 std::unique_lock<std::mutex> lock(mMutexStop);
                 mbStopped = false;
@@ -167,6 +168,11 @@ void LocalMapping::Run()
             // 6. 剔除冗余关键帧
             KeyFrameCulling();
 
+            if (mpSystem && mpSystem->GetLoopCloser())
+            {
+                mpSystem->GetLoopCloser()->InsertKeyFrame(mpCurrentKeyFrame);
+            }
+
             {
                 std::unique_lock<std::mutex> lock(mMutexStop);
                 mbNotStop = false;
@@ -197,6 +203,9 @@ void LocalMapping::ProcessNewKeyFrame()
         mlNewKeyFrames.pop_front();
     }
 
+    // 计算词袋向量
+    mpCurrentKeyFrame->ComputeBoW();
+
     std::vector<MapPoint *> vpMapPointMatches = mpCurrentKeyFrame->GetMapPointMatches();
     for (size_t i = 0; i < vpMapPointMatches.size(); i++)
     {
@@ -209,10 +218,9 @@ void LocalMapping::ProcessNewKeyFrame()
                 pMP->UpdateNormalAndDepth();
                 pMP->ComputeDistinctiveDescriptor();
             }
-
-            // 观测数较少（<= 2）的新点加入待考核队列进行质量检验
-            if (pMP->GetObservations().size() <= 2)
+            else
             {
+                // 由 Tracking 线程在插帧时直接创建并加入的立体点，必须加入待考队列接受 MapPointCulling 检验
                 mlpRecentAddedMapPoints.push_back(pMP);
             }
         }
@@ -221,25 +229,46 @@ void LocalMapping::ProcessNewKeyFrame()
     mpCurrentKeyFrame->UpdateConnections();
     mpMap->AddKeyFrame(mpCurrentKeyFrame);
 }
-
+/**
+ * @brief 检查新增地图点，根据地图点的观测情况剔除质量不好的新增地图点
+ * mlpRecentAddedMapPoints：存储新增的待考核地图点
+ */
 void LocalMapping::MapPointCulling()
 {
+    // 待考核地图点队列为空直接返回
+    if (mlpRecentAddedMapPoints.empty())
+        return;
+
     auto lit = mlpRecentAddedMapPoints.begin();
+    const unsigned long int nCurrentKFid = mpCurrentKeyFrame->mnId;
+
+    // 双目模式下，通过考核所需的关键帧观测数阈值为 3 (单目为 2)
+    const int cnThObs = 3;
+
     while (lit != mlpRecentAddedMapPoints.end())
     {
         MapPoint *pMP = *lit;
+
         if (pMP->isBad())
         {
+            // 1. 已经是坏点的地图点，直接从待考核队列中移除
             lit = mlpRecentAddedMapPoints.erase(lit);
         }
         else if (pMP->GetFoundRatio() < 0.25f)
         {
+            // 2. 跟踪到的帧数占视野预计可见帧数比例小于 25%，剔除
             pMP->SetBadFlag();
             lit = mlpRecentAddedMapPoints.erase(lit);
         }
-        // 观测数足够（> 2）说明质量稳定，直接通过考核，移出待考队列
-        else if (pMP->GetObservations().size() > 2)
+        else if (((int)nCurrentKFid - (int)pMP->mnFirstKFid) >= 2 && static_cast<int>(pMP->GetObservations().size()) <= cnThObs)
         {
+            // 3. 建立已满 2 个关键帧以上，但观测到该点的关键帧数仍 <= 3，判定为不稳定点剔除
+            pMP->SetBadFlag();
+            lit = mlpRecentAddedMapPoints.erase(lit);
+        }
+        else if (((int)nCurrentKFid - (int)pMP->mnFirstKFid) >= 3)
+        {
+            // 4. 建立已达 3 个关键帧且通过上述测试，说明质量可靠，移出考核队列转正
             lit = mlpRecentAddedMapPoints.erase(lit);
         }
         else
@@ -385,215 +414,219 @@ void LocalMapping::CreateNewMapPoints()
     }
 }
 
+/**
+ * @brief 检查并融合当前关键帧与相邻关键帧（两级相邻）中重复的地图点
+ */
 void LocalMapping::SearchInNeighbors()
 {
-    // 1. 获取当前关键帧的最佳共视邻居关键帧（一级邻居）
-    const int nn = 10;
-    std::vector<KeyFrame *> vpNeighKFs = mpCurrentKeyFrame->GetBestCovisibilityKeyFrames(nn);
+    // Step 1: 获得共视图中权重排名前 nn 的一级邻居（双目/RGB-D 取 20，单目取 10）
+    const int nn = 20;
+    const std::vector<KeyFrame *> vpNeighKFs = mpCurrentKeyFrame->GetBestCovisibilityKeyFrames(nn);
+
     if (vpNeighKFs.empty())
         return;
 
+    // Step 2: 搜集一级相邻关键帧与二级相邻关键帧 (前 5 个共视邻居)
     std::vector<KeyFrame *> vpTargetKFs;
-    std::set<MapPoint *> vpFuseCandidates;
-    const int nn2 = 5;
+    vpTargetKFs.reserve(vpNeighKFs.size() * 3);
 
-    // 收集所有候选邻居关键帧（一级邻居 + 部分二级邻居）以及它们的地图点
     for (size_t i = 0; i < vpNeighKFs.size(); i++)
     {
         KeyFrame *pKFi = vpNeighKFs[i];
-        if (!pKFi || pKFi->mbBad)
+        if (!pKFi || pKFi->mbBad || pKFi->mnId == mpCurrentKeyFrame->mnId)
             continue;
 
-        vpTargetKFs.push_back(pKFi);
-        std::vector<MapPoint *> vpMPi = pKFi->GetMapPointMatches();
-        for (size_t j = 0; j < vpMPi.size(); j++)
-        {
-            if (vpMPi[j] && !vpMPi[j]->isBad())
-                vpFuseCandidates.insert(vpMPi[j]);
-        }
+        if (std::find(vpTargetKFs.begin(), vpTargetKFs.end(), pKFi) == vpTargetKFs.end())
+            vpTargetKFs.push_back(pKFi);
 
-        // 扩展到二级邻居
-        std::vector<KeyFrame *> vpNeigh2 = pKFi->GetBestCovisibilityKeyFrames(nn2);
-        for (size_t j = 0; j < vpNeigh2.size(); j++)
+        // 扩充二级邻居 (前 5 个共视邻居)
+        const std::vector<KeyFrame *> vpSecondNeighs = pKFi->GetBestCovisibilityKeyFrames(5);
+        for (size_t j = 0; j < vpSecondNeighs.size(); j++)
         {
-            KeyFrame *pKFi2 = vpNeigh2[j];
+            KeyFrame *pKFi2 = vpSecondNeighs[j];
             if (!pKFi2 || pKFi2->mbBad || pKFi2->mnId == mpCurrentKeyFrame->mnId)
                 continue;
-            if (std::find(vpTargetKFs.begin(), vpTargetKFs.end(), pKFi2) != vpTargetKFs.end())
+            if (std::find(vpTargetKFs.begin(), vpTargetKFs.end(), pKFi2) == vpTargetKFs.end())
+                vpTargetKFs.push_back(pKFi2);
+        }
+    }
+
+    if (vpTargetKFs.empty())
+        return;
+
+    // Step 3: 正向融合 —— 将当前关键帧的地图点投影到所有目标关键帧中融合
+    std::vector<MapPoint *> vpMapPointMatches = mpCurrentKeyFrame->GetMapPointMatches();
+
+    for (KeyFrame *pKF : vpTargetKFs)
+    {
+        if (!pKF || pKF->mbBad)
+            continue;
+
+        const Eigen::Matrix3f Rcw = pKF->GetRotation();
+        const Eigen::Vector3f tcw = pKF->GetTranslation();
+        const Eigen::Vector3f Ow = pKF->GetCameraCenter();
+
+        for (size_t i = 0; i < vpMapPointMatches.size(); i++)
+        {
+            MapPoint *pMP = vpMapPointMatches[i];
+            if (!pMP || pMP->isBad())
                 continue;
 
-            vpTargetKFs.push_back(pKFi2);
-            std::vector<MapPoint *> vpMP2 = pKFi2->GetMapPointMatches();
-            for (size_t k = 0; k < vpMP2.size(); k++)
+            // 视锥与可见性几何校验[cite: 2]
+            Eigen::Vector3f Pw = pMP->GetWorldPos();
+            Eigen::Vector3f Pc = Rcw * Pw + tcw;
+            if (Pc.z() <= 0.0f)
+                continue;
+
+            const float dist = (Pw - Ow).norm();
+            if (dist < pMP->GetMinDistanceInvariance() * 0.8f || dist > pMP->GetMaxDistanceInvariance() * 1.2f)
+                continue;
+
+            Eigen::Vector3f Pn = (Pw - Ow).normalized();
+            if (Pn.dot(pMP->GetNormal()) < 0.5f)
+                continue;
+
+            const float invz = 1.0f / Pc.z();
+            const float u = pKF->fx * Pc.x() * invz + pKF->cx;
+            const float v = pKF->fy * Pc.y() * invz + pKF->cy;
+
+            if (u < pKF->mnMinX || u >= pKF->mnMaxX || v < pKF->mnMinY || v >= pKF->mnMaxY)
+                continue;
+
+            // 自适应金字塔搜索半径
+            float ratio = dist / pMP->GetMaxDistanceInvariance();
+            int nPredictedLevel = std::max(0, std::min(static_cast<int>(ratio * 4.0f), 3));
+            const float radius = 3.0f * pKF->mvScaleFactors[nPredictedLevel];
+
+            const std::vector<size_t> vIndices = pKF->GetFeaturesInArea(u, v, radius);
+            if (vIndices.empty())
+                continue;
+
+            const cv::Mat &dMP = pMP->GetDescriptor();
+            int bestDist = ORBmatcher::TH_LOW;
+            int bestIdx = -1;
+
+            for (size_t idx : vIndices)
             {
-                if (vpMP2[k] && !vpMP2[k]->isBad())
-                    vpFuseCandidates.insert(vpMP2[k]);
+                const cv::Mat &dF = pKF->mDescriptors.row(idx);
+                int distDesc = ORBmatcher::DescriptorDistance(dMP, dF);
+                if (distDesc < bestDist)
+                {
+                    bestDist = distDesc;
+                    bestIdx = static_cast<int>(idx);
+                }
+            }
+
+            if (bestIdx >= 0)
+            {
+                MapPoint *pMPinKF = pKF->GetMapPoint(bestIdx);
+                if (!pMPinKF)
+                {
+                    pKF->AddMapPoint(pMP, bestIdx);
+                    pMP->AddObservation(pKF, bestIdx);
+                }
+                else if (pMPinKF != pMP)
+                {
+                    if (pMP->GetObservations().size() >= pMPinKF->GetObservations().size())
+                        pMPinKF->Replace(pMP);
+                    else
+                        pMP->Replace(pMPinKF);
+                }
             }
         }
     }
 
-    const float fx = mpCurrentKeyFrame->fx;
-    const float fy = mpCurrentKeyFrame->fy;
-    const float cx = mpCurrentKeyFrame->cx;
-    const float cy = mpCurrentKeyFrame->cy;
-    const Eigen::Matrix3f Rcw = mpCurrentKeyFrame->GetRotation();
-    const Eigen::Vector3f tcw = mpCurrentKeyFrame->GetTranslation();
-
-    // ==========================================
-    // 阶段 A: 将邻居的地图点投影到当前关键帧融合
-    // ==========================================
-    std::vector<MapPoint *> vpLocalMapPoints = mpCurrentKeyFrame->GetMapPointMatches();
-
-    for (std::set<MapPoint *>::iterator sit = vpFuseCandidates.begin();
-         sit != vpFuseCandidates.end(); sit++)
+    // Step 4: 反向融合 —— 搜集目标关键帧中的所有地图点，投影到当前帧中融合
+    std::set<MapPoint *> sFuseCandidates;
+    for (KeyFrame *pKF : vpTargetKFs)
     {
-        MapPoint *pMP = *sit;
+        if (!pKF || pKF->mbBad)
+            continue;
+
+        const std::vector<MapPoint *> vpMPs = pKF->GetMapPointMatches();
+        for (MapPoint *pMP : vpMPs)
+        {
+            if (pMP && !pMP->isBad())
+                sFuseCandidates.insert(pMP);
+        }
+    }
+
+    const Eigen::Matrix3f RcwCur = mpCurrentKeyFrame->GetRotation();
+    const Eigen::Vector3f tcwCur = mpCurrentKeyFrame->GetTranslation();
+    const Eigen::Vector3f OwCur = mpCurrentKeyFrame->GetCameraCenter();
+
+    for (MapPoint *pMP : sFuseCandidates)
+    {
         if (!pMP || pMP->isBad())
             continue;
 
-        Eigen::Vector3f Pc = Rcw * pMP->GetWorldPos() + tcw;
+        Eigen::Vector3f Pw = pMP->GetWorldPos();
+        Eigen::Vector3f Pc = RcwCur * Pw + tcwCur;
         if (Pc.z() <= 0.0f)
             continue;
 
+        const float dist = (Pw - OwCur).norm();
+        if (dist < pMP->GetMinDistanceInvariance() * 0.8f || dist > pMP->GetMaxDistanceInvariance() * 1.2f)
+            continue;
+
+        Eigen::Vector3f Pn = (Pw - OwCur).normalized();
+        if (Pn.dot(pMP->GetNormal()) < 0.5f)
+            continue;
+
         const float invz = 1.0f / Pc.z();
-        const float u = fx * Pc.x() * invz + cx;
-        const float v = fy * Pc.y() * invz + cy;
+        const float u = mpCurrentKeyFrame->fx * Pc.x() * invz + mpCurrentKeyFrame->cx;
+        const float v = mpCurrentKeyFrame->fy * Pc.y() * invz + mpCurrentKeyFrame->cy;
 
         if (u < mpCurrentKeyFrame->mnMinX || u >= mpCurrentKeyFrame->mnMaxX ||
             v < mpCurrentKeyFrame->mnMinY || v >= mpCurrentKeyFrame->mnMaxY)
             continue;
 
-        // 根据特征点金字塔层级设置搜索半径
-        const std::vector<size_t> vCandidates = mpCurrentKeyFrame->GetFeaturesInArea(u, v, 10.0f);
-        if (vCandidates.empty())
+        float ratio = dist / pMP->GetMaxDistanceInvariance();
+        int nPredictedLevel = std::max(0, std::min(static_cast<int>(ratio * 4.0f), 3));
+        const float radius = 3.0f * mpCurrentKeyFrame->mvScaleFactors[nPredictedLevel];
+
+        const std::vector<size_t> vIndices = mpCurrentKeyFrame->GetFeaturesInArea(u, v, radius);
+        if (vIndices.empty())
             continue;
 
         const cv::Mat &dMP = pMP->GetDescriptor();
-        int bestDist = ORBmatcher::TH_HIGH;
+        int bestDist = ORBmatcher::TH_LOW;
         int bestIdx = -1;
 
-        for (size_t c = 0; c < vCandidates.size(); c++)
+        for (size_t idx : vIndices)
         {
-            const size_t idx = vCandidates[c];
             const cv::Mat &dF = mpCurrentKeyFrame->mDescriptors.row(idx);
-            const int dist = ORBmatcher::DescriptorDistance(dMP, dF);
-            if (dist < bestDist)
+            int distDesc = ORBmatcher::DescriptorDistance(dMP, dF);
+            if (distDesc < bestDist)
             {
-                bestDist = dist;
+                bestDist = distDesc;
                 bestIdx = static_cast<int>(idx);
             }
         }
 
-        if (bestIdx < 0 || bestDist > ORBmatcher::TH_HIGH)
-            continue;
-
-        MapPoint *pLocalMP = mpCurrentKeyFrame->GetMapPoint(bestIdx);
-        if (!pLocalMP)
+        if (bestIdx >= 0)
         {
-            // 当前关键帧没有该点，直接建立观测关联并更新点属性
-            mpCurrentKeyFrame->AddMapPoint(pMP, bestIdx);
-            pMP->AddObservation(mpCurrentKeyFrame, bestIdx);
-            pMP->UpdateNormalAndDepth();
-            pMP->ComputeDistinctiveDescriptor();
-        }
-        else if (pLocalMP->mnId != pMP->mnId)
-        {
-            // 发生重复观测，选择观测更多的点进行融合替换
-            if (pLocalMP->GetObservations().size() >= pMP->GetObservations().size())
+            MapPoint *pLocalMP = mpCurrentKeyFrame->GetMapPoint(bestIdx);
+            if (!pLocalMP)
             {
-                pMP->Replace(pLocalMP);
+                mpCurrentKeyFrame->AddMapPoint(pMP, bestIdx);
+                pMP->AddObservation(mpCurrentKeyFrame, bestIdx);
             }
-            else
+            else if (pLocalMP != pMP)
             {
-                pLocalMP->Replace(pMP);
-            }
-        }
-    }
-
-    // ==========================================
-    // 阶段 B: 将当前关键帧的地图点反向投影到目标关键帧融合
-    // ==========================================
-    vpLocalMapPoints = mpCurrentKeyFrame->GetMapPointMatches(); // 重新获取更新后的点
-
-    for (size_t i = 0; i < vpLocalMapPoints.size(); i++)
-    {
-        MapPoint *pMP = vpLocalMapPoints[i];
-        if (!pMP || pMP->isBad())
-            continue;
-
-        for (size_t k = 0; k < vpTargetKFs.size(); k++)
-        {
-            KeyFrame *pKF = vpTargetKFs[k];
-            if (!pKF || pKF->mbBad)
-                continue;
-
-            const Eigen::Matrix3f Rk = pKF->GetRotation();
-            const Eigen::Vector3f tk = pKF->GetTranslation();
-            const Eigen::Vector3f Pk = Rk * pMP->GetWorldPos() + tk;
-            if (Pk.z() <= 0.0f)
-                continue;
-
-            const float invzk = 1.0f / Pk.z();
-            const float uk = pKF->fx * Pk.x() * invzk + pKF->cx;
-            const float vk = pKF->fy * Pk.y() * invzk + pKF->cy;
-
-            if (uk < pKF->mnMinX || uk >= pKF->mnMaxX ||
-                vk < pKF->mnMinY || vk >= pKF->mnMaxY)
-                continue;
-
-            const std::vector<size_t> vCands = pKF->GetFeaturesInArea(uk, vk, 10.0f);
-            if (vCands.empty())
-                continue;
-
-            const cv::Mat &dMPF = pMP->GetDescriptor();
-            int bestDist = ORBmatcher::TH_HIGH;
-            int bestIdx = -1;
-
-            for (size_t c = 0; c < vCands.size(); c++)
-            {
-                const size_t idx = vCands[c];
-                const cv::Mat &dF = pKF->mDescriptors.row(idx);
-                const int dist = ORBmatcher::DescriptorDistance(dMPF, dF);
-                if (dist < bestDist)
-                {
-                    bestDist = dist;
-                    bestIdx = static_cast<int>(idx);
-                }
-            }
-
-            if (bestIdx < 0 || bestDist > ORBmatcher::TH_HIGH)
-                continue;
-
-            MapPoint *pNeighMP = pKF->GetMapPoint(bestIdx);
-            if (!pNeighMP)
-            {
-                pKF->AddMapPoint(pMP, bestIdx);
-                pMP->AddObservation(pKF, bestIdx);
-                pMP->UpdateNormalAndDepth();
-                pMP->ComputeDistinctiveDescriptor();
-            }
-            else if (pNeighMP->mnId != pMP->mnId)
-            {
-                if (pMP->GetObservations().size() >= pNeighMP->GetObservations().size())
-                {
-                    pNeighMP->Replace(pMP);
-                }
+                if (pMP->GetObservations().size() >= pLocalMP->GetObservations().size())
+                    pLocalMP->Replace(pMP);
                 else
-                {
-                    pMP->Replace(pNeighMP);
-                }
+                    pMP->Replace(pLocalMP);
             }
         }
     }
 
-    // ==========================================
-    // 阶段 C: 关键修复：统一清理坏点并重新计算所有更新点的几何与描述子
-    // ==========================================
-    // 1. 刷新当前帧的匹配点列表并更新点属性
-    vpLocalMapPoints = mpCurrentKeyFrame->GetMapPointMatches();
-    for (size_t i = 0; i < vpLocalMapPoints.size(); i++)
+    // Step 5: 刷新当前帧所有地图点的属性并更新共视连接
+    vpMapPointMatches = mpCurrentKeyFrame->GetMapPointMatches();
+    for (size_t i = 0; i < vpMapPointMatches.size(); i++)
     {
-        MapPoint *pMP = vpLocalMapPoints[i];
+        MapPoint *pMP = vpMapPointMatches[i];
         if (pMP)
         {
             if (pMP->isBad())
@@ -608,76 +641,91 @@ void LocalMapping::SearchInNeighbors()
         }
     }
 
-    // 2. 更新 Covisibility Graph 拓扑关系
     mpCurrentKeyFrame->UpdateConnections();
-    for (size_t i = 0; i < vpTargetKFs.size(); i++)
+    for (KeyFrame *pKF : vpTargetKFs)
     {
-        if (vpTargetKFs[i] && !vpTargetKFs[i]->mbBad)
-            vpTargetKFs[i]->UpdateConnections();
+        if (pKF && !pKF->mbBad)
+            pKF->UpdateConnections();
     }
 }
 
+/**
+ * @brief 检测当前关键帧在共视图中的关键帧，根据地图点在共视图中的冗余程度剔除该共视关键帧
+ * 冗余关键帧的判定：90%以上的地图点能被其他关键帧（至少3个）在相同或更优尺度下观测到
+ */
 void LocalMapping::KeyFrameCulling()
 {
-    // 1. 获取当前关键帧所有的共视关键帧
+    // Step 1: 获取当前关键帧所有的共视关键帧
     std::vector<KeyFrame *> vpLocalKeyFrames = mpCurrentKeyFrame->GetConnectedKeyFrames();
 
-    for (std::vector<KeyFrame *>::iterator vit = vpLocalKeyFrames.begin(), vend = vpLocalKeyFrames.end(); vit != vend; vit++)
+    // 对所有的共视关键帧进行遍历
+    for (std::vector<KeyFrame *>::iterator vit = vpLocalKeyFrames.begin(), vend = vpLocalKeyFrames.end(); vit != vend; ++vit)
     {
         KeyFrame *pKF = *vit;
-        // 保护第一帧不被剔除
-        if (pKF->mnId == 0)
+
+        // 保护初始关键帧不被剔除，跳过坏帧
+        if (!pKF || pKF->mnId == 0 || pKF->mbBad)
             continue;
 
+        // Step 2: 提取该共视关键帧关联的所有地图点
         const std::vector<MapPoint *> vpMapPoints = pKF->GetMapPointMatches();
 
-        // 设定冗余判定的观测次数门槛（双目标准：近点 3 次，远点由于深度不确定性不计入或要求更高）
-        int nRedundantObservations = 0;
-        int nTotalObservations = 0;
+        const int thObs = 3;            // 冗余观测次数门槛
+        int nRedundantObservations = 0; // 记录冗余地图点数量
+        int nMPs = 0;                   // 记录该帧有效近处地图点总数
 
-        // 2. 遍历该关键帧下的所有特征地图点
+        // Step 3: 遍历该关键帧下的所有地图点
         for (size_t i = 0; i < vpMapPoints.size(); i++)
         {
             MapPoint *pMP = vpMapPoints[i];
             if (pMP && !pMP->isBad())
             {
-                // 双目专属逻辑：只考虑深度有效的近点来进行冗余评估（远点不作为主冗余依据）
-                if (pKF->mvDepth[i] > 0.0f && pKF->mvDepth[i] > pKF->mThDepth)
+                // 双目专属逻辑：仅考虑深度有效的近点来进行冗余评估（远点不作为主冗余依据）
+                if (pKF->mvDepth[i] > pKF->mThDepth || pKF->mvDepth[i] <= 0.0f)
                     continue;
 
-                nTotalObservations++;
+                nMPs++;
 
-                // 该地图点在当前帧对应的金字塔层级
-                const int scaleLevel = pKF->mvKeysUn[i].octave;
+                // 地图点的观测关键帧数必须大于 3 才有可能冗余
                 const std::map<KeyFrame *, size_t> observations = pMP->GetObservations();
-
-                int nObs = 0;
-                for (std::map<KeyFrame *, size_t>::const_iterator mit = observations.begin(), mend = observations.end(); mit != mend; mit++)
+                if (static_cast<int>(observations.size()) > thObs)
                 {
-                    KeyFrame *pKFi = mit->first;
-                    if (pKFi == pKF || pKFi->mbBad)
-                        continue;
+                    const int &scaleLevel = pKF->mvKeysUn[i].octave;
 
-                    const int scaleLeveli = pKFi->mvKeysUn[mit->second].octave;
-
-                    // 尺度准则：只有其它关键帧的观测分辨率优于或等同于当前帧时（即层级 scaleLeveli <= scaleLevel + 1），才算作有效冗余观测
-                    if (scaleLeveli <= scaleLevel + 1)
+                    int nObs = 0;
+                    // 遍历观测到该地图点的所有关键帧
+                    for (auto mit = observations.begin(), mend = observations.end(); mit != mend; ++mit)
                     {
-                        nObs++;
-                        if (nObs >= 3)
-                            break;
-                    }
-                }
+                        KeyFrame *pKFi = mit->first;
+                        if (pKFi == pKF || pKFi->mbBad)
+                            continue;
 
-                if (nObs >= 3)
-                {
-                    nRedundantObservations++;
+                        const size_t idx_i = mit->second;
+                        if (idx_i >= pKFi->mvKeysUn.size())
+                            continue;
+
+                        const int &scaleLeveli = pKFi->mvKeysUn[idx_i].octave;
+
+                        // 尺度约束：只有其它关键帧的观测分辨率优于或等同于当前帧时（即 scaleLeveli <= scaleLevel + 1），才算作有效冗余观测
+                        if (scaleLeveli <= scaleLevel + 1)
+                        {
+                            nObs++;
+                            if (nObs >= thObs)
+                                break;
+                        }
+                    }
+
+                    // 该地图点在相同/更优尺度下被至少 3 个其它关键帧观测到
+                    if (nObs >= thObs)
+                    {
+                        nRedundantObservations++;
+                    }
                 }
             }
         }
 
-        // 3. 官方冗余判定：有效观测点数充足且冗余率达到 90% 时标记剔除
-        if (nTotalObservations > 20 && (float)nRedundantObservations / (float)nTotalObservations > 0.90f)
+        // Step 4: 90% 以上的有效近点为冗余观测点时，删除该关键帧
+        if (nMPs > 0 && (float)nRedundantObservations > 0.90f * (float)nMPs)
         {
             pKF->SetBadFlag();
         }

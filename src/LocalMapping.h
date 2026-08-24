@@ -11,7 +11,7 @@ class Map;
 class KeyFrame;
 class MapPoint;
 class Tracker;
-
+class LoopClosing;
 class LocalMapping
 {
 public:

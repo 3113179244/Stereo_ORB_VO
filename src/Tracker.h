@@ -18,6 +18,7 @@ class MotionOnlyBA;
 class LocalMapping;
 class KeyFrameDatabase;
 class LoopClosing;
+class Frame;
 class Tracker
 {
 public:

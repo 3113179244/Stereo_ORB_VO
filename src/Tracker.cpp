@@ -13,6 +13,7 @@
 #include "LocalMapping.h"
 #include "KeyFrameDatabase.h"
 #include "Viewer.h"
+#include "Frame.h"
 Tracker::Tracker(System *pSys, ORBVocabulary *pVoc, KeyFrameDatabase *pKFDB, std::shared_ptr<Map> pMap, System::eSensor sensor)
     : mpSystem(pSys), mpORBVocabulary(pVoc), mpKeyFrameDB(pKFDB), mpMap(pMap), mState(NO_IMAGES_YET), mVelocity(Eigen::Matrix4f::Identity()), mpReferenceKF(nullptr), mpLocalMapper(nullptr)
 {
@@ -255,9 +256,7 @@ bool Tracker::TrackWithMotionModel()
     // 清理当前帧地图点
     std::fill(mCurrentFrame.mvpMapPoints.begin(), mCurrentFrame.mvpMapPoints.end(), nullptr);
 
-    // =========================================================================
     // 第一阶段：精细搜索 (Base Radius th = 7.0f)
-    // =========================================================================
     int nmatches = matcher.SearchByProjection(mCurrentFrame, mLastFrame, 7.0f, false);
 
     // 若第一次匹配点过少，直接放宽基础半径重试
@@ -273,9 +272,7 @@ bool Tracker::TrackWithMotionModel()
     // 2. 第一次仅位姿优化 (Motion-only BA)
     int num_inliers = MotionOnlyBA::Optimize(&mCurrentFrame);
 
-    // =========================================================================
     // 第二阶段：分级回退重试 (Fallback Retry for Large Rotations / Turns)
-    // =========================================================================
     if (num_inliers < 40)
     {
         // 剔除第一轮中被判定为外点 (outlier) 的匹配
@@ -511,33 +508,40 @@ bool Tracker::TrackLocalMap()
 
 bool Tracker::NeedNewKeyFrame()
 {
-    if (mpLocalMapper)
-        mpLocalMapper->SetNotStop();
-
-    if (mpLocalMapper && mpLocalMapper->isStopped())
+    // 1. 如果 LocalMapping 线程被停止（例如闭环时锁定），禁止插入关键帧
+    if (mpLocalMapper && (mpLocalMapper->isStopped() || mpLocalMapper->GetStopRequired()))
         return false;
 
-    if (mnMatchesInliers < 15)
-        return false;
+    const int nKFs = mpMap ? mpMap->GetKeyFramesInMap() : 0;
+
+    // 2. 距离上一次重定位太近且关键帧已有一定积累时，不插入关键帧
+    // （若工程中暂无重定位帧记录，此项默认通过）
+    const int mMaxFrames = static_cast<int>(Config::g_dFps > 0.0 ? Config::g_dFps : 20.0);
+    const int mMinFrames = 0;
+
+    // 3. 统计参考关键帧跟踪到的稳定地图点数量 (nRefMatches)
+    int nMinObs = 3;
+    if (nKFs <= 2)
+        nMinObs = 2;
 
     int nRefMatches = 0;
-    if (mpReferenceKF)
+    if (mpReferenceKF && !mpReferenceKF->mbBad)
     {
-        const std::vector<MapPoint *> vpRefMPs = mpReferenceKF->GetMapPointMatches();
-        for (size_t i = 0; i < vpRefMPs.size(); i++)
-        {
-            if (vpRefMPs[i] && !vpRefMPs[i]->isBad())
-                nRefMatches++;
-        }
+        nRefMatches = mpReferenceKF->TrackedMapPoints(nMinObs);
     }
-    if (nRefMatches == 0)
-        nRefMatches = 1;
+    if (nRefMatches <= 0)
+        nRefMatches = 1; // 避免除零
 
-    // 双目近点统计
-    int nNonTrackedClose = 0;
-    int nTrackedClose = 0;
+    // 4. 查询 LocalMapping 是否处于空闲状态
+    bool bLocalMappingIdle = mpLocalMapper ? (mpLocalMapper->KeyframesInQueue() == 0) : true;
+
+    // 5. 双目专属逻辑：统计近点（Close Points）跟踪状况
+    int nNonTrackedClose = 0; // 当前帧中存在有效深度但尚未绑定地图点的近点
+    int nTrackedClose = 0;    // 当前帧中已成功跟踪并内点匹配的近点
+
     for (int i = 0; i < mCurrentFrame.N; i++)
     {
+        // 深度大于0且小于远近点阈值视为近点
         if (mCurrentFrame.mvDepth[i] > 0.0f && mCurrentFrame.mvDepth[i] < mCurrentFrame.mThDepth)
         {
             if (mCurrentFrame.mvpMapPoints[i] && !mCurrentFrame.mvbOutlier[i])
@@ -547,26 +551,50 @@ bool Tracker::NeedNewKeyFrame()
         }
     }
 
-    // 双目近点条件：只要视野中出现了新的近点（> 70个），或者已跟踪近点稀疏，就准备插帧
+    // 双目特有决策：已跟踪近点稀疏(<100)且未跟踪近点充足(>70)，必须立即建关键帧补充地图点
     bool bNeedToInsertClose = (nTrackedClose < 100) && (nNonTrackedClose > 70);
+
+    // 6. 决策阈值设置
+    float thRefRatio = 0.75f;
+    if (nKFs < 2)
+        thRefRatio = 0.4f;
 
     const int nFramesPassed = mCurrentFrame.mnId - mnLastKeyFrameId;
 
-    // 双目模式固定比例为 0.75f，不要在初期设为 0.4f
-    const float thRefRatio = 0.75f;
+    // 条件 1a: 距离上一关键帧已超过最大帧数 (如 1 秒未插帧)
+    const bool c1a = nFramesPassed >= mMaxFrames;
 
-    // 关键条件判断
-    const bool c1a = nFramesPassed >= 20;
-    const bool c1b = (nFramesPassed >= 3) && (mpLocalMapper && mpLocalMapper->KeyframesInQueue() == 0);
+    // 条件 1b: 经过了最小间隔帧数且 LocalMapping 空闲
+    const bool c1b = (nFramesPassed >= mMinFrames && bLocalMappingIdle);
+
+    // 条件 1c: 跟踪显著变弱 (内点少于参考帧的 25%) 或 满足双目急需近点条件
     const bool c1c = (mnMatchesInliers < nRefMatches * 0.25f) || bNeedToInsertClose;
-    const bool c2  = ((mnMatchesInliers < nRefMatches * thRefRatio) || bNeedToInsertClose) && (mnMatchesInliers >= 15);
 
+    // 条件 2: 匹配点相比参考帧明显减少(或需要近点)，且当前内点数满足最低跟踪要求 (>15)
+    const bool c2 = ((mnMatchesInliers < nRefMatches * thRefRatio) || bNeedToInsertClose) && (mnMatchesInliers > 15);
+
+    // 7. 综合决策与 LocalMapping 队列控制
     if ((c1a || c1b || c1c) && c2)
     {
-        if (mpLocalMapper && mpLocalMapper->KeyframesInQueue() >= 3)
-            return false;
+        if (bLocalMappingIdle)
+        {
+            return true;
+        }
+        else
+        {
+            if (mpLocalMapper)
+            {
+                // 打断局部 BA 优化以尽快响应新关键帧
+                mpLocalMapper->RequestStopBA();
 
-        return true;
+                // 双目模式下限制后端缓冲队列长度，避免挤压过多关键帧导致内存暴涨和耗时堆积
+                if (mpLocalMapper->KeyframesInQueue() < 3)
+                    return true;
+                else
+                    return false;
+            }
+            return false;
+        }
     }
 
     return false;
@@ -574,56 +602,92 @@ bool Tracker::NeedNewKeyFrame()
 
 void Tracker::CreateNewKeyFrame()
 {
-    // 创建新关键帧
-    KeyFrame *pKF = new KeyFrame(mCurrentFrame, mpMap.get());
+    // 如果局部建图器处于停止状态且无法阻止其停止，则不插入
+    if (mpLocalMapper && !mpLocalMapper->SetNotStop())
+        return;
 
-    // 遍历当前帧特征点：为新增的未跟踪点创建 MapPoint，为已跟踪点追加 Observation
+    // Step 1: 创建新关键帧并与当前帧绑定
+    KeyFrame *pKF = new KeyFrame(mCurrentFrame, mpMap.get());
+    mpReferenceKF = pKF;
+
+    // Step 2: 双目/RGB-D 专属建点逻辑（按深度排序，保底 100 个近点）
+    std::vector<std::pair<float, int>> vDepthIdx;
+    vDepthIdx.reserve(mCurrentFrame.N);
     for (int i = 0; i < mCurrentFrame.N; i++)
     {
-        MapPoint *pMP = mCurrentFrame.mvpMapPoints[i];
-
-        if (!pMP)
+        float z = mCurrentFrame.mvDepth[i];
+        if (z > 0.0f)
         {
-            // 筛选新增点：深度在有效范围 [0, mThDepth] 内
-            float z = mCurrentFrame.mvDepth[i];
-            if (z > 0 && z < mCurrentFrame.mThDepth)
+            vDepthIdx.push_back(std::make_pair(z, i));
+        }
+    }
+
+    if (!vDepthIdx.empty())
+    {
+        // 深度从小到大排序，优先处理近点
+        std::sort(vDepthIdx.begin(), vDepthIdx.end());
+
+        int nPoints = 0;
+        for (size_t j = 0; j < vDepthIdx.size(); j++)
+        {
+            int i = vDepthIdx[j].second;
+
+            bool bCreateNew = false;
+            MapPoint *pMP = mCurrentFrame.mvpMapPoints[i];
+
+            if (!pMP)
             {
-                Eigen::Vector3f p3D = mCurrentFrame.UnprojectStereo(i);
-                MapPoint *pNewMP = new MapPoint(p3D, pKF, mpMap.get());
+                bCreateNew = true;
+            }
+            else if (pMP->GetObservations().size() < 1)
+            {
+                // 地图点已无有效观测，重置并重新创建
+                bCreateNew = true;
+                mCurrentFrame.mvpMapPoints[i] = nullptr;
+            }
+
+            if (bCreateNew)
+            {
+                // 反投影生成世界坐标系下的 3D 点
+                Eigen::Vector3f x3D = mCurrentFrame.UnprojectStereo(i);
+                MapPoint *pNewMP = new MapPoint(x3D, pKF, mpMap.get());
 
                 pNewMP->AddObservation(pKF, i);
                 pKF->AddMapPoint(pNewMP, i);
-
                 pNewMP->ComputeDistinctiveDescriptor();
                 pNewMP->UpdateNormalAndDepth();
 
                 mpMap->AddMapPoint(pNewMP);
                 mCurrentFrame.mvpMapPoints[i] = pNewMP;
+                nPoints++;
             }
-        }
-        else if (!mCurrentFrame.mvbOutlier[i])
-        {
-            // 如果点已被跟踪，只需更新双向引用关系
-            pMP->AddObservation(pKF, i);
-            pKF->AddMapPoint(pMP, i);
+            else
+            {
+                // 若该点已被成功跟踪且不是外点，只需追加本关键帧的观测
+                if (!mCurrentFrame.mvbOutlier[i])
+                {
+                    pMP->AddObservation(pKF, i);
+                    pKF->AddMapPoint(pMP, i);
+                }
+                nPoints++;
+            }
+
+            // 停止条件：深度超过阈值 且 已处理近点数达到 100 个以上
+            if (vDepthIdx[j].first > mCurrentFrame.mThDepth && nPoints > 100)
+                break;
         }
     }
 
+    // Step 3: 将关键帧送入各个后端处理模块
     if (mpKeyFrameDB)
-    {
         mpKeyFrameDB->add(pKF);
-    }
 
     if (mpLocalMapper)
     {
         mpLocalMapper->InsertKeyFrame(pKF);
+        mpLocalMapper->Release(); // 允许 LocalMapping 恢复正常状态
     }
-    
-    if (mpLoopCloser)
-    {
-        mpLoopCloser->InsertKeyFrame(pKF);
-    }
-    mpReferenceKF = pKF;
+
     mnLastKeyFrameId = mCurrentFrame.mnId;
 }
 
