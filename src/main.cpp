@@ -10,6 +10,7 @@
 #include "System.h"
 #include "Config.h"
 #include "Viewer.h"
+#include "Map.h"
 int main(int argc, char **argv)
 {
     // 设置默认路径
@@ -17,7 +18,6 @@ int main(int argc, char **argv)
     std::string strConfigFile = "/home/wzj/Stereo_ORB_VO/config/KITTI04-12.yaml";
     std::string strSequenceDir = "/home/wzj/KITTI/data_odometry_gray/dataset/sequences/07";
 
-    // 按照 ./Stereo_ORB_VO <VocFile> <ConfigFile> <SequenceDir> 解析命令行参数
     if (argc >= 2)
     {
         strVocFile = argv[1];
@@ -170,6 +170,15 @@ int main(int argc, char **argv)
     cv::utils::fs::createDirectories(strTrajDir); 
     std::string strTrajFile = strTrajDir + "/CameraTrajectory.txt";
     SLAM.SaveTrajectoryKITTI(strTrajFile);
+    if (SLAM.GetMap())
+    {
+        unsigned long nKFs = SLAM.GetMap()->GetKeyFramesInMap();
+        unsigned long nMPs = SLAM.GetMap()->GetMapPointsInMap();
+        std::cout << "\n------- 系统运行统计 -------" << std::endl;
+        std::cout << "关键帧数量 (KeyFrames): " << nKFs << std::endl;
+        std::cout << "地图点数量 (MapPoints): " << nMPs << std::endl;
+        std::cout << "----------------------------\n" << std::endl;
+    }
     if (SLAM.GetViewer())
     {
         while (!SLAM.GetViewer()->isFinished())
