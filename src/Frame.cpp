@@ -44,6 +44,7 @@ Frame::Frame(const cv::Mat &imLeft, const cv::Mat &imRight, const double &timeSt
     mImGrayLeft = imLeft.clone();
     mImGrayRight = imRight.clone();
     mb = mbf / mK.at<float>(0, 0);
+    mThDepth = thDepth * mb;
     // 双目匹配，通过左右目特征点匹配计算视差，进而获得深度信息
     ComputeStereoMatches();
 
