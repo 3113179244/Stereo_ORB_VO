@@ -120,44 +120,48 @@ struct LocalRepoErrorStereo
     double sqrtInvSigma2_;
 };
 
-// 6自由度 SE3 位姿图残差: 约束帧 i 到 帧 j 的相对测量 T_ij = T_iw * (T_jw)^-1
+/**
+ * @brief 6自由度 SE3 位姿图残差: 约束帧 i 到 帧 j 的相对测量 T_ij = T_iw * (T_jw)^-1
+ */
 struct PoseGraphEdgeError {
     PoseGraphEdgeError(const Eigen::Matrix4f& T_ij_meas) {
         Eigen::Matrix3d R_ij = T_ij_meas.block<3,3>(0,0).cast<double>();
-        Eigen::Vector3d t_ij = T_ij_meas.block<3,1>(0,3).cast<double>();
-        r_ij_ = Eigen::AngleAxisd(R_ij).angle() * Eigen::AngleAxisd(R_ij).axis();
-        t_ij_ = t_ij;
+        t_ij_ = T_ij_meas.block<3,1>(0,3).cast<double>();
+        Eigen::AngleAxisd aa(R_ij);
+        r_ij_ = aa.angle() * aa.axis();
     }
 
     template <typename T>
     bool operator()(const T* const pose_i, const T* const pose_j, T* residuals) const {
-        // pose: [rx, ry, rz, tx, ty, tz]
+        // pose: [rx, ry, rz, tx, ty, tz] (代表世界到相机的旋转与平移: R_cw, t_cw)
         T p_i[3] = {pose_i[0], pose_i[1], pose_i[2]};
         T t_i[3] = {pose_i[3], pose_i[4], pose_i[5]};
         T p_j[3] = {pose_j[0], pose_j[1], pose_j[2]};
         T t_j[3] = {pose_j[3], pose_j[4], pose_j[5]};
 
-        // 1. 相对旋转 R_pred = R_i * R_j^T
+        // 1. 计算 R_i 与 R_j 的四元数
         T q_i[4], q_j[4];
         ceres::AngleAxisToQuaternion(p_i, q_i);
         ceres::AngleAxisToQuaternion(p_j, q_j);
         
-        // q_j_inv = [-q_j[1], -q_j[2], -q_j[3], q_j[0]]
+        // q_j_inv = [q_j[0], -q_j[1], -q_j[2], -q_j[3]]
         T q_j_inv[4] = {q_j[0], -q_j[1], -q_j[2], -q_j[3]};
+
+        // 预测的相对旋转: R_ij_pred = R_i * R_j^T
         T q_pred[4];
         ceres::QuaternionProduct(q_i, q_j_inv, q_pred);
 
-        // 2. 相对平移 t_pred = t_i - R_i * R_j^T * t_j
+        // 预测的相对平移: t_ij_pred = t_i - R_i * R_j^T * t_j
         T t_j_rotated[3];
         ceres::QuaternionRotatePoint(q_pred, t_j, t_j_rotated);
         T t_pred[3] = {t_i[0] - t_j_rotated[0], t_i[1] - t_j_rotated[1], t_i[2] - t_j_rotated[2]};
 
-        // 平移误差
+        // 平移残差
         residuals[0] = t_pred[0] - T(t_ij_[0]);
         residuals[1] = t_pred[1] - T(t_ij_[1]);
         residuals[2] = t_pred[2] - T(t_ij_[2]);
 
-        // 旋转误差
+        // 旋转残差 (Angle-Axis 差值)
         T q_meas[4];
         T r_meas[3] = {T(r_ij_[0]), T(r_ij_[1]), T(r_ij_[2])};
         ceres::AngleAxisToQuaternion(r_meas, q_meas);
@@ -229,9 +233,7 @@ void Optimizer::LocalBundleAdjustment(KeyFrame *pCurKF, bool *pbStopFlag, std::s
     if (!pCurKF || !pMap || pCurKF->mbBad)
         return;
 
-    // ------------------------------------------------------------------
     // Step 1~3: 收集局部关键帧、固定关键帧与局部地图点
-    // ------------------------------------------------------------------
     std::vector<KeyFrame *> vpLocalKFs;
     vpLocalKFs.push_back(pCurKF);
     {
@@ -293,9 +295,7 @@ void Optimizer::LocalBundleAdjustment(KeyFrame *pCurKF, bool *pbStopFlag, std::s
                 pAnchorKF = vpLocalKFs[i];
         }
     }
-    // ------------------------------------------------------------------
     // Step 4: 构建 Ceres 变量内存
-    // ------------------------------------------------------------------
     std::map<KeyFrame *, double *> mapKFPose;
     std::vector<double *> vPoseArrays;
     for (int i = 0; i < nLocalKFs; ++i)
@@ -519,9 +519,7 @@ void Optimizer::LocalBundleAdjustment(KeyFrame *pCurKF, bool *pbStopFlag, std::s
             }
         }
 
-        // ==============================================================
         // 第二阶段：纯内点精优化（迭代 10 次）
-        // ==============================================================
         options.max_num_iterations = 10;
         ceres::Problem problem2;
 
@@ -619,9 +617,7 @@ void Optimizer::LocalBundleAdjustment(KeyFrame *pCurKF, bool *pbStopFlag, std::s
         ceres::Solve(options, &problem2, &summary2);
     }
 
-    // ------------------------------------------------------------------
     // Step 5: 无论是否被打断，均将当前已优化的参数回写
-    // ------------------------------------------------------------------
     if (pbStopFlag && *pbStopFlag)
     {
         CleanupMemory();
@@ -643,9 +639,7 @@ void Optimizer::LocalBundleAdjustment(KeyFrame *pCurKF, bool *pbStopFlag, std::s
         pMP->SetWorldPos(Eigen::Vector3f((float)p[0], (float)p[1], (float)p[2]));
     }
 
-    // ------------------------------------------------------------------
     // Step 6: 释放内存
-    // ------------------------------------------------------------------
     CleanupMemory();
 }
 
@@ -656,9 +650,8 @@ void Optimizer::OptimizeEssentialGraph(Map* pMap, KeyFrame* pLoopKF, KeyFrame* p
     if (N < 2) return;
 
     ceres::Problem problem;
-    ceres::LossFunction* loss_function = new ceres::HuberLoss(1.0);
+    ceres::LossFunction* loss_function = new ceres::HuberLoss(0.5); // 调小核函数阈值，降低奇异外点拉扯
 
-    // 1. 记录优化前所有关键帧的平滑位姿（生成树边必须基于该位姿计算相对变换）
     std::map<KeyFrame*, Eigen::Matrix4f> mapOldPoses;
     std::map<KeyFrame*, double*> mapPoses;
 
@@ -680,19 +673,19 @@ void Optimizer::OptimizeEssentialGraph(Map* pMap, KeyFrame* pLoopKF, KeyFrame* p
         mapPoses[pKF] = pose;
         problem.AddParameterBlock(pose, 6);
 
-        // 固定闭环匹配关键帧作为绝对不动锚点
-        if (pKF == pLoopKF || pKF->mnId == 0) {
+        // 固定初始第 0 帧与闭环目标帧，作为绝对基准
+        if (pKF->mnId == 0 || pKF == pLoopKF) {
             problem.SetParameterBlockConstant(pose);
         }
     }
 
-    // 2. 添加生成树（Spanning Tree）边：使用优化前两帧之间连续记录的相对里程计
+    // 1. 生成树（Spanning Tree）相对边约束
     for (KeyFrame* pKF : vpKFs) {
         if (!pKF || pKF->mbBad || pKF->mnId == 0) continue;
         KeyFrame* pParent = pKF->GetParent();
         if (!pParent || !mapPoses.count(pParent) || !mapPoses.count(pKF)) continue;
 
-        // 真实未被破坏的相对变换: T_child_parent = T_child_w * (T_parent_w)^-1
+        // T_child_parent = T_child_w * (T_parent_w)^-1
         Eigen::Matrix4f T_child_parent = mapOldPoses[pKF] * mapOldPoses[pParent].inverse();
         
         problem.AddResidualBlock(PoseGraphEdgeError::Create(T_child_parent),
@@ -700,26 +693,26 @@ void Optimizer::OptimizeEssentialGraph(Map* pMap, KeyFrame* pLoopKF, KeyFrame* p
                                  mapPoses[pKF], mapPoses[pParent]);
     }
 
-    // 3. 添加回环闭合边 (Loop Edge): 由 PnP 解算得到的 Tcw_loop 与 pLoopKF 的相对位姿强约束
+    // 2. 添加闭环强约束边
     if (mapPoses.count(pCurKF) && mapPoses.count(pLoopKF)) {
-        // 计算当前帧与闭环帧之间精准的相对测量值: T_cur_loop = T_cur_loop_pnp * (T_loop_w)^-1
+        // T_cur_loop = Tcw_loop * (T_loop_w)^-1
         Eigen::Matrix4f T_cur_loop = Tcw_loop * mapOldPoses[pLoopKF].inverse();
         
         problem.AddResidualBlock(PoseGraphEdgeError::Create(T_cur_loop),
-                                 nullptr, // 闭环边作为强拉直约束，不加核函数
+                                 nullptr, // 闭环边作为强约束
                                  mapPoses[pCurKF], mapPoses[pLoopKF]);
     }
 
-    // 4. 配置并求解
+    // 3. 求解位姿图
     ceres::Solver::Options options;
     options.linear_solver_type = ceres::SPARSE_NORMAL_CHOLESKY;
-    options.max_num_iterations = 30;
+    options.max_num_iterations = 50;
     options.minimizer_progress_to_stdout = false;
 
     ceres::Solver::Summary summary;
     ceres::Solve(options, &problem, &summary);
 
-    // 5. 回写优化后的所有关键帧位姿
+    // 4. 回写优化后的位姿
     std::map<KeyFrame*, Eigen::Matrix4f> mapNewPoses;
     for (auto& kv : mapPoses) {
         KeyFrame* pKF = kv.first;
@@ -741,7 +734,7 @@ void Optimizer::OptimizeEssentialGraph(Map* pMap, KeyFrame* pLoopKF, KeyFrame* p
         delete[] pose;
     }
 
-    // 6. 根据各关键帧优化前后的位姿差，同步更新所有 3D 地图点
+    // 5. 地图点纠正：根据参考关键帧优化前后的位姿差更新 3D 空间坐标
     std::vector<MapPoint*> vpAllMPs = pMap->GetAllMapPoints();
     for (MapPoint* pMP : vpAllMPs) {
         if (!pMP || pMP->isBad()) continue;
@@ -754,13 +747,9 @@ void Optimizer::OptimizeEssentialGraph(Map* pMap, KeyFrame* pLoopKF, KeyFrame* p
         Eigen::Vector3f Pw_old = pMP->GetWorldPos();
         Eigen::Vector4f Pw_homo(Pw_old.x(), Pw_old.y(), Pw_old.z(), 1.0f);
 
+        // 将点变换到参考帧旧相机坐标系下，再通过新位姿反投影回世界坐标系
         Eigen::Vector4f Pw_new = T_new_wc * (T_old_cw * Pw_homo);
         pMP->SetWorldPos(Pw_new.head<3>());
         pMP->UpdateNormalAndDepth();
     }
-}
-
-void Optimizer::GlobalBundleAdjustment(std::shared_ptr<Map> pMap)
-{
-    (void)pMap;
 }
