@@ -7,15 +7,15 @@
 #include <Eigen/Core>
 #include <Eigen/Geometry>
 #include <vector>
+#include <mutex>
 
 /**
- * @brief 单目重投影误差残差块（2D-2D 残差，约束左目 u, v）
- * 适用于：单目点 或 双目远点 (Z >= mThDepth)
+ * @brief 单目重投影误差残差块（2D 残差，约束左目 u, v）
  */
-struct ReprojectionErrorMonocular
+struct ReprojectionErrorMono
 {
-    ReprojectionErrorMonocular(const Eigen::Vector2d &observed, const Eigen::Vector3d &point_3d,
-                               const Eigen::Matrix3d &K, double inv_sigma)
+    ReprojectionErrorMono(const Eigen::Vector2d &observed, const Eigen::Vector3d &point_3d,
+                          const Eigen::Matrix3d &K, double inv_sigma)
         : observed_(observed), point_3d_(point_3d), K_(K), inv_sigma_(inv_sigma) {}
 
     template <typename T>
@@ -44,19 +44,18 @@ struct ReprojectionErrorMonocular
     static ceres::CostFunction *Create(const Eigen::Vector2d &observed, const Eigen::Vector3d &point_3d,
                                        const Eigen::Matrix3d &K, double inv_sigma)
     {
-        return new ceres::AutoDiffCostFunction<ReprojectionErrorMonocular, 2, 6>(
-            new ReprojectionErrorMonocular(observed, point_3d, K, inv_sigma));
+        return new ceres::AutoDiffCostFunction<ReprojectionErrorMono, 2, 6>(
+            new ReprojectionErrorMono(observed, point_3d, K, inv_sigma));
     }
 
-    Eigen::Vector2d observed_;
+    Eigen::Vector2d observed_; // [u, v]
     Eigen::Vector3d point_3d_;
     Eigen::Matrix3d K_;
     double inv_sigma_;
 };
 
 /**
- * @brief 双目重投影误差残差块（3D-2D 残差，约束左目 u, v 以及右目 uR）
- * 适用于：双目近点 (0 < Z < mThDepth 且 u_r >= 0)
+ * @brief 双目重投影误差残差块（3D 残差，约束左目 u, v 以及右目 uR）
  */
 struct ReprojectionErrorStereo
 {
@@ -111,7 +110,15 @@ int MotionOnlyBA::Optimize(Frame *pFrame)
     const int N = pFrame->mvpMapPoints.size();
     pFrame->mvbOutlier.assign(N, false);
 
-    if (N < 5)
+    // 对应 ORB-SLAM2: 检查初始有效匹配点数
+    int nInitialCorrespondences = 0;
+    for (int i = 0; i < N; ++i)
+    {
+        if (pFrame->mvpMapPoints[i])
+            nInitialCorrespondences++;
+    }
+
+    if (nInitialCorrespondences < 3)
         return 0;
 
     Eigen::Matrix3d K_eigen;
@@ -131,13 +138,12 @@ int MotionOnlyBA::Optimize(Frame *pFrame)
     };
 
     const int its[4] = {10, 10, 10, 10};
-    const double chi2_mono = 5.991;   // 2自由度 Chi-Square 阈值 (95% 置信度)
-    const double chi2_stereo = 7.815; // 3自由度 Chi-Square 阈值 (95% 置信度)
-    const double thDepth = static_cast<double>(pFrame->mThDepth);
+    const double chi2_mono = 5.991;    // 2自由度 Chi-Square 阈值
+    const double chi2_stereo = 7.815;  // 3自由度 Chi-Square 阈值
 
     int num_inliers = 0;
 
-    // 4 轮迭代结构 (与 ORB-SLAM2 g2o 逻辑严格对齐)
+    // 4 轮迭代优化
     for (int it = 0; it < 4; ++it)
     {
         ceres::Problem problem;
@@ -152,52 +158,57 @@ int MotionOnlyBA::Optimize(Frame *pFrame)
             cur_R = Eigen::AngleAxisd(cur_angle, cur_r.normalized()).toRotationMatrix();
         }
 
-        for (int i = 0; i < N; ++i)
+        // 修改点 3：添加 MapPoint 全局互斥锁，防止读取时被其他线程并发修改
         {
-            MapPoint *pMP = pFrame->mvpMapPoints[i];
-            if (!pMP || pMP->isBad())
-                continue;
+            std::unique_lock<std::mutex> lock(MapPoint::mGlobalMutex);
 
-            // 后两轮精优化阶段，排除被判为 Outlier 的点
-            if (pFrame->mvbOutlier[i])
-                continue;
-
-            Eigen::Vector3d P_w = pMP->GetWorldPos().cast<double>();
-            Eigen::Vector3d P_c = cur_R * P_w + cur_t;
-            double depth = P_c[2];
-
-            if (depth <= 0.0)
+            for (int i = 0; i < N; ++i)
             {
-                pFrame->mvbOutlier[i] = true;
-                continue;
+                MapPoint *pMP = pFrame->mvpMapPoints[i];
+                if (!pMP || pMP->isBad())
+                    continue;
+
+                // 排除当前被标记为 Outlier 的点（不参与本轮优化）
+                if (pFrame->mvbOutlier[i])
+                    continue;
+
+                Eigen::Vector3d P_w = pMP->GetWorldPos().cast<double>();
+                Eigen::Vector3d P_c = cur_R * P_w + cur_t;
+                double depth = P_c[2];
+
+                if (depth <= 0.0)
+                {
+                    pFrame->mvbOutlier[i] = true;
+                    continue;
+                }
+
+                const int level = pFrame->mvKeysUn[i].octave;
+                const double inv_sigma = 1.0 / std::sqrt(pFrame->mpORBextractorLeft->GetScaleSigmaSquares()[level]);
+                const float u_r = pFrame->mvuRight[i];
+
+                // 修改点 1：单目观测与双目观测自适应支持（兼容远点/右目未匹配点）
+                if (u_r < 0.0f)
+                {
+                    // 单目 2DoF 观测
+                    Eigen::Vector2d obs(pFrame->mvKeysUn[i].pt.x, pFrame->mvKeysUn[i].pt.y);
+                    ceres::CostFunction *cost_function = ReprojectionErrorMono::Create(obs, P_w, K_eigen, inv_sigma);
+                    ceres::LossFunction *loss_function = (it < 2) ? new ceres::HuberLoss(std::sqrt(chi2_mono)) : nullptr;
+                    problem.AddResidualBlock(cost_function, loss_function, camera_pose);
+                }
+                else
+                {
+                    // 双目 3DoF 观测
+                    Eigen::Vector3d obs(pFrame->mvKeysUn[i].pt.x, pFrame->mvKeysUn[i].pt.y, u_r);
+                    ceres::CostFunction *cost_function = ReprojectionErrorStereo::Create(obs, P_w, K_eigen, pFrame->mbf, inv_sigma);
+                    ceres::LossFunction *loss_function = (it < 2) ? new ceres::HuberLoss(std::sqrt(chi2_stereo)) : nullptr;
+                    problem.AddResidualBlock(cost_function, loss_function, camera_pose);
+                }
+                num_edges++;
             }
+        } // 离开临界区
 
-            const int level = pFrame->mvKeysUn[i].octave;
-            const double inv_sigma = 1.0 / std::sqrt(pFrame->mpORBextractorLeft->GetScaleSigmaSquares()[level]);
-            const float u_r = pFrame->mvuRight[i];
-
-            ceres::CostFunction *cost_function = nullptr;
-
-            if (u_r >= 0.0f && depth < thDepth)
-            {
-                // 双目近点 3DoF
-                Eigen::Vector3d obs(pFrame->mvKeysUn[i].pt.x, pFrame->mvKeysUn[i].pt.y, u_r);
-                cost_function = ReprojectionErrorStereo::Create(obs, P_w, K_eigen, pFrame->mbf, inv_sigma);
-            }
-            else
-            {
-                // 单目/远点 2DoF
-                Eigen::Vector2d obs(pFrame->mvKeysUn[i].pt.x, pFrame->mvKeysUn[i].pt.y);
-                cost_function = ReprojectionErrorMonocular::Create(obs, P_w, K_eigen, inv_sigma);
-            }
-
-            // 前2轮粗优化使用 Huber 核函数，后2轮精优化关闭核函数
-            ceres::LossFunction *loss_function = (it < 2) ? new ceres::HuberLoss(std::sqrt(chi2_mono)) : nullptr;
-            problem.AddResidualBlock(cost_function, loss_function, camera_pose);
-            num_edges++;
-        }
-
-        if (num_edges < 5)
+        // 边数过少时提前退出
+        if (num_edges < 10)
             break;
 
         ceres::Solver::Options options;
@@ -218,79 +229,71 @@ int MotionOnlyBA::Optimize(Frame *pFrame)
             opt_R = Eigen::AngleAxisd(angle, opt_r.normalized()).toRotationMatrix();
         }
 
-        // 卡方检验 (Chi-Square Test)
-
+        // 修改点 2：修复外点复活逻辑，每一轮优化后均对全部有效地图点进行卡方重判
         num_inliers = 0;
-        for (int i = 0; i < N; ++i)
         {
-            MapPoint *pMP = pFrame->mvpMapPoints[i];
-            if (!pMP || pMP->isBad())
-                continue;
+            std::unique_lock<std::mutex> lock(MapPoint::mGlobalMutex);
 
-            // 【核心对齐】：在前 2 轮之后 (it == 2 结束时)，或者在前两轮每次优化后，
-            // 都要对所有点（包含此前被标记为 Outlier 的点）重新检验，以召回在新位姿下满足误差条件的内点。
-            // 只有在最后一轮优化 (it == 3) 结束后才做最终定型。
-            if (it >= 2 && pFrame->mvbOutlier[i] && it != 2)
-                continue;
-
-            Eigen::Vector3d P_w = pMP->GetWorldPos().cast<double>();
-            Eigen::Vector3d P_c = opt_R * P_w + opt_t;
-            double depth = P_c[2];
-
-            if (depth <= 0.0)
+            for (int i = 0; i < N; ++i)
             {
-                pFrame->mvbOutlier[i] = true;
-                continue;
-            }
+                MapPoint *pMP = pFrame->mvpMapPoints[i];
+                if (!pMP || pMP->isBad())
+                    continue;
 
-            double inv_z = 1.0 / depth;
-            double u = K_eigen(0, 0) * P_c[0] * inv_z + K_eigen(0, 2);
-            double v = K_eigen(1, 1) * P_c[1] * inv_z + K_eigen(1, 2);
+                Eigen::Vector3d P_w = pMP->GetWorldPos().cast<double>();
+                Eigen::Vector3d P_c = opt_R * P_w + opt_t;
+                double depth = P_c[2];
 
-            const int level = pFrame->mvKeysUn[i].octave;
-            const double inv_sigma2 = 1.0 / pFrame->mpORBextractorLeft->GetScaleSigmaSquares()[level];
-
-            double du = u - pFrame->mvKeysUn[i].pt.x;
-            double dv = v - pFrame->mvKeysUn[i].pt.y;
-            const float u_r = pFrame->mvuRight[i];
-
-            if (u_r >= 0.0f && depth < thDepth)
-            {
-                // 双目近点
-                double u_r_proj = u - pFrame->mbf * inv_z;
-                double du_r = u_r_proj - u_r;
-                double chi2 = (du * du + dv * dv + du_r * du_r) * inv_sigma2;
-
-                if (chi2 > chi2_stereo)
+                if (depth <= 0.0)
                 {
                     pFrame->mvbOutlier[i] = true;
+                    continue;
+                }
+
+                double inv_z = 1.0 / depth;
+                double u = K_eigen(0, 0) * P_c[0] * inv_z + K_eigen(0, 2);
+                double v = K_eigen(1, 1) * P_c[1] * inv_z + K_eigen(1, 2);
+
+                const int level = pFrame->mvKeysUn[i].octave;
+                const double inv_sigma2 = 1.0 / pFrame->mpORBextractorLeft->GetScaleSigmaSquares()[level];
+                const float u_r = pFrame->mvuRight[i];
+
+                double du = u - pFrame->mvKeysUn[i].pt.x;
+                double dv = v - pFrame->mvKeysUn[i].pt.y;
+
+                if (u_r < 0.0f)
+                {
+                    // 单目卡方检验 (2DoF)
+                    double chi2 = (du * du + dv * dv) * inv_sigma2;
+                    if (chi2 > chi2_mono)
+                    {
+                        pFrame->mvbOutlier[i] = true;
+                    }
+                    else
+                    {
+                        pFrame->mvbOutlier[i] = false;
+                        num_inliers++;
+                    }
                 }
                 else
                 {
-                    pFrame->mvbOutlier[i] = false; // 重新拉回为内点
-                    num_inliers++;
+                    // 双目卡方检验 (3DoF)
+                    double u_r_proj = u - pFrame->mbf * inv_z;
+                    double du_r = u_r_proj - u_r;
+                    double chi2 = (du * du + dv * dv + du_r * du_r) * inv_sigma2;
+
+                    if (chi2 > chi2_stereo)
+                    {
+                        pFrame->mvbOutlier[i] = true;
+                    }
+                    else
+                    {
+                        pFrame->mvbOutlier[i] = false;
+                        num_inliers++;
+                    }
                 }
             }
-            else
-            {
-                // 单目/远点
-                double chi2 = (du * du + dv * dv) * inv_sigma2;
-
-                if (chi2 > chi2_mono)
-                {
-                    pFrame->mvbOutlier[i] = true;
-                }
-                else
-                {
-                    pFrame->mvbOutlier[i] = false; // 重新拉回为内点
-                    num_inliers++;
-                }
-            }
-        }
-
-        // 若前两轮粗优化结束后内点数过少，提前退出避免无意义精优化
-        if (it == 1 && num_inliers < 10)
-            break;
+        } // 离开临界区
     }
 
     // 回写优化位姿
