@@ -707,7 +707,7 @@ void LocalMapping::KeyFrameCulling()
                         const int &scaleLeveli = pKFi->mvKeysUn[idx_i].octave;
 
                         // 尺度约束：只有其它关键帧的观测分辨率优于或等同于当前帧时（即 scaleLeveli <= scaleLevel + 1），才算作有效冗余观测
-                        if (scaleLeveli <= scaleLevel)
+                        if (scaleLeveli <= scaleLevel+1)
                         {
                             nObs++;
                             if (nObs >= thObs)

@@ -58,7 +58,8 @@ private:
 
     // 局部地图点投影融合辅助函数
     void SearchAndFuse(const std::vector<KeyFrame*>& vpLoopConnectedKFs);
-
+    void RunGlobalBundleAdjustment(unsigned long nLoopKF);
+    bool isRunningGBA();
 private:
     Map* mpMap;
     KeyFrameDatabase* mpKeyFrameDB;
@@ -92,4 +93,11 @@ private:
     std::mutex mMutexStop;
     bool mbResetRequested;
     std::mutex mMutexReset;
+
+    // 全局 BA 线程与控制变量
+    std::thread* mpThreadGBA = nullptr;
+    bool mbRunningGBA = false;
+    bool mbStopGBA = false;
+    std::mutex mMutexGBA;
+    unsigned long mnFullBAIdx = 0;
 };

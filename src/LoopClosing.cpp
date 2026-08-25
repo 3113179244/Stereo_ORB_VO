@@ -27,6 +27,12 @@ LoopClosing::~LoopClosing()
         mpThread->join();
         delete mpThread;
     }
+    // 等待并释放 GBA 线程
+    if (mpThreadGBA)
+    {
+        mpThreadGBA->join();
+        delete mpThreadGBA;
+    }
 }
 
 void LoopClosing::InsertKeyFrame(KeyFrame *pKF)
@@ -349,64 +355,89 @@ void LoopClosing::CorrectLoop()
         }
     }
 
-    // 地图全局更新互斥锁（保护整个闭环校正与 GBA 过程）
-    std::unique_lock<std::mutex> lockMap(mpMap->mMutexMapUpdate);
-
-    // 2. 将 ComputeSE3 阶段得到的闭环匹配点直接替换到当前关键帧
-    for (size_t i = 0; i < mvpLoopMatchedPoints.size(); i++)
+    // 2. 如果上一次的全局 GBA 还在运行，发送中断请求并回收线程
+    if (isRunningGBA())
     {
-        MapPoint *pLoopMP = mvpLoopMatchedPoints[i];
-        if (pLoopMP && !pLoopMP->isBad())
         {
-            MapPoint *pCurMP = mpCurrentKF->GetMapPoint(i);
-            if (pCurMP && pCurMP != pLoopMP)
-            {
-                pCurMP->Replace(pLoopMP);
-            }
-            else if (!pCurMP)
-            {
-                mpCurrentKF->AddMapPoint(pLoopMP, i);
-                pLoopMP->AddObservation(mpCurrentKF, i);
-            }
+            std::unique_lock<std::mutex> lock(mMutexGBA);
+            mbStopGBA = true;
+        }
+
+        if (mpThreadGBA)
+        {
+            mpThreadGBA->join();
+            delete mpThreadGBA;
+            mpThreadGBA = nullptr;
         }
     }
 
-    // 3. 闭环侧地图点投影反向融合 (SearchAndFuse)
-    std::vector<KeyFrame *> vpLoopConnectedKFs = mpMatchedKF->GetBestCovisibilityKeyFrames(10);
-    vpLoopConnectedKFs.push_back(mpMatchedKF);
-    SearchAndFuse(vpLoopConnectedKFs);
-
-    // 4. 更新闭环两侧的共视连接关系（必须在位姿图优化前建立闭环共视图约束）
-    std::vector<KeyFrame *> vpCurrentConnectedKFs = mpCurrentKF->GetBestCovisibilityKeyFrames(15);
-    vpCurrentConnectedKFs.push_back(mpCurrentKF);
-
-    for (KeyFrame *pKFi : vpCurrentConnectedKFs)
-        if (pKFi && !pKFi->mbBad)
-            pKFi->UpdateConnections();
-
-    for (KeyFrame *pKFm : vpLoopConnectedKFs)
-        if (pKFm && !pKFm->mbBad)
-            pKFm->UpdateConnections();
-
-    // 5. 执行 Essential Graph 位姿图优化
-    Optimizer::OptimizeEssentialGraph(mpMap, mpMatchedKF, mpCurrentKF, mTcw_loop);
-
-    // 6. 重置追踪线程的速度模型，防止位姿突变导致追踪丢失
-    if (mpTracker)
+    // 地图全局更新互斥锁（仅保护闭环校正与位姿图优化阶段）
     {
-        mpTracker->ResetVelocity();
-        mpTracker->mCurrentFrame.SetPose(mpCurrentKF->GetPose());
-        mpTracker->mLastFrame.SetPose(mpCurrentKF->GetPose());
-    }
+        std::unique_lock<std::mutex> lockMap(mpMap->mMutexMapUpdate);
 
-    // 7. 执行全局 BA（保持持有 lockMap 或在恢复 LocalMapping 之前完成）
-    Optimizer::GlobalBundleAdjustment(mpMap);
+        // 3. 将闭环匹配点替换到当前关键帧
+        for (size_t i = 0; i < mvpLoopMatchedPoints.size(); i++)
+        {
+            MapPoint *pLoopMP = mvpLoopMatchedPoints[i];
+            if (pLoopMP && !pLoopMP->isBad())
+            {
+                MapPoint *pCurMP = mpCurrentKF->GetMapPoint(i);
+                if (pCurMP && pCurMP != pLoopMP)
+                {
+                    pCurMP->Replace(pLoopMP);
+                }
+                else if (!pCurMP)
+                {
+                    mpCurrentKF->AddMapPoint(pLoopMP, i);
+                    pLoopMP->AddObservation(mpCurrentKF, i);
+                }
+            }
+        }
 
-    // 8. 全流程完成后，再释放 LocalMapping 线程
+        // 4. 投影反向融合
+        std::vector<KeyFrame *> vpLoopConnectedKFs = mpMatchedKF->GetBestCovisibilityKeyFrames(10);
+        vpLoopConnectedKFs.push_back(mpMatchedKF);
+        SearchAndFuse(vpLoopConnectedKFs);
+
+        // 5. 更新共视关系
+        std::vector<KeyFrame *> vpCurrentConnectedKFs = mpCurrentKF->GetBestCovisibilityKeyFrames(15);
+        vpCurrentConnectedKFs.push_back(mpCurrentKF);
+
+        for (KeyFrame *pKFi : vpCurrentConnectedKFs)
+            if (pKFi && !pKFi->mbBad)
+                pKFi->UpdateConnections();
+
+        for (KeyFrame *pKFm : vpLoopConnectedKFs)
+            if (pKFm && !pKFm->mbBad)
+                pKFm->UpdateConnections();
+
+        // 6. 执行 Essential Graph 位姿图优化
+        Optimizer::OptimizeEssentialGraph(mpMap, mpMatchedKF, mpCurrentKF, mTcw_loop);
+
+        // 7. 重置 Tracker 速度模型
+        if (mpTracker)
+        {
+            mpTracker->ResetVelocity();
+            mpTracker->mCurrentFrame.SetPose(mpCurrentKF->GetPose());
+            mpTracker->mLastFrame.SetPose(mpCurrentKF->GetPose());
+        }
+    } // 离开 lockMap 作用域，释放地图锁
+
+    // 8. 恢复 LocalMapping 线程运行
     if (mpLocalMapper)
     {
         mpLocalMapper->Release();
     }
+
+    // 9. 开启独立新线程在后台运行 GlobalBundleAdjustment
+    mbStopGBA = false;
+    mbRunningGBA = true;
+    if (mpThreadGBA)
+    {
+        mpThreadGBA->join();
+        delete mpThreadGBA;
+    }
+    mpThreadGBA = new std::thread(&LoopClosing::RunGlobalBundleAdjustment, this, mpCurrentKF->mnId);
 }
 
 // 辅助函数: 闭环区域地图点投影融合
@@ -502,4 +533,32 @@ void LoopClosing::RequestReset()
 {
     std::unique_lock<std::mutex> lock(mMutexReset);
     mbResetRequested = true;
+}
+
+bool LoopClosing::isRunningGBA()
+{
+    std::unique_lock<std::mutex> lock(mMutexGBA);
+    return mbRunningGBA;
+}
+
+void LoopClosing::RunGlobalBundleAdjustment(unsigned long nLoopKF)
+{
+    std::cout << "\033[32m[GBA Thread] 开始在后台执行全局 BA (LoopKF ID: " << nLoopKF << ")...\033[0m" << std::endl;
+
+    // 调用支持中断的 GBA
+    Optimizer::GlobalBundleAdjustment(mpMap, 35, &mbStopGBA);
+
+    {
+        std::unique_lock<std::mutex> lock(mMutexGBA);
+        if (mbStopGBA)
+        {
+            std::cout << "\033[33m[GBA Thread] 全局 BA 响应中断请求已提前终止。\033[0m" << std::endl;
+        }
+        else
+        {
+            std::cout << "\033[32;1m[GBA Thread] 全局 BA 优化完成并成功更新地图！\033[0m" << std::endl;
+            mnFullBAIdx++;
+        }
+        mbRunningGBA = false;
+    }
 }
