@@ -248,18 +248,17 @@ bool Tracker::StereoInitialization()
 
 bool Tracker::TrackWithMotionModel()
 {
+    // ORB-SLAM2 标准：基于运动模型投影搜索，使用 0.9 的 NN Ratio，检查旋转一致性
     ORBmatcher matcher(0.9f, true);
 
     // 1. 基于恒速模型预测当前帧初始位姿
     mCurrentFrame.SetPose(mVelocity * mLastFrame.mTcw);
-
-    // 清理当前帧地图点
     std::fill(mCurrentFrame.mvpMapPoints.begin(), mCurrentFrame.mvpMapPoints.end(), nullptr);
 
-    // 第一阶段：精细搜索 (Base Radius th = 7.0f)
+    // 阶段 1：使用标准搜索半径 th = 7.0f (单目为 15.0f，双目因有视差约束基准设为 7.0f)
     int nmatches = matcher.SearchByProjection(mCurrentFrame, mLastFrame, 7.0f, false);
 
-    // 若第一次匹配点过少，直接放宽基础半径重试
+    // 阶段 2：若匹配数过少，放宽到 15.0f 重新搜索
     if (nmatches < 20)
     {
         std::fill(mCurrentFrame.mvpMapPoints.begin(), mCurrentFrame.mvpMapPoints.end(), nullptr);
@@ -269,40 +268,33 @@ bool Tracker::TrackWithMotionModel()
     if (nmatches < 10)
         return false;
 
-    // 2. 第一次仅位姿优化 (Motion-only BA)
+    // 第一次位姿优化 (Motion-only BA)
     int num_inliers = MotionOnlyBA::Optimize(&mCurrentFrame);
 
-    // 第二阶段：分级回退重试 (Fallback Retry for Large Rotations / Turns)
+    // 阶段 3：如果优化后内点不足 40，使用 2 倍半径 (th = 15.0f) 补搜未匹配点并二次优化
     if (num_inliers < 40)
     {
-        // 剔除第一轮中被判定为外点 (outlier) 的匹配
         for (int i = 0; i < mCurrentFrame.N; ++i)
         {
             if (mCurrentFrame.mvpMapPoints[i] && mCurrentFrame.mvbOutlier[i])
-            {
                 mCurrentFrame.mvpMapPoints[i] = nullptr;
-            }
         }
 
-        // 使用 2 倍半径 (th = 15.0f) 补充搜索未匹配上的特征点
         int additional_matches = matcher.SearchByProjection(mCurrentFrame, mLastFrame, 15.0f, false);
-
         if (num_inliers + additional_matches >= 20)
         {
-            // 用补充召回的特征点进行第二次 MotionOnlyBA 优化
             num_inliers = MotionOnlyBA::Optimize(&mCurrentFrame);
         }
     }
 
-    // 剔除最终被判为 Outlier 的地图点关联
+    // 剔除 Outliers
     for (int i = 0; i < mCurrentFrame.N; ++i)
     {
         if (mCurrentFrame.mvpMapPoints[i] && mCurrentFrame.mvbOutlier[i])
-        {
             mCurrentFrame.mvpMapPoints[i] = nullptr;
-        }
     }
 
+    // ORB-SLAM2 判定恒速模型跟踪成功的标准：内点数 >= 10
     return num_inliers >= 10;
 }
 
