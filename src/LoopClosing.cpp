@@ -99,9 +99,7 @@ void LoopClosing::Run()
     }
 }
 
-// -----------------------------------------------------------------------------
 // 阶段 1: 候选帧与共视组检测 (DetectLoop)
-// -----------------------------------------------------------------------------
 bool LoopClosing::DetectLoop()
 {
     if (!mpCurrentKF || mpCurrentKF->mbBad)
@@ -110,7 +108,7 @@ bool LoopClosing::DetectLoop()
     mpCurrentKF->ComputeBoW();
 
     // 1. ORB-SLAM2 官方做法：仅获取权重 >= 20 的共视邻域计算 minScore
-    const std::vector<KeyFrame *> vpConnectedKFs = mpCurrentKF->GetCovisibleByWeight(20);
+    const std::vector<KeyFrame *> vpConnectedKFs = mpCurrentKF->GetConnectedKeyFrames();
     const DBoW3::BowVector &curBow = mpCurrentKF->mBowVec;
 
     float minScore = 1.0f;
@@ -118,7 +116,8 @@ bool LoopClosing::DetectLoop()
     {
         for (KeyFrame *pKF : vpConnectedKFs)
         {
-            if (pKF->mbBad) continue;
+            if (pKF->mbBad)
+                continue;
             pKF->ComputeBoW();
             float score = mpORBVocabulary->score(curBow, pKF->mBowVec);
             if (score < minScore)
@@ -127,7 +126,7 @@ bool LoopClosing::DetectLoop()
     }
     else
     {
-        minScore = 0.2f;
+        minScore = 0.4f; // 避免保底阈值过低
     }
 
     // 2. 数据库检索候选关键帧
@@ -167,7 +166,8 @@ bool LoopClosing::DetectLoop()
 
         for (size_t i = 0; i < mvConsistentGroups.size(); ++i)
         {
-            if (vbGroupMatched[i]) continue; // 防止同一组在同帧被多次匹配覆盖
+            if (vbGroupMatched[i])
+                continue; // 防止同一组在同帧被多次匹配覆盖
 
             const std::set<KeyFrame *> &sPrevGroup = mvConsistentGroups[i].first;
             for (KeyFrame *pGKF : sGroup)
@@ -179,13 +179,14 @@ bool LoopClosing::DetectLoop()
                     break;
                 }
             }
-            if (vbGroupMatched[i]) break;
+            if (vbGroupMatched[i])
+                break;
         }
 
         vCurrentConsistentGroups.push_back(std::make_pair(sGroup, nConsistency));
 
         // 达到 3 帧一致性要求
-        if (nConsistency >= 2)
+        if (nConsistency >= 3)
         {
             mvpEnoughConsistentCandidates.push_back(pCandKF);
         }
@@ -203,9 +204,7 @@ bool LoopClosing::DetectLoop()
     return !mvpEnoughConsistentCandidates.empty();
 }
 
-// -----------------------------------------------------------------------------
 // 阶段 2: 几何一致性校验与位姿求解 (ComputeSE3)
-// -----------------------------------------------------------------------------
 bool LoopClosing::ComputeSE3()
 {
     ORBmatcher matcher(0.75f, true);
@@ -215,11 +214,11 @@ bool LoopClosing::ComputeSE3()
         if (!pCandKF || pCandKF->mbBad)
             continue;
 
-        // 阶段 1: BoW 粗匹配
+        // 阶段 1: BoW 粗匹配 (ORB-SLAM2 标准门槛: 至少 20 对匹配)
         std::vector<MapPoint *> vpMatchedMapPoints;
         int nmatches = matcher.SearchByBoW(mpCurrentKF, pCandKF, vpMatchedMapPoints);
 
-        if (nmatches < 15)
+        if (nmatches < 20)
             continue;
 
         std::vector<cv::Point3f> vPts3D;
@@ -238,7 +237,7 @@ bool LoopClosing::ComputeSE3()
             }
         }
 
-        if (vPts3D.size() < 15)
+        if (vPts3D.size() < 20)
             continue;
 
         cv::Mat rvec, tvec;
@@ -247,7 +246,8 @@ bool LoopClosing::ComputeSE3()
             vPts3D, vPts2D, mpCurrentKF->mK, cv::Mat::zeros(4, 1, CV_32F),
             rvec, tvec, false, 300, 8.0f, 0.99, inliers, cv::SOLVEPNP_EPNP);
 
-        if (!bOK || inliers.size() < 12)
+        // ORB-SLAM2 标准门槛: RANSAC 内点数必须 >= 20
+        if (!bOK || inliers.size() < 20)
             continue;
 
         // 提取粗估计位姿
@@ -261,8 +261,7 @@ bool LoopClosing::ComputeSE3()
                 Tcw(r, c) = static_cast<float>(R_cv.at<double>(r, c));
         }
 
-        // 阶段 2: ORB-SLAM2 官方投影引导二次扩充匹配
-        // 利用初解位姿将候选帧及共视邻居的地图点反投影到当前帧搜索更多匹配
+        // 阶段 2: 投影引导二次扩充匹配
         std::vector<KeyFrame *> vpCandNeighs = pCandKF->GetBestCovisibilityKeyFrames(10);
         vpCandNeighs.push_back(pCandKF);
 
@@ -311,7 +310,7 @@ bool LoopClosing::ComputeSE3()
                 if (dist < bestDist)
                 {
                     bestDist = dist;
-                    bestIdx = idx;
+                    bestIdx = static_cast<int>(idx);
                 }
             }
 
@@ -322,8 +321,9 @@ bool LoopClosing::ComputeSE3()
             }
         }
 
-        int nTotalMatches = inliers.size() + nAdditionalMatches;
-        if (nTotalMatches >= 25)
+        // ORB-SLAM2 标准门槛: 最终有效内点总数 >= 40
+        int nTotalMatches = static_cast<int>(inliers.size()) + nAdditionalMatches;
+        if (nTotalMatches >= 40)
         {
             mpMatchedKF = pCandKF;
             mTcw_loop = Tcw;
@@ -335,14 +335,9 @@ bool LoopClosing::ComputeSE3()
     return false;
 }
 
-// -----------------------------------------------------------------------------
 // 阶段 3: 闭环校正与地图融合 (无位姿图优化)
-// -----------------------------------------------------------------------------
 void LoopClosing::CorrectLoop()
 {
-    std::cout << "\033[33;1m[LoopClosing] 开始执行闭环校正与位姿图优化... 当前KF-" 
-              << mpCurrentKF->mnId << " <---> 闭环KF-" << mpMatchedKF->mnId << "\033[0m" << std::endl;
-
     // 1. 请求暂停 LocalMapping 线程并中断局部 BA
     if (mpLocalMapper)
     {
@@ -354,54 +349,67 @@ void LoopClosing::CorrectLoop()
         }
     }
 
-    // 地图全局更新互斥锁
+    // 地图全局更新互斥锁（保护整个闭环校正与 GBA 过程）
     std::unique_lock<std::mutex> lockMap(mpMap->mMutexMapUpdate);
 
-    // 确保当前关键帧连接关系最新
-    mpCurrentKF->UpdateConnections();
+    // 2. 将 ComputeSE3 阶段得到的闭环匹配点直接替换到当前关键帧
+    for (size_t i = 0; i < mvpLoopMatchedPoints.size(); i++)
+    {
+        MapPoint *pLoopMP = mvpLoopMatchedPoints[i];
+        if (pLoopMP && !pLoopMP->isBad())
+        {
+            MapPoint *pCurMP = mpCurrentKF->GetMapPoint(i);
+            if (pCurMP && pCurMP != pLoopMP)
+            {
+                pCurMP->Replace(pLoopMP);
+            }
+            else if (!pCurMP)
+            {
+                mpCurrentKF->AddMapPoint(pLoopMP, i);
+                pLoopMP->AddObservation(mpCurrentKF, i);
+            }
+        }
+    }
 
-    // =========================================================================
-    // 【核心调整】：先执行全局位姿图优化（将误差平摊至整个大环）
-    // =========================================================================
-    Optimizer::OptimizeEssentialGraph(mpMap, mpMatchedKF, mpCurrentKF, mTcw_loop);
-
-    // 2. 闭环侧地图点投影融合 (SearchAndFuse)
-    std::vector<KeyFrame*> vpLoopConnectedKFs = mpMatchedKF->GetBestCovisibilityKeyFrames(10);
+    // 3. 闭环侧地图点投影反向融合 (SearchAndFuse)
+    std::vector<KeyFrame *> vpLoopConnectedKFs = mpMatchedKF->GetBestCovisibilityKeyFrames(10);
     vpLoopConnectedKFs.push_back(mpMatchedKF);
     SearchAndFuse(vpLoopConnectedKFs);
 
-    // 3. 更新所有相连帧的共视图拓扑
-    std::vector<KeyFrame*> vpCurrentConnectedKFs = mpCurrentKF->GetBestCovisibilityKeyFrames(15);
+    // 4. 更新闭环两侧的共视连接关系（必须在位姿图优化前建立闭环共视图约束）
+    std::vector<KeyFrame *> vpCurrentConnectedKFs = mpCurrentKF->GetBestCovisibilityKeyFrames(15);
     vpCurrentConnectedKFs.push_back(mpCurrentKF);
 
-    for (KeyFrame* pKFi : vpCurrentConnectedKFs)
-    {
+    for (KeyFrame *pKFi : vpCurrentConnectedKFs)
         if (pKFi && !pKFi->mbBad)
             pKFi->UpdateConnections();
-    }
-    for (KeyFrame* pKFm : vpLoopConnectedKFs)
-    {
+
+    for (KeyFrame *pKFm : vpLoopConnectedKFs)
         if (pKFm && !pKFm->mbBad)
             pKFm->UpdateConnections();
-    }
 
+    // 5. 执行 Essential Graph 位姿图优化
+    Optimizer::OptimizeEssentialGraph(mpMap, mpMatchedKF, mpCurrentKF, mTcw_loop);
+
+    // 6. 重置追踪线程的速度模型，防止位姿突变导致追踪丢失
     if (mpTracker)
     {
         mpTracker->ResetVelocity();
+        mpTracker->mCurrentFrame.SetPose(mpCurrentKF->GetPose());
+        mpTracker->mLastFrame.SetPose(mpCurrentKF->GetPose());
     }
 
-    // 4. 恢复 LocalMapping 线程
+    // 7. 执行全局 BA（保持持有 lockMap 或在恢复 LocalMapping 之前完成）
+    Optimizer::GlobalBundleAdjustment(mpMap);
+
+    // 8. 全流程完成后，再释放 LocalMapping 线程
     if (mpLocalMapper)
     {
         mpLocalMapper->Release();
     }
-
-    std::cout << "\033[32;1m[LoopClosing] 闭环校正与位姿图优化完成！\033[0m" << std::endl;
 }
 
-// -----------------------------------------------------------------------------
 // 辅助函数: 闭环区域地图点投影融合
-// -----------------------------------------------------------------------------
 void LoopClosing::SearchAndFuse(const std::vector<KeyFrame *> &vpLoopConnectedKFs)
 {
     // 收集闭环侧所有地图点

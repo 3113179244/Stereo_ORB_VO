@@ -672,7 +672,7 @@ void Tracker::CreateNewKeyFrame()
                 nPoints++;
             }
 
-            // 停止条件：深度超过阈值 且 已处理近点数达到 100 个以上
+            // 停止条件：深度超过阈值且已处理近点数达到 100 个以上
             if (vDepthIdx[j].first > mCurrentFrame.mThDepth && nPoints > 100)
                 break;
         }

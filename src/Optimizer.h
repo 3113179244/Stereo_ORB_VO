@@ -18,7 +18,7 @@ class Optimizer
 public:
     static int PoseOptimization(Frame *pFrame);
     static void LocalBundleAdjustment(KeyFrame *pCurKF, bool *pbStopFlag, std::shared_ptr<Map> pMap);
-    static void GlobalBundleAdjustment(std::shared_ptr<Map> pMap);
+    static void GlobalBundleAdjustment(Map *pMap);
     static void OptimizeEssentialGraph(Map *pMap, KeyFrame *pLoopKF, KeyFrame *pCurKF, const Eigen::Matrix4f &Tcw_loop);
 };
 
