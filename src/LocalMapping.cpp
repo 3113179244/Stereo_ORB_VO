@@ -283,7 +283,7 @@ void LocalMapping::CreateNewMapPoints()
     if (mpMap->GetKeyFramesInMap() < 2)
         return;
 
-    const int nn = 10;
+    const int nn = 20;
     std::vector<KeyFrame *> vpNeighKFs = mpCurrentKeyFrame->GetBestCovisibilityKeyFrames(nn);
     if (vpNeighKFs.empty())
         return;
@@ -496,7 +496,7 @@ void LocalMapping::SearchInNeighbors()
             // 自适应金字塔搜索半径
             float ratio = dist / pMP->GetMaxDistanceInvariance();
             int nPredictedLevel = std::max(0, std::min(static_cast<int>(ratio * 4.0f), 3));
-            const float radius = 3.0f * pKF->mvScaleFactors[nPredictedLevel];
+            const float radius = 5.0f * pKF->mvScaleFactors[nPredictedLevel];
 
             const std::vector<size_t> vIndices = pKF->GetFeaturesInArea(u, v, radius);
             if (vIndices.empty())
@@ -707,7 +707,7 @@ void LocalMapping::KeyFrameCulling()
                         const int &scaleLeveli = pKFi->mvKeysUn[idx_i].octave;
 
                         // 尺度约束：只有其它关键帧的观测分辨率优于或等同于当前帧时（即 scaleLeveli <= scaleLevel + 1），才算作有效冗余观测
-                        if (scaleLeveli <= scaleLevel + 1)
+                        if (scaleLeveli <= scaleLevel)
                         {
                             nObs++;
                             if (nObs >= thObs)

@@ -461,7 +461,7 @@ bool Tracker::Relocalize()
 }
 
 /**
- * @brief 局部地图跟踪顶层控制
+ * @brief 局部地图跟踪顶层控制与成功门槛
  */
 bool Tracker::TrackLocalMap()
 {
@@ -495,7 +495,8 @@ bool Tracker::TrackLocalMap()
     // 5. 将当前局部地图点同步到 Map 供可视化渲染
     mpMap->SetReferenceMapPoints(mvpLocalMapPoints);
 
-    return mnMatchesInliers >= 8;
+    // ORB-SLAM2 官方标准门槛：局部地图跟踪成功判定内点数至少为 30 (保底宽松门槛不低于 15~30)
+    return mnMatchesInliers >= 30;
 }
 
 bool Tracker::NeedNewKeyFrame()
@@ -729,6 +730,9 @@ void Tracker::UpdateLocalMap()
 /**
  * @brief 搜集局部关键帧 (当前帧观测帧 + 一级共视邻居 + 二级共视邻居)
  */
+/**
+ * @brief 搜集局部关键帧 (当前帧观测帧 + 一级共视前 K 个邻居 + 二级共视邻居)
+ */
 void Tracker::UpdateLocalKeyFrames()
 {
     mvpLocalKeyFrames.clear();
@@ -774,22 +778,31 @@ void Tracker::UpdateLocalKeyFrames()
     if (pKFmax)
         mpReferenceKF = pKFmax;
 
-    // 3. 扩充一级共视邻居、二级共视邻居、子节点与父节点
+    // 3. 扩充一级共视邻居 (ORB-SLAM2 标准：前 10 个最佳共视邻居)、二级共视邻居 (前 5 个)、生成树子/父节点
     std::vector<KeyFrame*> vpLocalKFWithNeighbors = mvpLocalKeyFrames;
     for (KeyFrame *pKF : mvpLocalKeyFrames)
     {
         if (pKF->mbBad)
             continue;
 
-        // (a) 最佳共视前 10 个邻居
+        // (a) 一级最佳共视前 10 个邻居
         const std::vector<KeyFrame *> vNeighs = pKF->GetBestCovisibilityKeyFrames(10);
         for (KeyFrame *pN : vNeighs)
         {
             if (pN && !pN->mbBad)
+            {
                 vpLocalKFWithNeighbors.push_back(pN);
+                // (b) 二级最佳共视前 5 个邻居
+                const std::vector<KeyFrame *> vSecondNeighs = pN->GetBestCovisibilityKeyFrames(5);
+                for (KeyFrame *p2N : vSecondNeighs)
+                {
+                    if (p2N && !p2N->mbBad)
+                        vpLocalKFWithNeighbors.push_back(p2N);
+                }
+            }
         }
 
-        // (b) 生成树子节点与父节点
+        // (c) 生成树子节点与父节点
         const std::set<KeyFrame *> spChildren = pKF->GetChilds();
         for (KeyFrame *pChild : spChildren)
         {
@@ -874,7 +887,7 @@ void Tracker::SearchLocalPoints()
     if (vpCandidateMPs.empty())
         return;
 
-    // 2. 调用已实现金字塔层级预测、视锥检查、Ratio Test与旋转直方图校验的匹配器
+    // 2. ORB-SLAM2 官方标准：局部地图匹配设置 nnratio = 0.8f，开启旋转一致性校验，搜索半径 th = 5.0f
     ORBmatcher matcher(0.8f, true);
     matcher.SearchByProjection(mCurrentFrame, vpCandidateMPs, 5.0f);
 }
