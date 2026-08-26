@@ -80,10 +80,6 @@ void LoopClosing::Run()
                     // 仅清空当前候选，保留连续性分组由 DetectLoop 迭代更新
                     mvpEnoughConsistentCandidates.clear();
                 }
-                // else
-                // {
-                //     std::cout << "\033[31m[LoopTrigger FAILED] 候选帧连续性达标，但 PnP 几何校验未通过。\033[0m" << std::endl;
-                // }
             }
         }
 
