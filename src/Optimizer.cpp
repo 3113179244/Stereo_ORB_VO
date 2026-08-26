@@ -445,18 +445,19 @@ void Optimizer::LocalBundleAdjustment(KeyFrame *pCurKF, bool *pbStopFlag, std::s
         bDoMore = false;
     }
 
-    std::set<MapPoint *> sBadMPs;
+    // 记录各关键帧中的单次外点观测: <MapPoint*, KeyFrame*>
+    std::vector<std::pair<KeyFrame*, MapPoint*>> vToEraseObservations;
 
     if (bDoMore)
     {
-        // 卡方检验：剔除外点
-        const double chi2_th = 5.991;
+        const double chi2_mono = 5.991;
+        const double chi2_stereo = 7.815;
+
         for (int i = 0; i < nLocalMPs; ++i)
         {
             MapPoint *pMP = vpLocalMPs[i];
             const double *p = mapMPPoint[pMP];
             const Eigen::Vector3d Pw(p[0], p[1], p[2]);
-            double maxErr2 = 0.0;
 
             std::map<KeyFrame *, size_t> obs = pMP->GetObservations();
             for (auto mit = obs.begin(); mit != obs.end(); ++mit)
@@ -476,34 +477,52 @@ void Optimizer::LocalBundleAdjustment(KeyFrame *pCurKF, bool *pbStopFlag, std::s
                 else
                     continue;
 
-                const cv::Point2f &kp = pKF->mvKeysUn[idx].pt;
-                Eigen::Vector3d Pc =
-                    Eigen::AngleAxisd(
-                        Eigen::Vector3d(pose[0], pose[1], pose[2]).norm(),
-                        Eigen::Vector3d(pose[0], pose[1], pose[2]).normalized())
-                        .toRotationMatrix() *
-                    Pw;
-                Pc += Eigen::Vector3d(pose[3], pose[4], pose[5]);
+                // 安全提取旋转，防止 0 向量调用 normalized() 产生 NaN 污染
+                Eigen::Vector3d r_vec(pose[0], pose[1], pose[2]);
+                double angle = r_vec.norm();
+                Eigen::Matrix3d R_cw = Eigen::Matrix3d::Identity();
+                if (angle > 1e-12)
+                    R_cw = Eigen::AngleAxisd(angle, r_vec.normalized()).toRotationMatrix();
+
+                Eigen::Vector3d Pc = R_cw * Pw + Eigen::Vector3d(pose[3], pose[4], pose[5]);
                 if (Pc.z() <= 0.0)
                 {
-                    maxErr2 = 1e9;
-                    break;
+                    vToEraseObservations.push_back(std::make_pair(pKF, pMP));
+                    continue;
                 }
 
-                const double du = pKF->fx * Pc.x() / Pc.z() + pKF->cx - kp.x;
-                const double dv = pKF->fy * Pc.y() / Pc.z() + pKF->cy - kp.y;
-                double err2 = du * du + dv * dv;
+                const double invz = 1.0 / Pc.z();
+                const double u = pKF->fx * Pc.x() * invz + pKF->cx;
+                const double v = pKF->fy * Pc.y() * invz + pKF->cy;
+                const double du = u - pKF->mvKeysUn[idx].pt.x;
+                const double dv = v - pKF->mvKeysUn[idx].pt.y;
 
                 const int level = pKF->mvKeysUn[idx].octave;
-                if (level >= 0 && level < pKF->mnScaleLevels)
-                    err2 /= pKF->mvLevelSigma2[level];
+                const double invSigma2 = (level >= 0 && level < pKF->mnScaleLevels) ? pKF->mvInvLevelSigma2[level] : 1.0;
 
-                maxErr2 = std::max(maxErr2, err2);
-            }
+                const float u_r = pKF->mvuRight[idx];
+                const float depth = pKF->mvDepth[idx];
 
-            if (maxErr2 > chi2_th)
-            {
-                sBadMPs.insert(pMP);
+                // 双目近点 3DoF 与单目/远点 2DoF 卡方检验
+                if (u_r >= 0.0f && depth > 0.0f && depth < pKF->mThDepth)
+                {
+                    const double u_r_proj = u - pKF->mbf * invz;
+                    const double du_r = u_r_proj - u_r;
+                    const double chi2 = (du * du + dv * dv + du_r * du_r) * invSigma2;
+                    if (chi2 > chi2_stereo)
+                    {
+                        // 【修复点 2】：仅记录此帧对该点的异常观测，不全局销毁 MapPoint
+                        vToEraseObservations.push_back(std::make_pair(pKF, pMP));
+                    }
+                }
+                else
+                {
+                    const double chi2 = (du * du + dv * dv) * invSigma2;
+                    if (chi2 > chi2_mono)
+                    {
+                        vToEraseObservations.push_back(std::make_pair(pKF, pMP));
+                    }
+                }
             }
         }
 
@@ -520,14 +539,14 @@ void Optimizer::LocalBundleAdjustment(KeyFrame *pCurKF, bool *pbStopFlag, std::s
                 problem2.SetParameterBlockConstant(mapKFPose[pKF]);
         }
 
-        // 注册内点地图点
+        // 注册所有局部地图点
         for (int i = 0; i < nLocalMPs; ++i)
         {
-            MapPoint *pMP = vpLocalMPs[i];
-            if (sBadMPs.count(pMP))
-                continue;
-            problem2.AddParameterBlock(mapMPPoint[pMP], 3);
+            problem2.AddParameterBlock(mapMPPoint[vpLocalMPs[i]], 3);
         }
+
+        // 建立外点快速检索哈希表
+        std::set<std::pair<KeyFrame*, MapPoint*>> sEraseObs(vToEraseObservations.begin(), vToEraseObservations.end());
 
         // 局部帧内点残差
         for (int i = 0; i < nLocalKFs; ++i)
@@ -540,7 +559,7 @@ void Optimizer::LocalBundleAdjustment(KeyFrame *pCurKF, bool *pbStopFlag, std::s
             for (size_t j = 0; j < vpMPs.size(); ++j)
             {
                 MapPoint *pMP = vpMPs[j];
-                if (!pMP || pMP->isBad() || !mapMPPoint.count(pMP) || sBadMPs.count(pMP))
+                if (!pMP || pMP->isBad() || !mapMPPoint.count(pMP) || sEraseObs.count(std::make_pair(pKF, pMP)))
                     continue;
 
                 const cv::KeyPoint &kp = pKF->mvKeysUn[j];
@@ -554,7 +573,6 @@ void Optimizer::LocalBundleAdjustment(KeyFrame *pCurKF, bool *pbStopFlag, std::s
                 const float depth = pKF->mvDepth[j];
 
                 ceres::CostFunction *cost = nullptr;
-                // 双目近点约束
                 if (u_r >= 0.0f && depth > 0.0f && depth < pKF->mThDepth)
                 {
                     cost = LocalRepoErrorStereo::Create(fx, fy, cx, cy, pKF->mbf,
@@ -583,7 +601,7 @@ void Optimizer::LocalBundleAdjustment(KeyFrame *pCurKF, bool *pbStopFlag, std::s
             for (size_t j = 0; j < vpMPs.size(); ++j)
             {
                 MapPoint *pMP = vpMPs[j];
-                if (!pMP || pMP->isBad() || !mapMPPoint.count(pMP) || sBadMPs.count(pMP))
+                if (!pMP || pMP->isBad() || !mapMPPoint.count(pMP) || sEraseObs.count(std::make_pair(pKF, pMP)))
                     continue;
 
                 const cv::KeyPoint &kp = pKF->mvKeysUn[j];
@@ -605,27 +623,49 @@ void Optimizer::LocalBundleAdjustment(KeyFrame *pCurKF, bool *pbStopFlag, std::s
         ceres::Solve(options, &problem2, &summary2);
     }
 
-    // Step 5: 无论是否被打断，均将当前已优化的参数回写
+    // Step 5: 优化结果回写
     if (pbStopFlag && *pbStopFlag)
     {
         CleanupMemory();
-        return; // 被外部打断，直接放弃本次未收敛的结果，防止地图被半成品位姿污染
+        return; // 中断保护
     }
 
-    for (int i = 0; i < nLocalKFs; ++i)
-        ArrayToPose(vpLocalKFs[i], mapKFPose[vpLocalKFs[i]]);
-
-    for (int i = 0; i < nLocalMPs; ++i)
+    // 加持地图全局互斥锁，防止与 Tracking / LoopClosing 线程并发冲突
     {
-        MapPoint *pMP = vpLocalMPs[i];
-        if (sBadMPs.count(pMP))
+        std::unique_lock<std::mutex> lock(pMap->mMutexMapUpdate);
+
+        // 1. 精准剔除单帧外点观测
+        for (size_t i = 0; i < vToEraseObservations.size(); ++i)
         {
-            pMP->SetBadFlag(); // 将检验出的外点正式标记为坏点
-            continue;
+            KeyFrame *pKF = vToEraseObservations[i].first;
+            MapPoint *pMP = vToEraseObservations[i].second;
+            if (pKF && pMP)
+            {
+                pKF->EraseMapPointMatch(pMP);
+                pMP->EraseObservation(pKF);
+            }
         }
-        double *p = mapMPPoint[pMP];
-        pMP->SetWorldPos(Eigen::Vector3f((float)p[0], (float)p[1], (float)p[2]));
-    }
+
+        // 2. 回写关键帧位姿
+        for (int i = 0; i < nLocalKFs; ++i)
+        {
+            ArrayToPose(vpLocalKFs[i], mapKFPose[vpLocalKFs[i]]);
+        }
+
+        // 3. 回写地图点 3D 坐标与法向量
+        for (int i = 0; i < nLocalMPs; ++i)
+        {
+            MapPoint *pMP = vpLocalMPs[i];
+            if (pMP->isBad())
+                continue;
+
+            double *p = mapMPPoint[pMP];
+            pMP->SetWorldPos(Eigen::Vector3f(static_cast<float>(p[0]),
+                                             static_cast<float>(p[1]),
+                                             static_cast<float>(p[2])));
+            pMP->UpdateNormalAndDepth();
+        }
+    } // 离开大括号自动释放 mMutexMapUpdate 锁
 
     // Step 6: 释放内存
     CleanupMemory();
@@ -682,7 +722,7 @@ void Optimizer::OptimizeEssentialGraph(Map *pMap, KeyFrame *pLoopKF, KeyFrame *p
             continue;
         KeyFrame *pParent = pKF->GetParent();
 
-        // 【关键修复】：跳过父节点等于自身的异常情况
+        // 跳过父节点等于自身的异常情况
         if (!pParent || pParent == pKF || !mapPoses.count(pParent) || !mapPoses.count(pKF))
             continue;
 

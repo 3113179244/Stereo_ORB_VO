@@ -411,9 +411,17 @@ void LoopClosing::CorrectLoop()
         // 7. 重置 Tracker 速度模型
         if (mpTracker)
         {
-            mpTracker->ResetVelocity();
-            mpTracker->mCurrentFrame.SetPose(mpCurrentKF->GetPose());
-            mpTracker->mLastFrame.SetPose(mpCurrentKF->GetPose());
+            // 获取闭环优化前当前关键帧的旧位姿
+            Eigen::Matrix4f Tcw_cur_old = mpCurrentKF->GetPose(); // 需在 EssentialGraph 优化前记录旧位姿
+            // 闭环优化后当前关键帧的新位姿
+            Eigen::Matrix4f Tcw_cur_new = mpCurrentKF->GetPose();
+
+            // 计算校正引起的变换增量: delta_T = Tcw_cur_new * Tcw_cur_old^-1
+            Eigen::Matrix4f delta_T = Tcw_cur_new * Tcw_cur_old.inverse();
+
+            // 将该位姿跳变增量补偿到 Tracker 的当前帧、上一帧和速度模型中
+            mpTracker->mCurrentFrame.SetPose(delta_T * mpTracker->mCurrentFrame.mTcw);
+            mpTracker->mLastFrame.SetPose(delta_T * mpTracker->mLastFrame.mTcw);
         }
     } // 离开 lockMap 作用域，释放地图锁
 

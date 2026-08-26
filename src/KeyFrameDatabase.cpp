@@ -164,7 +164,7 @@ std::vector<KeyFrame *> KeyFrameDatabase::DetectRelocalizationCandidates(Frame *
 
 std::vector<KeyFrame *> KeyFrameDatabase::DetectLoopCandidates(KeyFrame *pKF, float minScore)
 {
-    // 1. ORB-SLAM2 标准：搜集当前关键帧自身、直接相连关键帧及各自的一级共视邻居
+    // 1. 搜集当前关键帧自身、直接相连关键帧及各自的一级共视邻居
     std::set<KeyFrame *> spConnectedKeyFrames;
     const std::vector<KeyFrame *> vpConn = pKF->GetConnectedKeyFrames();
     spConnectedKeyFrames.insert(pKF);
