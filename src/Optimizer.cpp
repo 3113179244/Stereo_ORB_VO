@@ -681,10 +681,11 @@ void Optimizer::OptimizeEssentialGraph(Map *pMap, KeyFrame *pLoopKF, KeyFrame *p
         if (!pKF || pKF->mbBad || pKF->mnId == 0)
             continue;
         KeyFrame *pParent = pKF->GetParent();
-        if (!pParent || !mapPoses.count(pParent) || !mapPoses.count(pKF))
+
+        // 【关键修复】：跳过父节点等于自身的异常情况
+        if (!pParent || pParent == pKF || !mapPoses.count(pParent) || !mapPoses.count(pKF))
             continue;
 
-        // T_child_parent = T_child_w * (T_parent_w)^-1
         Eigen::Matrix4f T_child_parent = mapOldPoses[pKF] * mapOldPoses[pParent].inverse();
 
         problem.AddResidualBlock(PoseGraphEdgeError::Create(T_child_parent),
@@ -693,13 +694,13 @@ void Optimizer::OptimizeEssentialGraph(Map *pMap, KeyFrame *pLoopKF, KeyFrame *p
     }
 
     // 2. 添加闭环强约束边
-    if (mapPoses.count(pCurKF) && mapPoses.count(pLoopKF))
+    // 确保 pCurKF != pLoopKF
+    if (pCurKF != pLoopKF && mapPoses.count(pCurKF) && mapPoses.count(pLoopKF))
     {
-        // T_cur_loop = Tcw_loop * (T_loop_w)^-1
         Eigen::Matrix4f T_cur_loop = Tcw_loop * mapOldPoses[pLoopKF].inverse();
 
         problem.AddResidualBlock(PoseGraphEdgeError::Create(T_cur_loop),
-                                 nullptr, // 闭环边作为强约束
+                                 nullptr,
                                  mapPoses[pCurKF], mapPoses[pLoopKF]);
     }
 
@@ -761,11 +762,13 @@ void Optimizer::OptimizeEssentialGraph(Map *pMap, KeyFrame *pLoopKF, KeyFrame *p
 
 void Optimizer::GlobalBundleAdjustment(Map *pMap, int nIterations, bool *pbStopFlag)
 {
-    if (!pMap) return;
+    if (!pMap)
+        return;
 
     std::vector<KeyFrame *> vpKFs = pMap->GetAllKeyFrames();
     std::vector<MapPoint *> vpMPs = pMap->GetAllMapPoints();
-    if (vpKFs.size() < 2 || vpMPs.empty()) return;
+    if (vpKFs.size() < 2 || vpMPs.empty())
+        return;
 
     ceres::Problem problem;
     ceres::LossFunction *loss_function = new ceres::HuberLoss(std::sqrt(5.991));
@@ -777,7 +780,8 @@ void Optimizer::GlobalBundleAdjustment(Map *pMap, int nIterations, bool *pbStopF
 
     for (KeyFrame *pKF : vpKFs)
     {
-        if (!pKF || pKF->mbBad) continue;
+        if (!pKF || pKF->mbBad)
+            continue;
         double *pose = new double[6];
         PoseToArray(pKF, pose);
         mapKFPose[pKF] = pose;
@@ -794,11 +798,14 @@ void Optimizer::GlobalBundleAdjustment(Map *pMap, int nIterations, bool *pbStopF
 
     for (MapPoint *pMP : vpMPs)
     {
-        if (!pMP || pMP->isBad() || pMP->GetObservations().size() < 2) continue;
+        if (!pMP || pMP->isBad() || pMP->GetObservations().size() < 2)
+            continue;
 
         double *point = new double[3];
         const Eigen::Vector3f pos = pMP->GetWorldPos();
-        point[0] = pos[0]; point[1] = pos[1]; point[2] = pos[2];
+        point[0] = pos[0];
+        point[1] = pos[1];
+        point[2] = pos[2];
 
         mapMPPoint[pMP] = point;
         vPointArrays.push_back(point);
@@ -808,7 +815,8 @@ void Optimizer::GlobalBundleAdjustment(Map *pMap, int nIterations, bool *pbStopF
     // 2. 添加观测残差边
     for (KeyFrame *pKF : vpKFs)
     {
-        if (!pKF || pKF->mbBad || !mapKFPose.count(pKF)) continue;
+        if (!pKF || pKF->mbBad || !mapKFPose.count(pKF))
+            continue;
 
         double *pose = mapKFPose[pKF];
         const double fx = pKF->fx, fy = pKF->fy, cx = pKF->cx, cy = pKF->cy;
@@ -817,11 +825,13 @@ void Optimizer::GlobalBundleAdjustment(Map *pMap, int nIterations, bool *pbStopF
         for (size_t i = 0; i < vpMatches.size(); ++i)
         {
             MapPoint *pMP = vpMatches[i];
-            if (!pMP || pMP->isBad() || !mapMPPoint.count(pMP)) continue;
+            if (!pMP || pMP->isBad() || !mapMPPoint.count(pMP))
+                continue;
 
             const cv::KeyPoint &kp = pKF->mvKeysUn[i];
             const int level = kp.octave;
-            if (level < 0 || level >= pKF->mnScaleLevels) continue;
+            if (level < 0 || level >= pKF->mnScaleLevels)
+                continue;
 
             const double invSigma2 = pKF->mvInvLevelSigma2[level];
             const double sqrtInvSigma2 = std::sqrt(invSigma2);
@@ -858,9 +868,12 @@ void Optimizer::GlobalBundleAdjustment(Map *pMap, int nIterations, bool *pbStopF
     ceres::Solver::Summary summary;
     ceres::Solve(options, &problem, &summary);
 
-    auto CleanupMemory = [&]() {
-        for (double *ptr : vPoseArrays) delete[] ptr;
-        for (double *ptr : vPointArrays) delete[] ptr;
+    auto CleanupMemory = [&]()
+    {
+        for (double *ptr : vPoseArrays)
+            delete[] ptr;
+        for (double *ptr : vPointArrays)
+            delete[] ptr;
     };
 
     // 4. 如果被外部新闭环打断，放弃回写优化位姿

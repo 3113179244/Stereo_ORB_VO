@@ -531,6 +531,7 @@ std::vector<size_t> KeyFrame::GetFeaturesInArea(
 
 void KeyFrame::SetParent(KeyFrame *pKF)
 {
+    if (pKF == this) return; // 避免自环
     {
         std::unique_lock<std::mutex> lock(mMutexConnections);
         mpParent = pKF;
