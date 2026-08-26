@@ -65,8 +65,6 @@ void LoopClosing::Run()
             // 1. 闭环候选初筛与连续性检验
             if (DetectLoop())
             {
-                // std::cout << "\033[32;1m>>> [LoopTrigger] 成功检测到连续一致性闭环候选组！<<<\033[0m" << std::endl;
-
                 // 2. 几何位姿求解检验 (PnP / RANSAC)
                 if (ComputeSE3())
                 {

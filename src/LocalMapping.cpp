@@ -220,7 +220,8 @@ void LocalMapping::ProcessNewKeyFrame()
             }
             else
             {
-                // 由 Tracking 线程在插帧时直接创建并加入的立体点，必须加入待考队列接受 MapPointCulling 检验
+                // 由 Tracking 线程直接创建的立体点，确保其起始关键帧 ID 设为当前关键帧
+                pMP->mnFirstKFid = mpCurrentKeyFrame->mnId;
                 mlpRecentAddedMapPoints.push_back(pMP);
             }
         }
@@ -235,40 +236,39 @@ void LocalMapping::ProcessNewKeyFrame()
  */
 void LocalMapping::MapPointCulling()
 {
-    // 待考核地图点队列为空直接返回
     if (mlpRecentAddedMapPoints.empty())
         return;
 
     auto lit = mlpRecentAddedMapPoints.begin();
     const unsigned long int nCurrentKFid = mpCurrentKeyFrame->mnId;
 
-    // 双目模式下，通过考核所需的关键帧观测数阈值为 3 (单目为 2)
+    // 单目需要 2 个关键帧观测，双目系统有右目视差约束，3 帧观测更严格稳定
     const int cnThObs = 3;
 
     while (lit != mlpRecentAddedMapPoints.end())
     {
         MapPoint *pMP = *lit;
 
+        // 1. 若已被标记为坏点，直接从队列移出
         if (pMP->isBad())
         {
-            // 1. 已经是坏点的地图点，直接从待考核队列中移除
             lit = mlpRecentAddedMapPoints.erase(lit);
         }
+        // 2. 跟踪比例不合格（跟踪到的次数 / 预计可见次数 < 25%）
         else if (pMP->GetFoundRatio() < 0.25f)
         {
-            // 2. 跟踪到的帧数占视野预计可见帧数比例小于 25%，剔除
             pMP->SetBadFlag();
             lit = mlpRecentAddedMapPoints.erase(lit);
         }
+        // 3. 建立已超过 2 个关键帧，但观测帧数依然不足阈值
         else if (((int)nCurrentKFid - (int)pMP->mnFirstKFid) >= 2 && static_cast<int>(pMP->GetObservations().size()) <= cnThObs)
         {
-            // 3. 建立已满 2 个关键帧以上，但观测到该点的关键帧数仍 <= 3，判定为不稳定点剔除
             pMP->SetBadFlag();
             lit = mlpRecentAddedMapPoints.erase(lit);
         }
+        // 4. 连续存活达 3 个关键帧以上，顺利通过考核转正
         else if (((int)nCurrentKFid - (int)pMP->mnFirstKFid) >= 3)
         {
-            // 4. 建立已达 3 个关键帧且通过上述测试，说明质量可靠，移出考核队列转正
             lit = mlpRecentAddedMapPoints.erase(lit);
         }
         else

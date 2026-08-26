@@ -395,18 +395,17 @@ int ORBmatcher::SearchByProjection(Frame &F, const std::vector<MapPoint *> &vpMa
         const Eigen::Vector3f Pw = pMP->GetWorldPos();
         const Eigen::Vector3f Pc = Rcw * Pw + tcw;
 
-        // 深度检查：点必须在相机前方
         if (Pc.z() <= 0.0f)
             continue;
 
-        // 2. 视锥与尺度距离检查 (ORB-SLAM2 标准：0.8 * min 与 1.2 * max)
+        // 2. 视锥与尺度距离检查
         const float dist = (Pw - Ow).norm();
         const float maxDistance = pMP->GetMaxDistanceInvariance();
         const float minDistance = pMP->GetMinDistanceInvariance();
         if (dist < minDistance * 0.8f || dist > maxDistance * 1.2f)
             continue;
 
-        // 3. 视角夹角检查 (Viewing angle < 60°，即 cos(theta) >= 0.5)
+        // 3. 视角夹角检查
         Eigen::Vector3f Pn = (Pw - Ow).normalized();
         if (Pn.dot(pMP->GetNormal()) < 0.5f)
             continue;
@@ -420,7 +419,10 @@ int ORBmatcher::SearchByProjection(Frame &F, const std::vector<MapPoint *> &vpMa
             v < Frame::mnMinY || v >= Frame::mnMaxY)
             continue;
 
-        // 5. 根据距离比例估算金字塔层级 (ORB-SLAM2 官方公式)
+        // 【关键修复 1】：只要点落在有效视野内，增加可见计数
+        pMP->IncreaseVisible(1);
+
+        // 5. 根据距离比例估算金字塔层级
         const float ratio = pMP->GetMaxDistanceInvariance() / dist;
         int predictedLevel = cvRound(std::log(ratio) / std::log(F.mpORBextractorLeft->GetScaleFactor()));
 
@@ -429,7 +431,7 @@ int ORBmatcher::SearchByProjection(Frame &F, const std::vector<MapPoint *> &vpMa
         else if (predictedLevel >= F.mpORBextractorLeft->GetLevels())
             predictedLevel = F.mpORBextractorLeft->GetLevels() - 1;
 
-        // 6. 自适应搜索半径：th * scaleFactor
+        // 6. 自适应搜索半径
         const float radius = th * F.mpORBextractorLeft->GetScaleFactors()[predictedLevel];
         const std::vector<size_t> candidates =
             F.GetFeaturesInArea(u, v, radius, predictedLevel - 1, predictedLevel + 1);
@@ -438,7 +440,7 @@ int ORBmatcher::SearchByProjection(Frame &F, const std::vector<MapPoint *> &vpMa
             continue;
 
         const cv::Mat &dMP = pMP->GetDescriptor();
-        int bestDist = TH_LOW; // TH_LOW = 50
+        int bestDist = TH_LOW;
         int secondBestDist = TH_LOW;
         int bestIdx = -1;
 
@@ -463,12 +465,14 @@ int ORBmatcher::SearchByProjection(Frame &F, const std::vector<MapPoint *> &vpMa
             }
         }
 
-        // 7. 汉明距离与 Ratio Test 双重判定
+        // 7. 匹配成功判定
         if (bestIdx >= 0 && bestDist < TH_LOW)
         {
             if (static_cast<float>(bestDist) < mfNNratio * static_cast<float>(secondBestDist))
             {
                 F.mvpMapPoints[bestIdx] = pMP;
+                // 【关键修复 2】：匹配成功，增加匹配计数
+                pMP->IncreaseFound(1);
                 ++nmatches;
 
                 if (mbCheckOrientation)
@@ -484,7 +488,7 @@ int ORBmatcher::SearchByProjection(Frame &F, const std::vector<MapPoint *> &vpMa
         }
     }
 
-    // 8. 旋转一致性直方图剔除（保留前三名主方向）
+    // 8. 旋转一致性直方图剔除
     if (mbCheckOrientation)
     {
         int idx1 = -1, idx2 = -1, idx3 = -1;

@@ -859,7 +859,7 @@ void Tracker::SearchLocalPoints()
     if (mvpLocalMapPoints.empty())
         return;
 
-    // 1. 过滤掉当前帧中已经匹配上的地图点，避免重复搜索
+    // 1. 过滤掉当前帧中已经成功匹配且为有效内点（Inlier）的地图点
     std::vector<MapPoint*> vpCandidateMPs;
     vpCandidateMPs.reserve(mvpLocalMapPoints.size());
 
@@ -871,7 +871,8 @@ void Tracker::SearchLocalPoints()
         bool bAlreadyTracked = false;
         for (int i = 0; i < mCurrentFrame.N; ++i)
         {
-            if (mCurrentFrame.mvpMapPoints[i] == pMP)
+            // 核心修复：只有当指针匹配且不是 Outlier 时，才视作已跟踪成功
+            if (mCurrentFrame.mvpMapPoints[i] == pMP && !mCurrentFrame.mvbOutlier[i])
             {
                 bAlreadyTracked = true;
                 break;
@@ -887,7 +888,7 @@ void Tracker::SearchLocalPoints()
     if (vpCandidateMPs.empty())
         return;
 
-    // 2. ORB-SLAM2 官方标准：局部地图匹配设置 nnratio = 0.8f，开启旋转一致性校验，搜索半径 th = 5.0f
+    // 2. 局部地图匹配设置 nnratio = 0.8f，开启旋转一致性校验，搜索半径 th = 5.0f
     ORBmatcher matcher(0.8f, true);
     matcher.SearchByProjection(mCurrentFrame, vpCandidateMPs, 5.0f);
 }

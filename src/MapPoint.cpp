@@ -240,42 +240,54 @@ bool MapPoint::isBad()
 void MapPoint::Replace(MapPoint *pMP)
 {
     if (pMP->mnId == this->mnId)
-        return; // 自己无需替换自己
+        return;
 
+    int nvisible, nfound;
     std::map<KeyFrame *, size_t> obs;
+
+    // 1. 同时对 this 和 pMP 的互斥锁加锁，杜绝多线程下的 ABBA 死锁
     {
-        std::unique_lock<std::mutex> lock1(mMutexFeatures);
-        std::unique_lock<std::mutex> lock2(mMutexPos);
+        std::unique_lock<std::mutex> lock1(mMutexFeatures, std::defer_lock);
+        std::unique_lock<std::mutex> lock2(mMutexPos, std::defer_lock);
+        std::unique_lock<std::mutex> lock3(pMP->mMutexFeatures, std::defer_lock);
+        std::unique_lock<std::mutex> lock4(pMP->mMutexPos, std::defer_lock);
+
+        // 一次性安全锁定四个互斥量
+        std::lock(lock1, lock2, lock3, lock4);
+
         obs = mObservations;
-        mObservations.clear(); // 转移观测之前，先清空自身的观测
-        mbBad = true;          // 本点被抛弃
-        mpReplaced = pMP;      // 记录被哪个点顶替了
+        mObservations.clear();
+
+        mbBad = true;
+        mpReplaced = pMP;
+
+        // 继承统计量
+        pMP->mnVisible += mnVisible;
+        pMP->mnFound += mnFound;
     }
 
-    // 处理原来所有能看到当前旧点的关键帧
+    // 2. 转移关键帧观测记录（在 MapPoint 自身锁释放后执行，防止与 KeyFrame 的锁发生交叉死锁）
     for (auto mit = obs.begin(); mit != obs.end(); mit++)
     {
         KeyFrame *pKF = mit->first;
-        // 如果顶替它的新点还没有被该关键帧观测到
+
         if (!pMP->IsInKeyFrame(pKF))
         {
-            // 让关键帧把对应的地图点指针更新为新的点
             pKF->ReplaceMapPointMatch(mit->second, pMP);
-            // 新点增加对该关键帧的观测记录
             pMP->AddObservation(pKF, mit->second);
         }
         else
         {
-            // 如果新点本来就已经在这个关键帧里有观测了，说明产生了冲突，则直接抹除关键帧里原来的旧匹配
+            // 若新点已在该关键帧存在观测，则直接抹除旧点的槽位匹配
             pKF->EraseMapPointMatch(mit->second);
         }
     }
 
-    // 由于新点吸收了旧点的观测，所以需要重新计算它的最优描述子和法向量深度
+    // 3. 在锁外重新计算新点的代表性描述子与平均法向量深度
     pMP->ComputeDistinctiveDescriptor();
     pMP->UpdateNormalAndDepth();
 
-    // 最后让地图删掉原来的自己
+    // 4. 从全局地图中删除当前被替换的点
     mpMap->EraseMapPoint(this);
 }
 
@@ -313,4 +325,16 @@ float MapPoint::GetMaxDistanceInvariance()
 {
     std::unique_lock<std::mutex> lock(mMutexPos);
     return mfMaxDistance;
+}
+
+void MapPoint::IncreaseVisible(int n)
+{
+    std::unique_lock<std::mutex> lock(mMutexFeatures);
+    mnVisible += n;
+}
+
+void MapPoint::IncreaseFound(int n)
+{
+    std::unique_lock<std::mutex> lock(mMutexFeatures);
+    mnFound += n;
 }
