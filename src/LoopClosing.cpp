@@ -405,23 +405,27 @@ void LoopClosing::CorrectLoop()
             if (pKFm && !pKFm->mbBad)
                 pKFm->UpdateConnections();
 
+        // 在位姿图优化前，提前保存当前关键帧的旧位姿
+        Eigen::Matrix4f Tcw_cur_old = mpCurrentKF->GetPose();
+
         // 6. 执行 Essential Graph 位姿图优化
         Optimizer::OptimizeEssentialGraph(mpMap, mpMatchedKF, mpCurrentKF, mTcw_loop);
 
-        // 7. 重置 Tracker 速度模型
+        // 7. 将位姿跃变增量补偿给 Tracker，并重置速度模型
         if (mpTracker)
         {
-            // 获取闭环优化前当前关键帧的旧位姿
-            Eigen::Matrix4f Tcw_cur_old = mpCurrentKF->GetPose(); // 需在 EssentialGraph 优化前记录旧位姿
-            // 闭环优化后当前关键帧的新位姿
+            // 获取闭环优化后当前关键帧的新位姿
             Eigen::Matrix4f Tcw_cur_new = mpCurrentKF->GetPose();
 
-            // 计算校正引起的变换增量: delta_T = Tcw_cur_new * Tcw_cur_old^-1
+            // 计算校正引起的真实变换增量
             Eigen::Matrix4f delta_T = Tcw_cur_new * Tcw_cur_old.inverse();
 
-            // 将该位姿跳变增量补偿到 Tracker 的当前帧、上一帧和速度模型中
+            // 将增量补偿到 Tracker 的当前帧与上一帧
             mpTracker->mCurrentFrame.SetPose(delta_T * mpTracker->mCurrentFrame.mTcw);
             mpTracker->mLastFrame.SetPose(delta_T * mpTracker->mLastFrame.mTcw);
+
+            // 重置恒速模型速度，避免使用跳变前的旧速度导致下一帧外推失配
+            mpTracker->ResetVelocity();
         }
     } // 离开 lockMap 作用域，释放地图锁
 
