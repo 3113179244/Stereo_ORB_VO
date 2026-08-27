@@ -1,17 +1,19 @@
-// Source File: Optimizer.cpp
 #include "Optimizer.h"
 #include "Map.h"
 #include "KeyFrame.h"
 #include "MapPoint.h"
 #include "MotionOnlyBA.h"
-
-#include <ceres/ceres.h>
 #include <ceres/rotation.h>
+#include <ceres/ceres.h>
+#include <sophus/se3.hpp>
 #include <Eigen/Core>
 #include <Eigen/Geometry>
 #include <map>
+#include <set>
+#include <vector>
 #include <algorithm>
 #include <cmath>
+#include <iostream>
 
 /**
  * @brief Ceres 迭代回调函数：用于在每次迭代结束时响应外部中断请求 (如插入新关键帧)
@@ -35,159 +37,309 @@ private:
 };
 
 /**
- * @brief 局部 BA 用的重投影误差（3D-2D）
+ * @brief 单目解析求导残差块（残差 2，参数块 0: 6维位姿增量, 参数块 1: 3维地图点）
  */
-struct LocalRepoError
+class LocalRepoErrorAnalytic : public ceres::SizedCostFunction<2, 6, 3>
 {
-    LocalRepoError(double fx, double fy, double cx, double cy,
-                   double u, double v, double sqrtInvSigma2)
+public:
+    LocalRepoErrorAnalytic(double fx, double fy, double cx, double cy,
+                           double u, double v, const Sophus::SE3d &T_cw_init, double sqrtInvSigma2)
         : fx_(fx), fy_(fy), cx_(cx), cy_(cy),
-          u_(u), v_(v), sqrtInvSigma2_(sqrtInvSigma2) {}
+          u_(u), v_(v), T_cw_init_(T_cw_init), sqrtInvSigma2_(sqrtInvSigma2) {}
 
-    template <typename T>
-    bool operator()(const T *const pose, const T *const point, T *residuals) const
+    virtual bool Evaluate(double const *const *parameters, double *residuals, double **jacobians) const override
     {
-        T p_w[3] = {point[0], point[1], point[2]};
-        T p_c[3];
+        const double *xi_raw = parameters[0];
+        const double *point = parameters[1];
 
-        ceres::AngleAxisRotatePoint(pose, p_w, p_c);
-        p_c[0] += pose[3];
-        p_c[1] += pose[4];
-        p_c[2] += pose[5];
+        // 1. 计算当前估计的位姿与空间点
+        Eigen::Matrix<double, 6, 1> xi;
+        xi << xi_raw[3], xi_raw[4], xi_raw[5], xi_raw[0], xi_raw[1], xi_raw[2];
+        Sophus::SE3d T_cw = Sophus::SE3d::exp(xi) * T_cw_init_;
 
-        const T invz = T(1.0) / p_c[2];
-        const T pred_u = fx_ * p_c[0] * invz + cx_;
-        const T pred_v = fy_ * p_c[1] * invz + cy_;
+        Eigen::Vector3d P_w(point[0], point[1], point[2]);
+        Eigen::Vector3d P_c = T_cw * P_w;
 
-        residuals[0] = (pred_u - T(u_)) * T(sqrtInvSigma2_);
-        residuals[1] = (pred_v - T(v_)) * T(sqrtInvSigma2_);
+        const double x = P_c[0];
+        const double y = P_c[1];
+        const double z = P_c[2];
+
+        if (z <= 1e-4)
+        {
+            residuals[0] = 0.0;
+            residuals[1] = 0.0;
+            if (jacobians)
+            {
+                if (jacobians[0])
+                    std::fill(jacobians[0], jacobians[0] + 12, 0.0); // 2x6
+                if (jacobians[1])
+                    std::fill(jacobians[1], jacobians[1] + 6, 0.0); // 2x3
+            }
+            return true; // 返回 true，避免 Ceres 报错
+        }
+
+        const double inv_z = 1.0 / z;
+        const double inv_z2 = inv_z * inv_z;
+
+        const double pred_u = fx_ * x * inv_z + cx_;
+        const double pred_v = fy_ * y * inv_z + cy_;
+
+        // 2. 残差
+        residuals[0] = (pred_u - u_) * sqrtInvSigma2_;
+        residuals[1] = (pred_v - v_) * sqrtInvSigma2_;
+
+        const double dedx_0 = fx_ * inv_z;
+        const double dedz_0 = -fx_ * x * inv_z2;
+        const double dedy_1 = fy_ * inv_z;
+        const double dedz_1 = -fy_ * y * inv_z2;
+
+        // 3. 对位姿求导 (2x6)
+        if (jacobians && jacobians[0])
+        {
+            double *j_pose = jacobians[0];
+
+            // du 对旋转与平移
+            j_pose[0] = sqrtInvSigma2_ * (dedz_0 * y);
+            j_pose[1] = sqrtInvSigma2_ * (dedx_0 * z - dedz_0 * x);
+            j_pose[2] = sqrtInvSigma2_ * (-dedx_0 * y);
+            j_pose[3] = sqrtInvSigma2_ * dedx_0;
+            j_pose[4] = 0.0;
+            j_pose[5] = sqrtInvSigma2_ * dedz_0;
+
+            // dv 对旋转与平移
+            j_pose[6] = sqrtInvSigma2_ * (-dedy_1 * z + dedz_1 * y);
+            j_pose[7] = sqrtInvSigma2_ * (-dedz_1 * x);
+            j_pose[8] = sqrtInvSigma2_ * (dedy_1 * x);
+            j_pose[9] = 0.0;
+            j_pose[10] = sqrtInvSigma2_ * dedy_1;
+            j_pose[11] = sqrtInvSigma2_ * dedz_1;
+        }
+
+        // 4. 对地图点求导 (2x3): J_point = J_Pc * R_cw
+        if (jacobians && jacobians[1])
+        {
+            double *j_pt = jacobians[1];
+            const Eigen::Matrix3d &R = T_cw.rotationMatrix();
+
+            // Row 0 (du): [dedx_0, 0, dedz_0] * R
+            j_pt[0] = sqrtInvSigma2_ * (dedx_0 * R(0, 0) + dedz_0 * R(2, 0));
+            j_pt[1] = sqrtInvSigma2_ * (dedx_0 * R(0, 1) + dedz_0 * R(2, 1));
+            j_pt[2] = sqrtInvSigma2_ * (dedx_0 * R(0, 2) + dedz_0 * R(2, 2));
+
+            // Row 1 (dv): [0, dedy_1, dedz_1] * R
+            j_pt[3] = sqrtInvSigma2_ * (dedy_1 * R(1, 0) + dedz_1 * R(2, 0));
+            j_pt[4] = sqrtInvSigma2_ * (dedy_1 * R(1, 1) + dedz_1 * R(2, 1));
+            j_pt[5] = sqrtInvSigma2_ * (dedy_1 * R(1, 2) + dedz_1 * R(2, 2));
+        }
+
         return true;
     }
 
-    static ceres::CostFunction *Create(double fx, double fy, double cx, double cy,
-                                       double u, double v, double sqrtInvSigma2)
-    {
-        return new ceres::AutoDiffCostFunction<LocalRepoError, 2, 6, 3>(
-            new LocalRepoError(fx, fy, cx, cy, u, v, sqrtInvSigma2));
-    }
-
+private:
     double fx_, fy_, cx_, cy_;
     double u_, v_;
+    Sophus::SE3d T_cw_init_;
     double sqrtInvSigma2_;
 };
+
 /**
- * @brief 局部 BA 用的双目重投影误差（3D-2D，带右目视差约束）
- * 适用于：双目近点 (u_r >= 0 且 Z < mThDepth)
+ * @brief 双目解析求导残差块（残差 3，参数块 0: 6维位姿增量, 参数块 1: 3维地图点）
  */
-struct LocalRepoErrorStereo
+class LocalRepoErrorStereoAnalytic : public ceres::SizedCostFunction<3, 6, 3>
 {
-    LocalRepoErrorStereo(double fx, double fy, double cx, double cy, double mbf,
-                         double u, double v, double u_r, double sqrtInvSigma2)
+public:
+    LocalRepoErrorStereoAnalytic(double fx, double fy, double cx, double cy, double mbf,
+                                 double u, double v, double u_r, const Sophus::SE3d &T_cw_init, double sqrtInvSigma2)
         : fx_(fx), fy_(fy), cx_(cx), cy_(cy), mbf_(mbf),
-          u_(u), v_(v), u_r_(u_r), sqrtInvSigma2_(sqrtInvSigma2) {}
+          u_(u), v_(v), u_r_(u_r), T_cw_init_(T_cw_init), sqrtInvSigma2_(sqrtInvSigma2) {}
 
-    template <typename T>
-    bool operator()(const T *const pose, const T *const point, T *residuals) const
+    virtual bool Evaluate(double const *const *parameters, double *residuals, double **jacobians) const override
     {
-        T p_w[3] = {point[0], point[1], point[2]};
-        T p_c[3];
+        const double *xi_raw = parameters[0];
+        const double *point = parameters[1];
 
-        ceres::AngleAxisRotatePoint(pose, p_w, p_c);
-        p_c[0] += pose[3];
-        p_c[1] += pose[4];
-        p_c[2] += pose[5];
+        Eigen::Matrix<double, 6, 1> xi;
+        xi << xi_raw[3], xi_raw[4], xi_raw[5], xi_raw[0], xi_raw[1], xi_raw[2];
+        Sophus::SE3d T_cw = Sophus::SE3d::exp(xi) * T_cw_init_;
 
-        const T invz = T(1.0) / p_c[2];
-        const T pred_u = fx_ * p_c[0] * invz + cx_;
-        const T pred_v = fy_ * p_c[1] * invz + cy_;
-        const T pred_ur = pred_u - T(mbf_) * invz;
+        Eigen::Vector3d P_w(point[0], point[1], point[2]);
+        Eigen::Vector3d P_c = T_cw * P_w;
 
-        residuals[0] = (pred_u - T(u_)) * T(sqrtInvSigma2_);
-        residuals[1] = (pred_v - T(v_)) * T(sqrtInvSigma2_);
-        residuals[2] = (pred_ur - T(u_r_)) * T(sqrtInvSigma2_);
+        const double x = P_c[0];
+        const double y = P_c[1];
+        const double z = P_c[2];
+
+        if (z <= 1e-4)
+        {
+            residuals[0] = 0.0;
+            residuals[1] = 0.0;
+            residuals[2] = 0.0;
+            if (jacobians)
+            {
+                if (jacobians[0])
+                    std::fill(jacobians[0], jacobians[0] + 18, 0.0); // 3x6
+                if (jacobians[1])
+                    std::fill(jacobians[1], jacobians[1] + 9, 0.0); // 3x3
+            }
+            return true; // 返回 true，避免 Ceres 报错
+        }
+
+        const double inv_z = 1.0 / z;
+        const double inv_z2 = inv_z * inv_z;
+
+        const double pred_u = fx_ * x * inv_z + cx_;
+        const double pred_v = fy_ * y * inv_z + cy_;
+        const double pred_ur = pred_u - mbf_ * inv_z;
+
+        // 残差
+        residuals[0] = (pred_u - u_) * sqrtInvSigma2_;
+        residuals[1] = (pred_v - v_) * sqrtInvSigma2_;
+        residuals[2] = (pred_ur - u_r_) * sqrtInvSigma2_;
+
+        const double dedx_0 = fx_ * inv_z;
+        const double dedz_0 = -fx_ * x * inv_z2;
+        const double dedy_1 = fy_ * inv_z;
+        const double dedz_1 = -fy_ * y * inv_z2;
+        const double dedx_2 = dedx_0;
+        const double dedz_2 = -(fx_ * x - mbf_) * inv_z2;
+
+        // 对位姿求导 (3x6)
+        if (jacobians && jacobians[0])
+        {
+            double *j_pose = jacobians[0];
+
+            // duL
+            j_pose[0] = sqrtInvSigma2_ * (dedz_0 * y);
+            j_pose[1] = sqrtInvSigma2_ * (dedx_0 * z - dedz_0 * x);
+            j_pose[2] = sqrtInvSigma2_ * (-dedx_0 * y);
+            j_pose[3] = sqrtInvSigma2_ * dedx_0;
+            j_pose[4] = 0.0;
+            j_pose[5] = sqrtInvSigma2_ * dedz_0;
+
+            // dvL
+            j_pose[6] = sqrtInvSigma2_ * (-dedy_1 * z + dedz_1 * y);
+            j_pose[7] = sqrtInvSigma2_ * (-dedz_1 * x);
+            j_pose[8] = sqrtInvSigma2_ * (dedy_1 * x);
+            j_pose[9] = 0.0;
+            j_pose[10] = sqrtInvSigma2_ * dedy_1;
+            j_pose[11] = sqrtInvSigma2_ * dedz_1;
+
+            // duR
+            j_pose[12] = sqrtInvSigma2_ * (dedz_2 * y);
+            j_pose[13] = sqrtInvSigma2_ * (dedx_2 * z - dedz_2 * x);
+            j_pose[14] = sqrtInvSigma2_ * (-dedx_2 * y);
+            j_pose[15] = sqrtInvSigma2_ * dedx_2;
+            j_pose[16] = 0.0;
+            j_pose[17] = sqrtInvSigma2_ * dedz_2;
+        }
+
+        // 对地图点求导 (3x3)
+        if (jacobians && jacobians[1])
+        {
+            double *j_pt = jacobians[1];
+            const Eigen::Matrix3d &R = T_cw.rotationMatrix();
+
+            // Row 0 (duL)
+            j_pt[0] = sqrtInvSigma2_ * (dedx_0 * R(0, 0) + dedz_0 * R(2, 0));
+            j_pt[1] = sqrtInvSigma2_ * (dedx_0 * R(0, 1) + dedz_0 * R(2, 1));
+            j_pt[2] = sqrtInvSigma2_ * (dedx_0 * R(0, 2) + dedz_0 * R(2, 2));
+
+            // Row 1 (dvL)
+            j_pt[3] = sqrtInvSigma2_ * (dedy_1 * R(1, 0) + dedz_1 * R(2, 0));
+            j_pt[4] = sqrtInvSigma2_ * (dedy_1 * R(1, 1) + dedz_1 * R(2, 1));
+            j_pt[5] = sqrtInvSigma2_ * (dedy_1 * R(1, 2) + dedz_1 * R(2, 2));
+
+            // Row 2 (duR)
+            j_pt[6] = sqrtInvSigma2_ * (dedx_2 * R(0, 0) + dedz_2 * R(2, 0));
+            j_pt[7] = sqrtInvSigma2_ * (dedx_2 * R(0, 1) + dedz_2 * R(2, 1));
+            j_pt[8] = sqrtInvSigma2_ * (dedx_2 * R(0, 2) + dedz_2 * R(2, 2));
+        }
+
         return true;
     }
 
-    static ceres::CostFunction *Create(double fx, double fy, double cx, double cy, double mbf,
-                                       double u, double v, double u_r, double sqrtInvSigma2)
-    {
-        return new ceres::AutoDiffCostFunction<LocalRepoErrorStereo, 3, 6, 3>(
-            new LocalRepoErrorStereo(fx, fy, cx, cy, mbf, u, v, u_r, sqrtInvSigma2));
-    }
-
+private:
     double fx_, fy_, cx_, cy_, mbf_;
     double u_, v_, u_r_;
+    Sophus::SE3d T_cw_init_;
     double sqrtInvSigma2_;
 };
 
 /**
- * @brief 6自由度 SE3 位姿图残差: 约束帧 i 到 帧 j 的相对测量 T_ij = T_iw * (T_jw)^-1
+ * @brief 位姿图 SE3 解析求导残差块（残差 6，参数块 0: 帧 i 扰动, 参数块 1: 帧 j 扰动）
  */
-struct PoseGraphEdgeError
+class PoseGraphSE3Analytic : public ceres::SizedCostFunction<6, 6, 6>
 {
-    PoseGraphEdgeError(const Eigen::Matrix4f &T_ij_meas)
+public:
+    PoseGraphSE3Analytic(const Sophus::SE3d &T_ij_meas, const Sophus::SE3d &T_iw_init, const Sophus::SE3d &T_jw_init)
+        : T_ij_meas_(T_ij_meas), T_iw_init_(T_iw_init), T_jw_init_(T_jw_init) {}
+
+    virtual bool Evaluate(double const *const *parameters, double *residuals, double **jacobians) const override
     {
-        Eigen::Matrix3d R_ij = T_ij_meas.block<3, 3>(0, 0).cast<double>();
-        t_ij_ = T_ij_meas.block<3, 1>(0, 3).cast<double>();
-        Eigen::AngleAxisd aa(R_ij);
-        r_ij_ = aa.angle() * aa.axis();
-    }
+        const double *xi_i_raw = parameters[0];
+        const double *xi_j_raw = parameters[1];
 
-    template <typename T>
-    bool operator()(const T *const pose_i, const T *const pose_j, T *residuals) const
-    {
-        // pose: [rx, ry, rz, tx, ty, tz] (代表世界到相机的旋转与平移: R_cw, t_cw)
-        T p_i[3] = {pose_i[0], pose_i[1], pose_i[2]};
-        T t_i[3] = {pose_i[3], pose_i[4], pose_i[5]};
-        T p_j[3] = {pose_j[0], pose_j[1], pose_j[2]};
-        T t_j[3] = {pose_j[3], pose_j[4], pose_j[5]};
+        Eigen::Matrix<double, 6, 1> xi_i, xi_j;
+        xi_i << xi_i_raw[3], xi_i_raw[4], xi_i_raw[5], xi_i_raw[0], xi_i_raw[1], xi_i_raw[2];
+        xi_j << xi_j_raw[3], xi_j_raw[4], xi_j_raw[5], xi_j_raw[0], xi_j_raw[1], xi_j_raw[2];
 
-        // 1. 计算 R_i 与 R_j 的四元数
-        T q_i[4], q_j[4];
-        ceres::AngleAxisToQuaternion(p_i, q_i);
-        ceres::AngleAxisToQuaternion(p_j, q_j);
+        Sophus::SE3d T_iw = Sophus::SE3d::exp(xi_i) * T_iw_init_;
+        Sophus::SE3d T_jw = Sophus::SE3d::exp(xi_j) * T_jw_init_;
 
-        // q_j_inv = [q_j[0], -q_j[1], -q_j[2], -q_j[3]]
-        T q_j_inv[4] = {q_j[0], -q_j[1], -q_j[2], -q_j[3]};
+        // 误差 e = log( T_ij_meas * T_jw * T_iw^-1 )
+        Sophus::SE3d T_ij_est = T_iw * T_jw.inverse();
+        Sophus::SE3d error_SE3 = T_ij_meas_ * T_ij_est.inverse();
+        
+        // 提取 6 维李代数残差 [omega, v]
+        Eigen::Matrix<double, 6, 1> error_vec = error_SE3.log(); // Sophus::log 返回 [v, w]
+        residuals[0] = error_vec[3]; // wx
+        residuals[1] = error_vec[4]; // wy
+        residuals[2] = error_vec[5]; // wz
+        residuals[3] = error_vec[0]; // vx
+        residuals[4] = error_vec[1]; // vy
+        residuals[5] = error_vec[2]; // vz
 
-        // 预测的相对旋转: R_ij_pred = R_i * R_j^T
-        T q_pred[4];
-        ceres::QuaternionProduct(q_i, q_j_inv, q_pred);
+        if (jacobians)
+        {
+            // 对帧 i 的偏导: J_i = -I (6x6)
+            if (jacobians[0])
+            {
+                std::fill(jacobians[0], jacobians[0] + 36, 0.0);
+                for (int k = 0; k < 6; ++k)
+                    jacobians[0][k * 6 + k] = -1.0;
+            }
 
-        // 预测的相对平移: t_ij_pred = t_i - R_i * R_j^T * t_j
-        T t_j_rotated[3];
-        ceres::QuaternionRotatePoint(q_pred, t_j, t_j_rotated);
-        T t_pred[3] = {t_i[0] - t_j_rotated[0], t_i[1] - t_j_rotated[1], t_i[2] - t_j_rotated[2]};
+            // 对帧 j 的偏导: J_j = Ad(T_ij_meas) (在 [w, v] 排布下)
+            if (jacobians[1])
+            {
+                std::fill(jacobians[1], jacobians[1] + 36, 0.0);
+                const Eigen::Matrix3d R = T_ij_meas_.rotationMatrix();
+                const Eigen::Vector3d t = T_ij_meas_.translation();
+                const Eigen::Matrix3d tx = Sophus::SO3d::hat(t); // [t]x
 
-        // 平移残差
-        residuals[0] = t_pred[0] - T(t_ij_[0]);
-        residuals[1] = t_pred[1] - T(t_ij_[1]);
-        residuals[2] = t_pred[2] - T(t_ij_[2]);
+                Eigen::Matrix<double, 6, 6> J_j = Eigen::Matrix<double, 6, 6>::Zero();
+                // [w] 对 [w] -> R
+                J_j.block<3, 3>(0, 0) = R;
+                // [w] 对 [v] -> 0
+                J_j.block<3, 3>(0, 3) = Eigen::Matrix3d::Zero();
+                // [v] 对 [w] -> [t]x * R
+                J_j.block<3, 3>(3, 0) = tx * R;
+                // [v] 对 [v] -> R
+                J_j.block<3, 3>(3, 3) = R;
 
-        // 旋转残差 (Angle-Axis 差值)
-        T q_meas[4];
-        T r_meas[3] = {T(r_ij_[0]), T(r_ij_[1]), T(r_ij_[2])};
-        ceres::AngleAxisToQuaternion(r_meas, q_meas);
-        T q_meas_inv[4] = {q_meas[0], -q_meas[1], -q_meas[2], -q_meas[3]};
-
-        T q_diff[4];
-        ceres::QuaternionProduct(q_meas_inv, q_pred, q_diff);
-
-        residuals[3] = T(2.0) * q_diff[1];
-        residuals[4] = T(2.0) * q_diff[2];
-        residuals[5] = T(2.0) * q_diff[3];
+                for (int r = 0; r < 6; ++r)
+                    for (int c = 0; c < 6; ++c)
+                        jacobians[1][r * 6 + c] = J_j(r, c);
+            }
+        }
 
         return true;
     }
 
-    static ceres::CostFunction *Create(const Eigen::Matrix4f &T_ij_meas)
-    {
-        return new ceres::AutoDiffCostFunction<PoseGraphEdgeError, 6, 6, 6>(
-            new PoseGraphEdgeError(T_ij_meas));
-    }
-
-    Eigen::Vector3d r_ij_;
-    Eigen::Vector3d t_ij_;
+private:
+    Sophus::SE3d T_ij_meas_;
+    Sophus::SE3d T_iw_init_;
+    Sophus::SE3d T_jw_init_;
 };
 
 static void PoseToArray(KeyFrame *pKF, double out[6])
@@ -229,15 +381,14 @@ int Optimizer::PoseOptimization(Frame *pFrame)
 }
 
 /**
- * @brief 局部 Bundle Adjustment (支持中断)
- * @param pbStopFlag 外部中断标志位指针（例如由 LocalMapping 线程传入）
+ * @brief 局部 Bundle Adjustment (解析求导版)
  */
 void Optimizer::LocalBundleAdjustment(KeyFrame *pCurKF, bool *pbStopFlag, std::shared_ptr<Map> pMap)
 {
     if (!pCurKF || !pMap || pCurKF->mbBad)
         return;
 
-    // Step 1~3: 收集局部关键帧、固定关键帧与局部地图点
+    // Step 1: 收集局部关键帧
     std::vector<KeyFrame *> vpLocalKFs;
     vpLocalKFs.push_back(pCurKF);
     {
@@ -249,10 +400,10 @@ void Optimizer::LocalBundleAdjustment(KeyFrame *pCurKF, bool *pbStopFlag, std::s
         }
     }
 
+    // Step 2: 收集固定关键帧
     std::vector<KeyFrame *> vpFixedKFs;
     for (size_t i = 0; i < vpLocalKFs.size(); ++i)
     {
-        // 扩大固定关键帧共视搜索范围 (从 5 扩大到 10)
         std::vector<KeyFrame *> vNeigh = vpLocalKFs[i]->GetBestCovisibilityKeyFrames(10);
         for (size_t j = 0; j < vNeigh.size(); ++j)
         {
@@ -267,6 +418,7 @@ void Optimizer::LocalBundleAdjustment(KeyFrame *pCurKF, bool *pbStopFlag, std::s
         }
     }
 
+    // Step 3: 收集局部地图点
     std::vector<MapPoint *> vpLocalMPs;
     std::set<MapPoint *> sLocalMPs;
     for (size_t i = 0; i < vpLocalKFs.size(); ++i)
@@ -289,92 +441,88 @@ void Optimizer::LocalBundleAdjustment(KeyFrame *pCurKF, bool *pbStopFlag, std::s
     if (nLocalKFs < 2 || nLocalMPs < 5)
         return;
 
-    // Step 4: 构建 Ceres 变量内存
-    std::map<KeyFrame *, double *> mapKFPose;
-    std::vector<double *> vPoseArrays;
-    for (int i = 0; i < nLocalKFs; ++i)
+    // 存储关键帧位姿态状态（Sophus::SE3d）
+    std::map<KeyFrame *, Sophus::SE3d> mapKF_SE3;
+    for (KeyFrame *pKF : vpLocalKFs)
     {
-        double *pose = new double[6];
-        PoseToArray(vpLocalKFs[i], pose);
-        mapKFPose[vpLocalKFs[i]] = pose;
-        vPoseArrays.push_back(pose);
+        Eigen::Matrix4f Tcw = pKF->GetPose();
+        Eigen::Matrix3d R = Tcw.block<3, 3>(0, 0).cast<double>();
+        Eigen::Vector3d t = Tcw.block<3, 1>(0, 3).cast<double>();
+        Eigen::Quaterniond q(R);
+        q.normalize();
+        mapKF_SE3[pKF] = Sophus::SE3d(q, t);
+    }
+    for (KeyFrame *pKF : vpFixedKFs)
+    {
+        Eigen::Matrix4f Tcw = pKF->GetPose();
+        Eigen::Matrix3d R = Tcw.block<3, 3>(0, 0).cast<double>();
+        Eigen::Vector3d t = Tcw.block<3, 1>(0, 3).cast<double>();
+        Eigen::Quaterniond q(R);
+        q.normalize();
+        mapKF_SE3[pKF] = Sophus::SE3d(q, t);
     }
 
-    std::map<KeyFrame *, double *> mapFixedPose;
-    for (size_t i = 0; i < vpFixedKFs.size(); ++i)
+    // 存储地图点 3D 坐标
+    std::map<MapPoint *, Eigen::Vector3d> mapMP_Point;
+    for (MapPoint *pMP : vpLocalMPs)
     {
-        double *pose = new double[6];
-        PoseToArray(vpFixedKFs[i], pose);
-        mapFixedPose[vpFixedKFs[i]] = pose;
+        Eigen::Vector3f pos = pMP->GetWorldPos();
+        mapMP_Point[pMP] = pos.cast<double>();
     }
 
-    std::map<MapPoint *, double *> mapMPPoint;
-    std::vector<double *> vPointArrays;
-    for (int i = 0; i < nLocalMPs; ++i)
-    {
-        double *p = new double[3];
-        const Eigen::Vector3f pos = vpLocalMPs[i]->GetWorldPos();
-        p[0] = pos[0];
-        p[1] = pos[1];
-        p[2] = pos[2];
-        mapMPPoint[vpLocalMPs[i]] = p;
-        vPointArrays.push_back(p);
-    }
-
-    auto CleanupMemory = [&]()
-    {
-        for (size_t i = 0; i < vPoseArrays.size(); ++i)
-            delete[] vPoseArrays[i];
-        for (auto &kv : mapFixedPose)
-            delete[] kv.second;
-        for (size_t i = 0; i < vPointArrays.size(); ++i)
-            delete[] vPointArrays[i];
-    };
-
-    // 配置 Ceres 求解器参数
+    // 求解器配置
     ceres::Solver::Options options;
     options.linear_solver_type = ceres::SPARSE_SCHUR;
     options.num_threads = 1;
     options.minimizer_progress_to_stdout = false;
-    options.update_state_every_iteration = true; // 确保每一步迭代的优化结果就地写入数组
+    options.function_tolerance = 1e-4;
+    options.gradient_tolerance = 1e-4;
 
     AbortCallback callback(pbStopFlag);
     if (pbStopFlag)
-    {
         options.callbacks.push_back(&callback);
-    }
 
-    // 第一阶段：粗优化（迭代 5 次）
+    // 第一阶段：粗优化（带 Huber 鲁棒核，迭代 5 次）
     options.max_num_iterations = 5;
     ceres::Problem problem1;
 
-    // 1. 注册局部关键帧
-    for (int i = 0; i < nLocalKFs; ++i)
+    // 为局部关键帧分配 6 维切空间扰动量参数块（初值为 0）
+    std::map<KeyFrame *, std::vector<double>> mapKF_delta_xi1;
+    for (KeyFrame *pKF : vpLocalKFs)
     {
-        KeyFrame *pKF = vpLocalKFs[i];
-        problem1.AddParameterBlock(mapKFPose[pKF], 6);
+        mapKF_delta_xi1[pKF] = std::vector<double>(6, 0.0);
+        problem1.AddParameterBlock(mapKF_delta_xi1[pKF].data(), 6);
         if (pKF->mnId == 0)
-            problem1.SetParameterBlockConstant(mapKFPose[pKF]);
+            problem1.SetParameterBlockConstant(mapKF_delta_xi1[pKF].data());
     }
 
-    // 2. 注册局部地图点
-    for (int i = 0; i < nLocalMPs; ++i)
+    // 为固定帧分配恒定参数块
+    std::map<KeyFrame *, std::vector<double>> mapFixed_delta_xi1;
+    for (KeyFrame *pKF : vpFixedKFs)
     {
-        problem1.AddParameterBlock(mapMPPoint[vpLocalMPs[i]], 3);
+        mapFixed_delta_xi1[pKF] = std::vector<double>(6, 0.0);
+        problem1.AddParameterBlock(mapFixed_delta_xi1[pKF].data(), 6);
+        problem1.SetParameterBlockConstant(mapFixed_delta_xi1[pKF].data());
     }
 
-    // 3. 添加局部关键帧观测残差
-    for (int i = 0; i < nLocalKFs; ++i)
+    // 注册地图点参数块
+    for (MapPoint *pMP : vpLocalMPs)
     {
-        KeyFrame *pKF = vpLocalKFs[i];
+        problem1.AddParameterBlock(mapMP_Point[pMP].data(), 3);
+    }
+
+    // 添加局部帧观测边
+    for (KeyFrame *pKF : vpLocalKFs)
+    {
         const double fx = pKF->fx, fy = pKF->fy, cx = pKF->cx, cy = pKF->cy;
         std::vector<MapPoint *> vpMPs = pKF->GetMapPointMatches();
-        double *pose = mapKFPose[pKF];
+        double *pose_param = mapKF_delta_xi1[pKF].data();
+        const Sophus::SE3d &T_init = mapKF_SE3[pKF];
 
         for (size_t j = 0; j < vpMPs.size(); ++j)
         {
             MapPoint *pMP = vpMPs[j];
-            if (!pMP || pMP->isBad() || !mapMPPoint.count(pMP))
+            if (!pMP || pMP->isBad() || !mapMP_Point.count(pMP))
                 continue;
 
             const cv::KeyPoint &kp = pKF->mvKeysUn[j];
@@ -388,36 +536,34 @@ void Optimizer::LocalBundleAdjustment(KeyFrame *pCurKF, bool *pbStopFlag, std::s
             const float depth = pKF->mvDepth[j];
 
             ceres::CostFunction *cost = nullptr;
-            // 判断是否是双目近点（带右目视差约束）
             if (u_r >= 0.0f && depth > 0.0f && depth < pKF->mThDepth)
             {
-                cost = LocalRepoErrorStereo::Create(fx, fy, cx, cy, pKF->mbf,
-                                                    kp.pt.x, kp.pt.y, u_r, sqrtInvSigma2);
+                cost = new LocalRepoErrorStereoAnalytic(fx, fy, cx, cy, pKF->mbf,
+                                                        kp.pt.x, kp.pt.y, u_r, T_init, sqrtInvSigma2);
             }
             else
             {
-                cost = LocalRepoError::Create(fx, fy, cx, cy, kp.pt.x, kp.pt.y, sqrtInvSigma2);
+                cost = new LocalRepoErrorAnalytic(fx, fy, cx, cy,
+                                                  kp.pt.x, kp.pt.y, T_init, sqrtInvSigma2);
             }
 
             ceres::LossFunction *loss = new ceres::HuberLoss(std::sqrt(5.991));
-            problem1.AddResidualBlock(cost, loss, pose, mapMPPoint[pMP]);
+            problem1.AddResidualBlock(cost, loss, pose_param, mapMP_Point[pMP].data());
         }
     }
 
-    // 4. 添加固定关键帧约束残差
-    for (size_t i = 0; i < vpFixedKFs.size(); ++i)
+    // 添加固定关键帧约束边
+    for (KeyFrame *pKF : vpFixedKFs)
     {
-        KeyFrame *pKF = vpFixedKFs[i];
         const double fx = pKF->fx, fy = pKF->fy, cx = pKF->cx, cy = pKF->cy;
         std::vector<MapPoint *> vpMPs = pKF->GetMapPointMatches();
-        double *pose = mapFixedPose[pKF];
-        problem1.AddParameterBlock(pose, 6);
-        problem1.SetParameterBlockConstant(pose);
+        double *pose_param = mapFixed_delta_xi1[pKF].data();
+        const Sophus::SE3d &T_init = mapKF_SE3[pKF];
 
         for (size_t j = 0; j < vpMPs.size(); ++j)
         {
             MapPoint *pMP = vpMPs[j];
-            if (!pMP || pMP->isBad() || !mapMPPoint.count(pMP))
+            if (!pMP || pMP->isBad() || !mapMP_Point.count(pMP))
                 continue;
 
             const cv::KeyPoint &kp = pKF->mvKeysUn[j];
@@ -428,25 +574,32 @@ void Optimizer::LocalBundleAdjustment(KeyFrame *pCurKF, bool *pbStopFlag, std::s
             const double invSigma2 = pKF->mvInvLevelSigma2[level];
             const double sqrtInvSigma2 = std::sqrt(invSigma2);
 
-            ceres::CostFunction *cost =
-                LocalRepoError::Create(fx, fy, cx, cy, kp.pt.x, kp.pt.y, sqrtInvSigma2);
+            ceres::CostFunction *cost = new LocalRepoErrorAnalytic(fx, fy, cx, cy,
+                                                                   kp.pt.x, kp.pt.y, T_init, sqrtInvSigma2);
             ceres::LossFunction *loss = new ceres::HuberLoss(std::sqrt(5.991));
-            problem1.AddResidualBlock(cost, loss, pose, mapMPPoint[pMP]);
+            problem1.AddResidualBlock(cost, loss, pose_param, mapMP_Point[pMP].data());
         }
     }
 
     ceres::Solver::Summary summary1;
     ceres::Solve(options, &problem1, &summary1);
-
-    // 检查中断标志：若被中断，则跳过外点剔除与第二阶段精优化
-    bool bDoMore = true;
-    if (pbStopFlag && *pbStopFlag)
+    // std::cout << "========== [Local BA] Stage 1 (Coarse with Huber) ==========\n"
+    //           << summary1.FullReport() << std::endl;
+    // 第一阶段求解完成后，将位姿增量回写到 mapKF_SE3
+    for (KeyFrame *pKF : vpLocalKFs)
     {
-        bDoMore = false;
+        const auto &d_xi = mapKF_delta_xi1[pKF];
+        Eigen::Matrix<double, 6, 1> xi;
+        xi << d_xi[3], d_xi[4], d_xi[5], d_xi[0], d_xi[1], d_xi[2];
+        mapKF_SE3[pKF] = Sophus::SE3d::exp(xi) * mapKF_SE3[pKF];
     }
 
-    // 记录各关键帧中的单次外点观测: <MapPoint*, KeyFrame*>
-    std::vector<std::pair<KeyFrame*, MapPoint*>> vToEraseObservations;
+    bool bDoMore = true;
+    if (pbStopFlag && *pbStopFlag)
+        bDoMore = false;
+
+    // 卡方检验剔除外点
+    std::vector<std::pair<KeyFrame *, MapPoint *>> vToEraseObservations;
 
     if (bDoMore)
     {
@@ -456,35 +609,18 @@ void Optimizer::LocalBundleAdjustment(KeyFrame *pCurKF, bool *pbStopFlag, std::s
         for (int i = 0; i < nLocalMPs; ++i)
         {
             MapPoint *pMP = vpLocalMPs[i];
-            const double *p = mapMPPoint[pMP];
-            const Eigen::Vector3d Pw(p[0], p[1], p[2]);
+            const Eigen::Vector3d &Pw = mapMP_Point[pMP];
 
             std::map<KeyFrame *, size_t> obs = pMP->GetObservations();
             for (auto mit = obs.begin(); mit != obs.end(); ++mit)
             {
                 KeyFrame *pKF = mit->first;
                 const size_t idx = mit->second;
-                if (idx >= pKF->mvKeysUn.size())
+                if (idx >= pKF->mvKeysUn.size() || !mapKF_SE3.count(pKF))
                     continue;
 
-                double *pose = nullptr;
-                auto itL = mapKFPose.find(pKF);
-                auto itF = mapFixedPose.find(pKF);
-                if (itL != mapKFPose.end())
-                    pose = itL->second;
-                else if (itF != mapFixedPose.end())
-                    pose = itF->second;
-                else
-                    continue;
-
-                // 安全提取旋转，防止 0 向量调用 normalized() 产生 NaN 污染
-                Eigen::Vector3d r_vec(pose[0], pose[1], pose[2]);
-                double angle = r_vec.norm();
-                Eigen::Matrix3d R_cw = Eigen::Matrix3d::Identity();
-                if (angle > 1e-12)
-                    R_cw = Eigen::AngleAxisd(angle, r_vec.normalized()).toRotationMatrix();
-
-                Eigen::Vector3d Pc = R_cw * Pw + Eigen::Vector3d(pose[3], pose[4], pose[5]);
+                const Sophus::SE3d &T_cw = mapKF_SE3[pKF];
+                Eigen::Vector3d Pc = T_cw * Pw;
                 if (Pc.z() <= 0.0)
                 {
                     vToEraseObservations.push_back(std::make_pair(pKF, pMP));
@@ -503,63 +639,65 @@ void Optimizer::LocalBundleAdjustment(KeyFrame *pCurKF, bool *pbStopFlag, std::s
                 const float u_r = pKF->mvuRight[idx];
                 const float depth = pKF->mvDepth[idx];
 
-                // 双目近点 3DoF 与单目/远点 2DoF 卡方检验
                 if (u_r >= 0.0f && depth > 0.0f && depth < pKF->mThDepth)
                 {
                     const double u_r_proj = u - pKF->mbf * invz;
                     const double du_r = u_r_proj - u_r;
                     const double chi2 = (du * du + dv * dv + du_r * du_r) * invSigma2;
                     if (chi2 > chi2_stereo)
-                    {
-                        // 【修复点 2】：仅记录此帧对该点的异常观测，不全局销毁 MapPoint
                         vToEraseObservations.push_back(std::make_pair(pKF, pMP));
-                    }
                 }
                 else
                 {
                     const double chi2 = (du * du + dv * dv) * invSigma2;
                     if (chi2 > chi2_mono)
-                    {
                         vToEraseObservations.push_back(std::make_pair(pKF, pMP));
-                    }
                 }
             }
         }
 
-        // 第二阶段：纯内点精优化（迭代 10 次）
+
+        // 第二阶段：纯内点精优化（无 Huber 核，迭代 10 次）
+
         options.max_num_iterations = 10;
         ceres::Problem problem2;
 
-        // 注册局部关键帧
-        for (int i = 0; i < nLocalKFs; ++i)
+        std::map<KeyFrame *, std::vector<double>> mapKF_delta_xi2;
+        for (KeyFrame *pKF : vpLocalKFs)
         {
-            KeyFrame *pKF = vpLocalKFs[i];
-            problem2.AddParameterBlock(mapKFPose[pKF], 6);
+            mapKF_delta_xi2[pKF] = std::vector<double>(6, 0.0);
+            problem2.AddParameterBlock(mapKF_delta_xi2[pKF].data(), 6);
             if (pKF->mnId == 0)
-                problem2.SetParameterBlockConstant(mapKFPose[pKF]);
+                problem2.SetParameterBlockConstant(mapKF_delta_xi2[pKF].data());
         }
 
-        // 注册所有局部地图点
-        for (int i = 0; i < nLocalMPs; ++i)
+        std::map<KeyFrame *, std::vector<double>> mapFixed_delta_xi2;
+        for (KeyFrame *pKF : vpFixedKFs)
         {
-            problem2.AddParameterBlock(mapMPPoint[vpLocalMPs[i]], 3);
+            mapFixed_delta_xi2[pKF] = std::vector<double>(6, 0.0);
+            problem2.AddParameterBlock(mapFixed_delta_xi2[pKF].data(), 6);
+            problem2.SetParameterBlockConstant(mapFixed_delta_xi2[pKF].data());
         }
 
-        // 建立外点快速检索哈希表
-        std::set<std::pair<KeyFrame*, MapPoint*>> sEraseObs(vToEraseObservations.begin(), vToEraseObservations.end());
+        for (MapPoint *pMP : vpLocalMPs)
+        {
+            problem2.AddParameterBlock(mapMP_Point[pMP].data(), 3);
+        }
+
+        std::set<std::pair<KeyFrame *, MapPoint *>> sEraseObs(vToEraseObservations.begin(), vToEraseObservations.end());
 
         // 局部帧内点残差
-        for (int i = 0; i < nLocalKFs; ++i)
+        for (KeyFrame *pKF : vpLocalKFs)
         {
-            KeyFrame *pKF = vpLocalKFs[i];
             const double fx = pKF->fx, fy = pKF->fy, cx = pKF->cx, cy = pKF->cy;
             std::vector<MapPoint *> vpMPs = pKF->GetMapPointMatches();
-            double *pose = mapKFPose[pKF];
+            double *pose_param = mapKF_delta_xi2[pKF].data();
+            const Sophus::SE3d &T_init = mapKF_SE3[pKF];
 
             for (size_t j = 0; j < vpMPs.size(); ++j)
             {
                 MapPoint *pMP = vpMPs[j];
-                if (!pMP || pMP->isBad() || !mapMPPoint.count(pMP) || sEraseObs.count(std::make_pair(pKF, pMP)))
+                if (!pMP || pMP->isBad() || !mapMP_Point.count(pMP) || sEraseObs.count(std::make_pair(pKF, pMP)))
                     continue;
 
                 const cv::KeyPoint &kp = pKF->mvKeysUn[j];
@@ -575,33 +713,31 @@ void Optimizer::LocalBundleAdjustment(KeyFrame *pCurKF, bool *pbStopFlag, std::s
                 ceres::CostFunction *cost = nullptr;
                 if (u_r >= 0.0f && depth > 0.0f && depth < pKF->mThDepth)
                 {
-                    cost = LocalRepoErrorStereo::Create(fx, fy, cx, cy, pKF->mbf,
-                                                        kp.pt.x, kp.pt.y, u_r, sqrtInvSigma2);
+                    cost = new LocalRepoErrorStereoAnalytic(fx, fy, cx, cy, pKF->mbf,
+                                                            kp.pt.x, kp.pt.y, u_r, T_init, sqrtInvSigma2);
                 }
                 else
                 {
-                    cost = LocalRepoError::Create(fx, fy, cx, cy, kp.pt.x, kp.pt.y, sqrtInvSigma2);
+                    cost = new LocalRepoErrorAnalytic(fx, fy, cx, cy,
+                                                      kp.pt.x, kp.pt.y, T_init, sqrtInvSigma2);
                 }
 
-                ceres::LossFunction *loss = new ceres::HuberLoss(std::sqrt(5.991));
-                problem2.AddResidualBlock(cost, loss, pose, mapMPPoint[pMP]);
+                problem2.AddResidualBlock(cost, nullptr, pose_param, mapMP_Point[pMP].data());
             }
         }
 
         // 固定帧内点残差
-        for (size_t i = 0; i < vpFixedKFs.size(); ++i)
+        for (KeyFrame *pKF : vpFixedKFs)
         {
-            KeyFrame *pKF = vpFixedKFs[i];
             const double fx = pKF->fx, fy = pKF->fy, cx = pKF->cx, cy = pKF->cy;
             std::vector<MapPoint *> vpMPs = pKF->GetMapPointMatches();
-            double *pose = mapFixedPose[pKF];
-            problem2.AddParameterBlock(pose, 6);
-            problem2.SetParameterBlockConstant(pose);
+            double *pose_param = mapFixed_delta_xi2[pKF].data();
+            const Sophus::SE3d &T_init = mapKF_SE3[pKF];
 
             for (size_t j = 0; j < vpMPs.size(); ++j)
             {
                 MapPoint *pMP = vpMPs[j];
-                if (!pMP || pMP->isBad() || !mapMPPoint.count(pMP) || sEraseObs.count(std::make_pair(pKF, pMP)))
+                if (!pMP || pMP->isBad() || !mapMP_Point.count(pMP) || sEraseObs.count(std::make_pair(pKF, pMP)))
                     continue;
 
                 const cv::KeyPoint &kp = pKF->mvKeysUn[j];
@@ -612,29 +748,34 @@ void Optimizer::LocalBundleAdjustment(KeyFrame *pCurKF, bool *pbStopFlag, std::s
                 const double invSigma2 = pKF->mvInvLevelSigma2[level];
                 const double sqrtInvSigma2 = std::sqrt(invSigma2);
 
-                ceres::CostFunction *cost =
-                    LocalRepoError::Create(fx, fy, cx, cy, kp.pt.x, kp.pt.y, sqrtInvSigma2);
-                ceres::LossFunction *loss = new ceres::HuberLoss(std::sqrt(5.991));
-                problem2.AddResidualBlock(cost, loss, pose, mapMPPoint[pMP]);
+                ceres::CostFunction *cost = new LocalRepoErrorAnalytic(fx, fy, cx, cy,
+                                                                       kp.pt.x, kp.pt.y, T_init, sqrtInvSigma2);
+                problem2.AddResidualBlock(cost, nullptr, pose_param, mapMP_Point[pMP].data());
             }
         }
 
         ceres::Solver::Summary summary2;
         ceres::Solve(options, &problem2, &summary2);
+        // std::cout << "========== [Local BA] Stage 2 (Inliers Refinement) ==========\n"
+        //           << summary2.FullReport() << std::endl;
+        // 将第二阶段增量更新回位姿
+        for (KeyFrame *pKF : vpLocalKFs)
+        {
+            const auto &d_xi = mapKF_delta_xi2[pKF];
+            Eigen::Matrix<double, 6, 1> xi;
+            xi << d_xi[3], d_xi[4], d_xi[5], d_xi[0], d_xi[1], d_xi[2];
+            mapKF_SE3[pKF] = Sophus::SE3d::exp(xi) * mapKF_SE3[pKF];
+        }
     }
 
-    // Step 5: 优化结果回写
+    // Step 5: 回写优化结果
     if (pbStopFlag && *pbStopFlag)
-    {
-        CleanupMemory();
-        return; // 中断保护
-    }
+        return;
 
-    // 加持地图全局互斥锁，防止与 Tracking / LoopClosing 线程并发冲突
     {
         std::unique_lock<std::mutex> lock(pMap->mMutexMapUpdate);
 
-        // 1. 精准剔除单帧外点观测
+        // 1. 剔除单帧外点观测
         for (size_t i = 0; i < vToEraseObservations.size(); ++i)
         {
             KeyFrame *pKF = vToEraseObservations[i].first;
@@ -647,28 +788,23 @@ void Optimizer::LocalBundleAdjustment(KeyFrame *pCurKF, bool *pbStopFlag, std::s
         }
 
         // 2. 回写关键帧位姿
-        for (int i = 0; i < nLocalKFs; ++i)
+        for (KeyFrame *pKF : vpLocalKFs)
         {
-            ArrayToPose(vpLocalKFs[i], mapKFPose[vpLocalKFs[i]]);
+            Eigen::Matrix4f Tcw = mapKF_SE3[pKF].matrix().cast<float>();
+            pKF->SetPose(Tcw);
         }
 
-        // 3. 回写地图点 3D 坐标与法向量
-        for (int i = 0; i < nLocalMPs; ++i)
+        // 3. 回写地图点坐标
+        for (MapPoint *pMP : vpLocalMPs)
         {
-            MapPoint *pMP = vpLocalMPs[i];
             if (pMP->isBad())
                 continue;
 
-            double *p = mapMPPoint[pMP];
-            pMP->SetWorldPos(Eigen::Vector3f(static_cast<float>(p[0]),
-                                             static_cast<float>(p[1]),
-                                             static_cast<float>(p[2])));
+            const Eigen::Vector3d &p = mapMP_Point[pMP];
+            pMP->SetWorldPos(p.cast<float>());
             pMP->UpdateNormalAndDepth();
         }
-    } // 离开大括号自动释放 mMutexMapUpdate 锁
-
-    // Step 6: 释放内存
-    CleanupMemory();
+    }
 }
 
 void Optimizer::OptimizeEssentialGraph(Map *pMap, KeyFrame *pLoopKF, KeyFrame *pCurKF, const Eigen::Matrix4f &Tcw_loop)
@@ -679,39 +815,32 @@ void Optimizer::OptimizeEssentialGraph(Map *pMap, KeyFrame *pLoopKF, KeyFrame *p
         return;
 
     ceres::Problem problem;
-    ceres::LossFunction *loss_function = new ceres::HuberLoss(0.5); // 调小核函数阈值，降低奇异外点拉扯
+    ceres::LossFunction *loss_function = new ceres::HuberLoss(0.5);
 
-    std::map<KeyFrame *, Eigen::Matrix4f> mapOldPoses;
-    std::map<KeyFrame *, double *> mapPoses;
+    std::map<KeyFrame *, Sophus::SE3d> mapOldPoses;
+    std::map<KeyFrame *, std::vector<double>> mapKF_delta;
 
     for (KeyFrame *pKF : vpKFs)
     {
         if (!pKF || pKF->mbBad)
             continue;
-        double *pose = new double[6];
 
         Eigen::Matrix4f Tcw = pKF->GetPose();
-        mapOldPoses[pKF] = Tcw;
-
         Eigen::Matrix3d R = Tcw.block<3, 3>(0, 0).cast<double>();
         Eigen::Vector3d t = Tcw.block<3, 1>(0, 3).cast<double>();
-        Eigen::AngleAxisd aa(R);
-        Eigen::Vector3d r = aa.angle() * aa.axis();
+        Eigen::Quaterniond q(R);
+        q.normalize();
+        Sophus::SE3d T_cw(q, t);
 
-        pose[0] = r.x();
-        pose[1] = r.y();
-        pose[2] = r.z();
-        pose[3] = t.x();
-        pose[4] = t.y();
-        pose[5] = t.z();
+        mapOldPoses[pKF] = T_cw;
+        mapKF_delta[pKF] = std::vector<double>(6, 0.0);
 
-        mapPoses[pKF] = pose;
-        problem.AddParameterBlock(pose, 6);
+        problem.AddParameterBlock(mapKF_delta[pKF].data(), 6);
 
         // 固定初始第 0 帧与闭环目标帧，作为绝对基准
         if (pKF->mnId == 0 || pKF == pLoopKF)
         {
-            problem.SetParameterBlockConstant(pose);
+            problem.SetParameterBlockConstant(mapKF_delta[pKF].data());
         }
     }
 
@@ -721,27 +850,32 @@ void Optimizer::OptimizeEssentialGraph(Map *pMap, KeyFrame *pLoopKF, KeyFrame *p
         if (!pKF || pKF->mbBad || pKF->mnId == 0)
             continue;
         KeyFrame *pParent = pKF->GetParent();
-
-        // 跳过父节点等于自身的异常情况
-        if (!pParent || pParent == pKF || !mapPoses.count(pParent) || !mapPoses.count(pKF))
+        if (!pParent || pParent == pKF || !mapOldPoses.count(pParent) || !mapOldPoses.count(pKF))
             continue;
 
-        Eigen::Matrix4f T_child_parent = mapOldPoses[pKF] * mapOldPoses[pParent].inverse();
+        Sophus::SE3d T_child_parent_meas = mapOldPoses[pKF] * mapOldPoses[pParent].inverse();
 
-        problem.AddResidualBlock(PoseGraphEdgeError::Create(T_child_parent),
-                                 loss_function,
-                                 mapPoses[pKF], mapPoses[pParent]);
+        ceres::CostFunction *cost = new PoseGraphSE3Analytic(
+            T_child_parent_meas, mapOldPoses[pKF], mapOldPoses[pParent]);
+        problem.AddResidualBlock(cost, loss_function,
+                                 mapKF_delta[pKF].data(), mapKF_delta[pParent].data());
     }
 
     // 2. 添加闭环强约束边
-    // 确保 pCurKF != pLoopKF
-    if (pCurKF != pLoopKF && mapPoses.count(pCurKF) && mapPoses.count(pLoopKF))
+    if (pCurKF != pLoopKF && mapOldPoses.count(pCurKF) && mapOldPoses.count(pLoopKF))
     {
-        Eigen::Matrix4f T_cur_loop = Tcw_loop * mapOldPoses[pLoopKF].inverse();
+        Eigen::Matrix3d R_loop = Tcw_loop.block<3, 3>(0, 0).cast<double>();
+        Eigen::Vector3d t_loop = Tcw_loop.block<3, 1>(0, 3).cast<double>();
+        Eigen::Quaterniond q_loop(R_loop);
+        q_loop.normalize();
+        Sophus::SE3d Tcw_loop_se3(q_loop, t_loop);
 
-        problem.AddResidualBlock(PoseGraphEdgeError::Create(T_cur_loop),
-                                 nullptr,
-                                 mapPoses[pCurKF], mapPoses[pLoopKF]);
+        Sophus::SE3d T_cur_loop_meas = Tcw_loop_se3 * mapOldPoses[pLoopKF].inverse();
+
+        ceres::CostFunction *cost = new PoseGraphSE3Analytic(
+            T_cur_loop_meas, mapOldPoses[pCurKF], mapOldPoses[pLoopKF]);
+        problem.AddResidualBlock(cost, nullptr,
+                                 mapKF_delta[pCurKF].data(), mapKF_delta[pLoopKF].data());
     }
 
     // 3. 求解位姿图
@@ -754,30 +888,20 @@ void Optimizer::OptimizeEssentialGraph(Map *pMap, KeyFrame *pLoopKF, KeyFrame *p
     ceres::Solve(options, &problem, &summary);
 
     // 4. 回写优化后的位姿
-    std::map<KeyFrame *, Eigen::Matrix4f> mapNewPoses;
-    for (auto &kv : mapPoses)
+    std::map<KeyFrame *, Sophus::SE3d> mapNewPoses;
+    for (auto &kv : mapOldPoses)
     {
         KeyFrame *pKF = kv.first;
-        double *pose = kv.second;
+        const auto &d = mapKF_delta[pKF];
+        Eigen::Matrix<double, 6, 1> xi;
+        xi << d[3], d[4], d[5], d[0], d[1], d[2];
+        Sophus::SE3d T_new = Sophus::SE3d::exp(xi) * kv.second;
 
-        Eigen::Vector3d r(pose[0], pose[1], pose[2]);
-        Eigen::Vector3d t(pose[3], pose[4], pose[5]);
-        double angle = r.norm();
-        Eigen::Matrix3d R = Eigen::Matrix3d::Identity();
-        if (angle > 1e-12)
-            R = Eigen::AngleAxisd(angle, r.normalized()).toRotationMatrix();
-
-        Eigen::Matrix4f Tcw = Eigen::Matrix4f::Identity();
-        Tcw.block<3, 3>(0, 0) = R.cast<float>();
-        Tcw.block<3, 1>(0, 3) = t.cast<float>();
-
-        pKF->SetPose(Tcw);
-        mapNewPoses[pKF] = Tcw;
-
-        delete[] pose;
+        pKF->SetPose(T_new.matrix().cast<float>());
+        mapNewPoses[pKF] = T_new;
     }
 
-    // 5. 地图点纠正：根据参考关键帧优化前后的位姿差更新 3D 空间坐标
+    // 5. 地图点根据参考帧位姿变化更新
     std::vector<MapPoint *> vpAllMPs = pMap->GetAllMapPoints();
     for (MapPoint *pMP : vpAllMPs)
     {
@@ -787,15 +911,13 @@ void Optimizer::OptimizeEssentialGraph(Map *pMap, KeyFrame *pLoopKF, KeyFrame *p
         if (!pRefKF || !mapOldPoses.count(pRefKF) || !mapNewPoses.count(pRefKF))
             continue;
 
-        Eigen::Matrix4f T_old_cw = mapOldPoses[pRefKF];
-        Eigen::Matrix4f T_new_wc = mapNewPoses[pRefKF].inverse();
+        Sophus::SE3d T_old_cw = mapOldPoses[pRefKF];
+        Sophus::SE3d T_new_wc = mapNewPoses[pRefKF].inverse();
 
-        Eigen::Vector3f Pw_old = pMP->GetWorldPos();
-        Eigen::Vector4f Pw_homo(Pw_old.x(), Pw_old.y(), Pw_old.z(), 1.0f);
+        Eigen::Vector3d Pw_old = pMP->GetWorldPos().cast<double>();
+        Eigen::Vector3d Pw_new = T_new_wc * (T_old_cw * Pw_old);
 
-        // 将点变换到参考帧旧相机坐标系下，再通过新位姿反投影回世界坐标系
-        Eigen::Vector4f Pw_new = T_new_wc * (T_old_cw * Pw_homo);
-        pMP->SetWorldPos(Pw_new.head<3>());
+        pMP->SetWorldPos(Pw_new.cast<float>());
         pMP->UpdateNormalAndDepth();
     }
 }
@@ -810,62 +932,62 @@ void Optimizer::GlobalBundleAdjustment(Map *pMap, int nIterations, bool *pbStopF
     if (vpKFs.size() < 2 || vpMPs.empty())
         return;
 
-    ceres::Problem problem;
-    ceres::LossFunction *loss_function = new ceres::HuberLoss(std::sqrt(5.991));
-
-    // 1. 注册关键帧与地图点
-    std::map<KeyFrame *, double *> mapKFPose;
-    std::vector<double *> vPoseArrays;
-    vPoseArrays.reserve(vpKFs.size());
-
+    // 1. 初始化关键帧 SE3 位姿与地图点
+    std::map<KeyFrame *, Sophus::SE3d> mapKF_SE3;
     for (KeyFrame *pKF : vpKFs)
     {
         if (!pKF || pKF->mbBad)
             continue;
-        double *pose = new double[6];
-        PoseToArray(pKF, pose);
-        mapKFPose[pKF] = pose;
-        vPoseArrays.push_back(pose);
-
-        problem.AddParameterBlock(pose, 6);
-        if (pKF->mnId == 0)
-            problem.SetParameterBlockConstant(pose); // 锚定第一帧
+        Eigen::Matrix4f Tcw = pKF->GetPose();
+        Eigen::Matrix3d R = Tcw.block<3, 3>(0, 0).cast<double>();
+        Eigen::Vector3d t = Tcw.block<3, 1>(0, 3).cast<double>();
+        Eigen::Quaterniond q(R);
+        q.normalize();
+        mapKF_SE3[pKF] = Sophus::SE3d(q, t);
     }
 
-    std::map<MapPoint *, double *> mapMPPoint;
-    std::vector<double *> vPointArrays;
-    vPointArrays.reserve(vpMPs.size());
-
+    std::map<MapPoint *, Eigen::Vector3d> mapMP_Point;
     for (MapPoint *pMP : vpMPs)
     {
         if (!pMP || pMP->isBad() || pMP->GetObservations().size() < 2)
             continue;
-
-        double *point = new double[3];
-        const Eigen::Vector3f pos = pMP->GetWorldPos();
-        point[0] = pos[0];
-        point[1] = pos[1];
-        point[2] = pos[2];
-
-        mapMPPoint[pMP] = point;
-        vPointArrays.push_back(point);
-        problem.AddParameterBlock(point, 3);
+        Eigen::Vector3f pos = pMP->GetWorldPos();
+        mapMP_Point[pMP] = pos.cast<double>();
     }
 
-    // 2. 添加观测残差边
-    for (KeyFrame *pKF : vpKFs)
-    {
-        if (!pKF || pKF->mbBad || !mapKFPose.count(pKF))
-            continue;
+    ceres::Problem problem;
+    ceres::LossFunction *loss_function = new ceres::HuberLoss(std::sqrt(5.991));
 
-        double *pose = mapKFPose[pKF];
+    // 2. 注册关键帧增量参数块 (6维)
+    std::map<KeyFrame *, std::vector<double>> mapKF_delta;
+    for (auto &kv : mapKF_SE3)
+    {
+        KeyFrame *pKF = kv.first;
+        mapKF_delta[pKF] = std::vector<double>(6, 0.0);
+        problem.AddParameterBlock(mapKF_delta[pKF].data(), 6);
+        if (pKF->mnId == 0)
+            problem.SetParameterBlockConstant(mapKF_delta[pKF].data()); // 锚定第一帧
+    }
+
+    // 3. 注册地图点参数块 (3维)
+    for (auto &kv : mapMP_Point)
+    {
+        problem.AddParameterBlock(kv.second.data(), 3);
+    }
+
+    // 4. 添加观测残差边
+    for (auto &kv : mapKF_SE3)
+    {
+        KeyFrame *pKF = kv.first;
         const double fx = pKF->fx, fy = pKF->fy, cx = pKF->cx, cy = pKF->cy;
         const std::vector<MapPoint *> vpMatches = pKF->GetMapPointMatches();
+        double *pose_param = mapKF_delta[pKF].data();
+        const Sophus::SE3d &T_init = kv.second;
 
         for (size_t i = 0; i < vpMatches.size(); ++i)
         {
             MapPoint *pMP = vpMatches[i];
-            if (!pMP || pMP->isBad() || !mapMPPoint.count(pMP))
+            if (!pMP || pMP->isBad() || !mapMP_Point.count(pMP))
                 continue;
 
             const cv::KeyPoint &kp = pKF->mvKeysUn[i];
@@ -881,63 +1003,56 @@ void Optimizer::GlobalBundleAdjustment(Map *pMap, int nIterations, bool *pbStopF
             ceres::CostFunction *cost = nullptr;
             if (u_r >= 0.0f && depth > 0.0f && depth < pKF->mThDepth)
             {
-                cost = LocalRepoErrorStereo::Create(fx, fy, cx, cy, pKF->mbf,
-                                                    kp.pt.x, kp.pt.y, u_r, sqrtInvSigma2);
+                cost = new LocalRepoErrorStereoAnalytic(fx, fy, cx, cy, pKF->mbf,
+                                                       kp.pt.x, kp.pt.y, u_r, T_init, sqrtInvSigma2);
             }
             else
             {
-                cost = LocalRepoError::Create(fx, fy, cx, cy, kp.pt.x, kp.pt.y, sqrtInvSigma2);
+                cost = new LocalRepoErrorAnalytic(fx, fy, cx, cy,
+                                                  kp.pt.x, kp.pt.y, T_init, sqrtInvSigma2);
             }
-            problem.AddResidualBlock(cost, loss_function, pose, mapMPPoint[pMP]);
+            problem.AddResidualBlock(cost, loss_function, pose_param, mapMP_Point[pMP].data());
         }
     }
 
-    // 3. 配置 Ceres 求解器并添加 AbortCallback 中断支持
+    // 5. 配置并求解
     ceres::Solver::Options options;
     options.linear_solver_type = ceres::SPARSE_SCHUR;
     options.max_num_iterations = nIterations;
-    options.num_threads = 4;
+    options.num_threads = 1;
     options.minimizer_progress_to_stdout = false;
 
     AbortCallback callback(pbStopFlag);
     if (pbStopFlag)
-    {
         options.callbacks.push_back(&callback);
-    }
 
     ceres::Solver::Summary summary;
     ceres::Solve(options, &problem, &summary);
 
-    auto CleanupMemory = [&]()
-    {
-        for (double *ptr : vPoseArrays)
-            delete[] ptr;
-        for (double *ptr : vPointArrays)
-            delete[] ptr;
-    };
-
-    // 4. 如果被外部新闭环打断，放弃回写优化位姿
     if (pbStopFlag && *pbStopFlag)
-    {
-        CleanupMemory();
-        return;
-    }
+        return; // 被中断则放弃回写
 
-    // 5. 回写优化结果
-    for (auto &kv : mapKFPose)
+    // 6. 回写优化结果
     {
-        ArrayToPose(kv.first, kv.second);
-    }
+        std::unique_lock<std::mutex> lock(pMap->mMutexMapUpdate);
 
-    for (auto &kv : mapMPPoint)
-    {
-        MapPoint *pMP = kv.first;
-        double *p = kv.second;
-        pMP->SetWorldPos(Eigen::Vector3f(static_cast<float>(p[0]),
-                                         static_cast<float>(p[1]),
-                                         static_cast<float>(p[2])));
-        pMP->UpdateNormalAndDepth();
-    }
+        for (auto &kv : mapKF_SE3)
+        {
+            KeyFrame *pKF = kv.first;
+            const auto &d = mapKF_delta[pKF];
+            Eigen::Matrix<double, 6, 1> xi;
+            xi << d[3], d[4], d[5], d[0], d[1], d[2];
+            Sophus::SE3d T_opt = Sophus::SE3d::exp(xi) * kv.second;
+            pKF->SetPose(T_opt.matrix().cast<float>());
+        }
 
-    CleanupMemory();
+        for (auto &kv : mapMP_Point)
+        {
+            MapPoint *pMP = kv.first;
+            if (pMP->isBad())
+                continue;
+            pMP->SetWorldPos(kv.second.cast<float>());
+            pMP->UpdateNormalAndDepth();
+        }
+    }
 }

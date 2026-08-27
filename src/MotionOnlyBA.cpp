@@ -23,11 +23,11 @@ public:
     virtual bool Evaluate(double const *const *parameters, double *residuals, double **jacobians) const override
     {
         const double *xi_raw = parameters[0];
-        
+
         // 增量扰动 xi: [wx, wy, wz, vx, vy, vz]
         Eigen::Matrix<double, 6, 1> xi;
         xi << xi_raw[3], xi_raw[4], xi_raw[5], xi_raw[0], xi_raw[1], xi_raw[2]; // Sophus::exp 顺序: [v, w]
-        
+
         Sophus::SE3d T_cw = Sophus::SE3d::exp(xi) * T_cw_initial_;
         Eigen::Vector3d P_c = T_cw * point_3d_;
 
@@ -36,7 +36,15 @@ public:
         const double z = P_c[2];
 
         if (z <= 1e-4)
-            return false;
+        {
+            residuals[0] = 0.0;
+            residuals[1] = 0.0;
+            if (jacobians && jacobians[0])
+            {
+                std::fill(jacobians[0], jacobians[0] + 12, 0.0);
+            }
+            return true;
+        }
 
         const double inv_z = 1.0 / z;
         const double inv_z2 = inv_z * inv_z;
@@ -71,10 +79,10 @@ public:
             jacobian[5] = inv_sigma_ * dedz_0;
 
             // Row 1 (dv)
-            jacobian[6]  = inv_sigma_ * (-dedy_1 * z + dedz_1 * y);
-            jacobian[7]  = inv_sigma_ * (-dedz_1 * x);
-            jacobian[8]  = inv_sigma_ * (dedy_1 * x);
-            jacobian[9]  = 0.0;
+            jacobian[6] = inv_sigma_ * (-dedy_1 * z + dedz_1 * y);
+            jacobian[7] = inv_sigma_ * (-dedz_1 * x);
+            jacobian[8] = inv_sigma_ * (dedy_1 * x);
+            jacobian[9] = 0.0;
             jacobian[10] = inv_sigma_ * dedy_1;
             jacobian[11] = inv_sigma_ * dedz_1;
         }
@@ -115,7 +123,16 @@ public:
         const double z = P_c[2];
 
         if (z <= 1e-4)
-            return false;
+        {
+            residuals[0] = 0.0;
+            residuals[1] = 0.0;
+            residuals[2] = 0.0;
+            if (jacobians && jacobians[0])
+            {
+                std::fill(jacobians[0], jacobians[0] + 18, 0.0);
+            }
+            return true;
+        }
 
         const double inv_z = 1.0 / z;
         const double inv_z2 = inv_z * inv_z;
@@ -154,10 +171,10 @@ public:
             jacobian[5] = inv_sigma_ * dedz_0;
 
             // Row 1 (dvL)
-            jacobian[6]  = inv_sigma_ * (-dedy_1 * z + dedz_1 * y);
-            jacobian[7]  = inv_sigma_ * (-dedz_1 * x);
-            jacobian[8]  = inv_sigma_ * (dedy_1 * x);
-            jacobian[9]  = 0.0;
+            jacobian[6] = inv_sigma_ * (-dedy_1 * z + dedz_1 * y);
+            jacobian[7] = inv_sigma_ * (-dedz_1 * x);
+            jacobian[8] = inv_sigma_ * (dedy_1 * x);
+            jacobian[9] = 0.0;
             jacobian[10] = inv_sigma_ * dedy_1;
             jacobian[11] = inv_sigma_ * dedz_1;
 
@@ -202,8 +219,8 @@ int MotionOnlyBA::Optimize(Frame *pFrame)
 
     Eigen::Matrix3d K_eigen;
     K_eigen << pFrame->mK.at<float>(0, 0), 0, pFrame->mK.at<float>(0, 2),
-               0, pFrame->mK.at<float>(1, 1), pFrame->mK.at<float>(1, 2),
-               0, 0, 1;
+        0, pFrame->mK.at<float>(1, 1), pFrame->mK.at<float>(1, 2),
+        0, 0, 1;
 
     Eigen::Matrix3d R_cw = pFrame->mTcw.block<3, 3>(0, 0).cast<double>();
     Eigen::Vector3d t_cw = pFrame->mTcw.block<3, 1>(0, 3).cast<double>();

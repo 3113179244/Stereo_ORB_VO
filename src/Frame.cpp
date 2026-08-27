@@ -29,9 +29,13 @@ Frame::Frame(const cv::Mat &imLeft, const cv::Mat &imRight, const double &timeSt
     mImGrayLeft = imLeft.clone();
     mImGrayRight = imRight.clone();
 
-    std::thread threadLeft(&Frame::ExtractORB, this, 0, mImGrayLeft);
+    // 仅为右图启动一个子线程
     std::thread threadRight(&Frame::ExtractORB, this, 1, mImGrayRight);
-    threadLeft.join();
+
+    // 当前主线程直接负责提取左图
+    ExtractORB(0, mImGrayLeft);
+
+    // 等待右图提取完成
     threadRight.join();
 
     // 记录特征点总数
@@ -41,8 +45,8 @@ Frame::Frame(const cv::Mat &imLeft, const cv::Mat &imRight, const double &timeSt
 
     // 此处简化了去畸变过程。在实际系统中，若输入图像已极线校正，可直接拷贝 mvKeysUn = mvKeys
     mvKeysUn = mvKeys;
-    mImGrayLeft = imLeft.clone();
-    mImGrayRight = imRight.clone();
+    // mImGrayLeft = imLeft.clone();
+    // mImGrayRight = imRight.clone();
     mb = mbf / mK.at<float>(0, 0);
     mThDepth = thDepth * mb;
     // 双目匹配，通过左右目特征点匹配计算视差，进而获得深度信息
