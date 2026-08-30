@@ -48,6 +48,7 @@ public:
     // 数据获取接口
     std::shared_ptr<Map> GetMap() const { return mpMap; }
     void SaveTrajectoryKITTI(const std::string &filename);
+    void SaveTrajectoryTUM(const std::string &filename);
     
 private:
     eSensor mSensor;

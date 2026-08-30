@@ -1,13 +1,18 @@
-cmake_minimum_required(VERSION 3.8)
+cmake_minimum_required(VERSION 3.10)
 project(Stereo_ORB_VO)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
-set(CMAKE_BUILD_TYPE "Debug")
-add_compile_options(-Wextra -Wpedantic -w)
-add_compile_options(-O3 -march=native)
 
+# 设置 Release 优化编译
+set(CMAKE_BUILD_TYPE "Release")
+add_compile_options(-O3 -march=native -w)
+
+# 添加现代 OpenGL 扩展支持宏，避免 Pangolin glsl 报错
+add_definitions(-DHAVE_GLEW -DGL_GLEXT_PROTOTYPES)
+
+# 查找依赖库
 find_package(OpenCV REQUIRED)
 find_package(Ceres REQUIRED)
 find_package(Eigen3 REQUIRED)
@@ -26,12 +31,14 @@ include_directories(
   ${EIGEN3_INCLUDE_DIR}
   ${CERES_INCLUDE_DIRS}
   ${Sophus_INCLUDE_DIRS}
-  ${PANGOLIN_INCLUDE_DIRS}
+  ${Pangolin_INCLUDE_DIRS}
   ${OPENGL_INCLUDE_DIR}
-  ${DBow3_INCLUDE_DIRS}
+  ${GLEW_INCLUDE_DIRS}
+  ${DBoW3_INCLUDE_DIRS}
 )
 
-add_library(${PROJECT_NAME}_lib
+# 1. 编译核心算法库
+add_library(${PROJECT_NAME}_lib SHARED
   src/Camera.cpp
   src/Config.cpp
   src/ORBmatcher.cpp
@@ -55,24 +62,22 @@ target_link_libraries(${PROJECT_NAME}_lib
   ${OpenCV_LIBS}
   ${CERES_LIBRARIES}
   Sophus::Sophus
-  pango_display        
+  ${Pangolin_LIBRARIES}
   ${OPENGL_LIBRARIES}
+  ${GLEW_LIBRARIES}
   ${DBoW3_LIBS}
   g2o_core                  
   g2o_stuff
   g2o_types_sba
   g2o_solver_eigen
-  GLEW::GLEW
-  pthread
   fmt::fmt
+  pthread
 )
 
-add_executable(Stereo_ORB_VO src/main.cpp)
+# 2. 编译 KITTI 可执行文件
+add_executable(stereo_kitti src/stereo_kitti.cpp)
+target_link_libraries(stereo_kitti ${PROJECT_NAME}_lib)
 
-target_link_libraries(Stereo_ORB_VO ${PROJECT_NAME}_lib)
-
-install(TARGETS ${PROJECT_NAME}_lib Stereo_ORB_VO
-  ARCHIVE DESTINATION lib
-  LIBRARY DESTINATION lib
-  RUNTIME DESTINATION bin
-)
+# 3. 编译 EuRoC 可执行文件
+add_executable(stereo_euroc src/stereo_euroc.cpp)
+target_link_libraries(stereo_euroc ${PROJECT_NAME}_lib)

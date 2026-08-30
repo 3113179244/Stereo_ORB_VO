@@ -115,10 +115,18 @@ Eigen::Matrix4f System::TrackStereo(const cv::Mat &imLeft, const cv::Mat &imRigh
 
 void System::Shutdown()
 {
+    if (mpLocalMapper)
+    {
+        mpLocalMapper->RequestStop();
+    }
+    if (mpLoopCloser)
+    {
+        mpLoopCloser->RequestStop();
+    }
     if (mpViewerThread)
     {
         if (mpViewer)
-            mpViewer->RequestStop();
+            mpViewer->RequestFinish();
         mpViewerThread->join();
         delete mpViewerThread;
         mpViewerThread = nullptr;
@@ -239,5 +247,104 @@ void System::SaveTrajectoryKITTI(const std::string &filename)
     f.flush();
     f.close();
     std::cout << "[System] KITTI 轨迹保存成功！有效帧: " << nValid
+              << " / 总记录帧数: " << nTotal << std::endl;
+}
+
+void System::SaveTrajectoryTUM(const std::string &filename)
+{
+    std::cout << "[System] 正在保存 TUM 格式轨迹至: " << filename << " ..." << std::endl;
+
+    std::vector<KeyFrame *> vpKFs = mpMap->GetAllKeyFrames();
+    if (vpKFs.empty())
+    {
+        std::cerr << "[System 错误] 地图中无关键帧，无法生成轨迹！" << std::endl;
+        return;
+    }
+
+    std::sort(vpKFs.begin(), vpKFs.end(),
+              [](KeyFrame *a, KeyFrame *b)
+              { return a->mnId < b->mnId; });
+
+    std::ofstream f(filename.c_str());
+    if (!f.is_open())
+    {
+        std::cerr << "[System 错误] 无法创建轨迹文件: " << filename << std::endl;
+        return;
+    }
+    f << std::fixed << std::setprecision(6);
+
+    auto lRit = mpTracker->mlpReferences.begin();
+    auto lT = mpTracker->mlFrameTimes.begin();
+    auto lbL = mpTracker->mlbLost.begin();
+
+    Eigen::Matrix4f lastValidTwc = Eigen::Matrix4f::Identity();
+    int nValid = 0;
+    int nTotal = 0;
+
+    for (auto lit = mpTracker->mlRelativeFramePoses.begin();
+         lit != mpTracker->mlRelativeFramePoses.end();
+         ++lit, ++lRit, ++lT, ++lbL)
+    {
+        nTotal++;
+        KeyFrame *pKF = *lRit;
+        Eigen::Matrix4f Tcr = *lit;
+        double timestamp = *lT;
+        bool bLost = *lbL;
+
+        Eigen::Matrix4f Twc = lastValidTwc;
+        bool bCurrentValid = false;
+
+        if (!bLost && pKF)
+        {
+            Eigen::Matrix4f T_c_curr = Tcr;
+            KeyFrame *pCurrKF = pKF;
+            int maxDepth = 0;
+
+            // 沿生成树向上回溯
+            while (pCurrKF && pCurrKF->mbBad && pCurrKF->GetParent() && maxDepth < 10)
+            {
+                KeyFrame *pParent = pCurrKF->GetParent();
+                Eigen::Matrix4f T_child_parent = pCurrKF->GetRelativePoseToParent();
+                T_c_curr = T_c_curr * T_child_parent;
+                pCurrKF = pParent;
+                maxDepth++;
+            }
+
+            if (pCurrKF && !pCurrKF->mbBad)
+            {
+                Eigen::Matrix4f Trw = pCurrKF->GetPose();
+                Eigen::Matrix4f Tcw = T_c_curr * Trw;
+                Twc = Tcw.inverse();
+                lastValidTwc = Twc;
+                bCurrentValid = true;
+            }
+            else
+            {
+                Eigen::Matrix4f Trw = pKF->GetPose();
+                Eigen::Matrix4f Tcw = Tcr * Trw;
+                Twc = Tcw.inverse();
+                lastValidTwc = Twc;
+                bCurrentValid = true;
+            }
+        }
+
+        if (bCurrentValid)
+            nValid++;
+
+        // 提取平移 t 与四元数 q (注意转换顺序为 tx ty tz qx qy qz qw)
+        Eigen::Matrix3f R = Twc.block<3, 3>(0, 0);
+        Eigen::Vector3f t = Twc.block<3, 1>(0, 3);
+        Eigen::Quaternionf q(R);
+        q.normalize();
+
+        f << std::setprecision(6) << timestamp << " "
+          << std::setprecision(9)
+          << t.x() << " " << t.y() << " " << t.z() << " "
+          << q.x() << " " << q.y() << " " << q.z() << " " << q.w() << "\n";
+    }
+
+    f.flush();
+    f.close();
+    std::cout << "[System] TUM 轨迹保存成功！有效帧: " << nValid
               << " / 总记录帧数: " << nTotal << std::endl;
 }
