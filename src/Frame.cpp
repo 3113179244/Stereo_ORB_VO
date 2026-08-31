@@ -210,51 +210,41 @@ void Frame::ComputeStereoMatches()
             if (uL_round - w < 0 || uL_round + w >= mImGrayLeft.cols ||
                 vL_round - w < 0 || vL_round + w >= mImGrayLeft.rows ||
                 uR0_round - w - 2 < 0 || uR0_round + w + 2 >= mImGrayRight.cols ||
-                vR0_round - w - 1 < 0 || vR0_round + w + 1 >= mImGrayRight.rows)
+                vR0_round - w < 0 || vR0_round + w >= mImGrayRight.rows)
                 continue;
 
             int bestL = 0;
-            int bestV = 0;
             int distSubPixelMin = INT_MAX;
             int vIdxToCost[5] = {0};
 
-            for (int incV = -1; incV <= 1; ++incV)
+            // 仅在水平方向 (incR) 滑动计算 SAD 块匹配代价
+            for (int incR = -2; incR <= 2; ++incR)
             {
-                int current_v_costs[5] = {0};
-                for (int incR = -2; incR <= 2; ++incR)
+                int distSubPixel = 0;
+                for (int wy = -w; wy <= w; ++wy)
                 {
-                    int distSubPixel = 0;
-                    for (int wy = -w; wy <= w; ++wy)
+                    const uchar *pL = mImGrayLeft.ptr<uchar>(vL_round + wy);
+                    const uchar *pR = mImGrayRight.ptr<uchar>(vR0_round + wy); // 严格处于同一水平行
+
+                    for (int wx = -w; wx <= w; ++wx)
                     {
-                        const uchar *pL = mImGrayLeft.ptr<uchar>(vL_round + wy);
-                        const uchar *pR = mImGrayRight.ptr<uchar>(vR0_round + incV + wy);
-
-                        for (int wx = -w; wx <= w; ++wx)
-                        {
-                            distSubPixel += std::abs(pL[uL_round + wx] - pR[uR0_round + incR + wx]);
-                        }
-                    }
-
-                    current_v_costs[incR + 2] = distSubPixel;
-
-                    if (distSubPixel < distSubPixelMin)
-                    {
-                        distSubPixelMin = distSubPixel;
-                        bestL = incR;
-                        bestV = incV;
+                        distSubPixel += std::abs(pL[uL_round + wx] - pR[uR0_round + incR + wx]);
                     }
                 }
 
-                if (bestV == incV)
+                vIdxToCost[incR + 2] = distSubPixel;
+
+                if (distSubPixel < distSubPixelMin)
                 {
-                    for (int k = 0; k < 5; ++k)
-                        vIdxToCost[k] = current_v_costs[k];
+                    distSubPixelMin = distSubPixel;
+                    bestL = incR;
                 }
             }
 
             if (bestL == -2 || bestL == 2)
                 continue;
 
+            // 抛物线拟合计算亚像素偏移
             const float dist1 = vIdxToCost[bestL + 1];
             const float dist2 = vIdxToCost[bestL + 2];
             const float dist3 = vIdxToCost[bestL + 3];

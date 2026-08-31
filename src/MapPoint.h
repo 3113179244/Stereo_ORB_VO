@@ -21,7 +21,7 @@ public:
     // 设置和获取地图点在世界坐标系下的三维坐标
     void SetWorldPos(const Eigen::Vector3f &Pos);
     Eigen::Vector3f GetWorldPos();
-    
+    MapPoint* GetReplaced() { return mpReplaced; }
     // 获取地图点的平均观测法线方向
     Eigen::Vector3f GetNormal(); 
     

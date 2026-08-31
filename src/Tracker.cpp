@@ -56,7 +56,7 @@ void Tracker::Track()
 {
     if (mState == NO_IMAGES_YET)
         mState = NOT_INITIALIZED;
-
+    std::unique_lock<std::mutex> lockMap(mpMap->mMutexMapUpdate);
     if (mState == NOT_INITIALIZED)
     {
         if (StereoInitialization())
@@ -69,6 +69,7 @@ void Tracker::Track()
     }
     else
     {
+        CheckReplacedInLastFrame();
         UpdateLastFrame(); // 更新上一帧数据
         bool bOK = false;
         bool bFromRelocalization = false; // 标记是否是通过重定位恢复的
@@ -577,12 +578,12 @@ bool Tracker::NeedNewKeyFrame()
         {
             if (mpLocalMapper)
             {
-                // 打断局部 BA 优化以尽快响应新关键帧
-                mpLocalMapper->RequestStopBA();
-
-                // 双目模式下限制后端缓冲队列长度，避免挤压过多关键帧导致内存暴涨和耗时堆积
+                // 仅在队列未满且确定要插帧时打断
                 if (mpLocalMapper->KeyframesInQueue() < 3)
+                {
+                    mpLocalMapper->RequestStopBA();
                     return true;
+                }
                 else
                     return false;
             }
@@ -738,7 +739,7 @@ void Tracker::UpdateLocalKeyFrames()
     mvpLocalKeyFrames.clear();
 
     // 1. 统计当前帧所有已匹配地图点的所有有效观测关键帧
-    std::map<KeyFrame*, int> keyframeCounter;
+    std::map<KeyFrame *, int> keyframeCounter;
     for (int i = 0; i < mCurrentFrame.N; i++)
     {
         MapPoint *pMP = mCurrentFrame.mvpMapPoints[i];
@@ -779,7 +780,7 @@ void Tracker::UpdateLocalKeyFrames()
         mpReferenceKF = pKFmax;
 
     // 3. 扩充一级共视邻居 (ORB-SLAM2 标准：前 10 个最佳共视邻居)、二级共视邻居 (前 5 个)、生成树子/父节点
-    std::vector<KeyFrame*> vpLocalKFWithNeighbors = mvpLocalKeyFrames;
+    std::vector<KeyFrame *> vpLocalKFWithNeighbors = mvpLocalKeyFrames;
     for (KeyFrame *pKF : mvpLocalKeyFrames)
     {
         if (pKF->mbBad)
@@ -860,7 +861,7 @@ void Tracker::SearchLocalPoints()
         return;
 
     // 1. 过滤掉当前帧中已经成功匹配且为有效内点（Inlier）的地图点
-    std::vector<MapPoint*> vpCandidateMPs;
+    std::vector<MapPoint *> vpCandidateMPs;
     vpCandidateMPs.reserve(mvpLocalMapPoints.size());
 
     for (MapPoint *pMP : mvpLocalMapPoints)
@@ -891,4 +892,20 @@ void Tracker::SearchLocalPoints()
     // 2. 局部地图匹配设置 nnratio = 0.8f，开启旋转一致性校验，搜索半径 th = 5.0f
     ORBmatcher matcher(0.8f, true);
     matcher.SearchByProjection(mCurrentFrame, vpCandidateMPs, 5.0f);
+}
+
+void Tracker::CheckReplacedInLastFrame()
+{
+    for (int i = 0; i < mLastFrame.N; i++)
+    {
+        MapPoint *pMP = mLastFrame.mvpMapPoints[i];
+        if (pMP)
+        {
+            MapPoint *pRep = pMP->GetReplaced();
+            if (pRep)
+            {
+                mLastFrame.mvpMapPoints[i] = pRep;
+            }
+        }
+    }
 }
