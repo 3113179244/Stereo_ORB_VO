@@ -55,12 +55,12 @@ System::System(const std::string &strConfigFile, const std::string &strVocFile, 
 
     mpTracker->SetFrameDrawer(mpFrameDrawer);
     mpTracker->SetLocalMapper(mpLocalMapper.get());
-    mpTracker->SetLoopClosing(mpLoopCloser.get()); 
+    mpTracker->SetLoopClosing(mpLoopCloser.get());
 
     mpLocalMapper->SetTracker(mpTracker.get());
 
-    mpLoopCloser->SetTracker(mpTracker.get());    
-    mpLoopCloser->SetLocalMapper(mpLocalMapper.get()); 
+    mpLoopCloser->SetTracker(mpTracker.get());
+    mpLoopCloser->SetLocalMapper(mpLocalMapper.get());
     if (bUseViewer)
     {
         mpViewer = std::make_shared<Viewer>(this, mpMap);

@@ -699,12 +699,10 @@ void Tracker::Reset()
 
 void Tracker::UpdateLastFrame()
 {
-    // 如果没有参考关键帧，直接退出
     if (!mpReferenceKF || mpReferenceKF->mbBad)
         return;
 
     // 获取上一帧相对于参考关键帧的相对位姿: T_lr = T_lw * T_rw^-1
-    // 由于在 Track() 结束时保存了 mlRelativeFramePoses 和 mlpReferences，此处更新 mLastFrame：
     if (!mlRelativeFramePoses.empty() && mlpReferences.back() == mpReferenceKF)
     {
         Eigen::Matrix4f Tlr = mlRelativeFramePoses.back();
