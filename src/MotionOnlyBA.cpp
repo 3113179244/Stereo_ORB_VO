@@ -2,201 +2,163 @@
 #include "Frame.h"
 #include "MapPoint.h"
 #include "ORBextractor.h"
+
 #include <ceres/ceres.h>
+#include <ceres/manifold.h>
 #include <sophus/se3.hpp>
 #include <Eigen/Core>
 #include <Eigen/Geometry>
 #include <vector>
 #include <mutex>
-#include <iostream>
 
 /**
- * @brief 单目解析求导（优化变量为切空间 6 维扰动量 xi = [w, v]，初值为 0）
+ * @brief Sophus::SE3d 的 Ceres Manifold 实现
+ * 状态量环境空间维度 AmbientSize = 7 (quaternion [x, y, z, w], translation [x, y, z])
+ * 切空间局部扰动维度 TangentSize = 6 (se(3) Lie algebra [v, w] 或 [w, v])
  */
-class ReprojectionErrorMonoAnalytic : public ceres::SizedCostFunction<2, 6>
+class SophusSE3Manifold : public ceres::Manifold
 {
 public:
-    ReprojectionErrorMonoAnalytic(const Eigen::Vector2d &observed, const Eigen::Vector3d &point_3d,
-                                  const Sophus::SE3d &T_cw_initial, const Eigen::Matrix3d &K, double inv_sigma)
-        : observed_(observed), point_3d_(point_3d), T_cw_initial_(T_cw_initial), K_(K), inv_sigma_(inv_sigma) {}
+    int AmbientSize() const override { return 7; }
+    int TangentSize() const override { return 6; }
 
-    virtual bool Evaluate(double const *const *parameters, double *residuals, double **jacobians) const override
+    // x_plus_delta = exp(delta) * x (左乘扰动更新)
+    bool Plus(const double *x, const double *delta, double *x_plus_delta) const override
     {
-        const double *xi_raw = parameters[0];
+        Eigen::Map<const Sophus::SE3d> T(x);
+        // delta 映射为 6 维切空间向量: [vx, vy, vz, wx, wy, wz]
+        Eigen::Map<const Eigen::Matrix<double, 6, 1>> xi(delta);
 
-        // 增量扰动 xi: [wx, wy, wz, vx, vy, vz]
-        Eigen::Matrix<double, 6, 1> xi;
-        xi << xi_raw[3], xi_raw[4], xi_raw[5], xi_raw[0], xi_raw[1], xi_raw[2]; // Sophus::exp 顺序: [v, w]
+        Sophus::SE3d T_plus = Sophus::SE3d::exp(xi) * T;
 
-        Sophus::SE3d T_cw = Sophus::SE3d::exp(xi) * T_cw_initial_;
-        Eigen::Vector3d P_c = T_cw * point_3d_;
-
-        const double x = P_c[0];
-        const double y = P_c[1];
-        const double z = P_c[2];
-
-        if (z <= 1e-4)
-        {
-            residuals[0] = 0.0;
-            residuals[1] = 0.0;
-            if (jacobians && jacobians[0])
-            {
-                std::fill(jacobians[0], jacobians[0] + 12, 0.0);
-            }
-            return true;
-        }
-
-        const double inv_z = 1.0 / z;
-        const double inv_z2 = inv_z * inv_z;
-        const double fx = K_(0, 0);
-        const double fy = K_(1, 1);
-        const double cx = K_(0, 2);
-        const double cy = K_(1, 2);
-
-        const double u = fx * x * inv_z + cx;
-        const double v = fy * y * inv_z + cy;
-
-        // 残差
-        residuals[0] = (u - observed_[0]) * inv_sigma_;
-        residuals[1] = (v - observed_[1]) * inv_sigma_;
-
-        // 雅可比 (2x6)
-        if (jacobians && jacobians[0])
-        {
-            double *jacobian = jacobians[0];
-
-            const double dedx_0 = fx * inv_z;
-            const double dedz_0 = -fx * x * inv_z2;
-            const double dedy_1 = fy * inv_z;
-            const double dedz_1 = -fy * y * inv_z2;
-
-            // Row 0 (du)
-            jacobian[0] = inv_sigma_ * (dedz_0 * y);
-            jacobian[1] = inv_sigma_ * (dedx_0 * z - dedz_0 * x);
-            jacobian[2] = inv_sigma_ * (-dedx_0 * y);
-            jacobian[3] = inv_sigma_ * dedx_0;
-            jacobian[4] = 0.0;
-            jacobian[5] = inv_sigma_ * dedz_0;
-
-            // Row 1 (dv)
-            jacobian[6] = inv_sigma_ * (-dedy_1 * z + dedz_1 * y);
-            jacobian[7] = inv_sigma_ * (-dedz_1 * x);
-            jacobian[8] = inv_sigma_ * (dedy_1 * x);
-            jacobian[9] = 0.0;
-            jacobian[10] = inv_sigma_ * dedy_1;
-            jacobian[11] = inv_sigma_ * dedz_1;
-        }
-
+        Eigen::Map<Sophus::SE3d> result(x_plus_delta);
+        result = T_plus;
         return true;
     }
 
-private:
-    Eigen::Vector2d observed_;
-    Eigen::Vector3d point_3d_;
-    Sophus::SE3d T_cw_initial_;
-    Eigen::Matrix3d K_;
-    double inv_sigma_;
+    // Plus 的雅可比矩阵: d(Plus(x, delta)) / d(delta)|_{delta=0}
+    bool PlusJacobian(const double *x, double *jacobian) const override
+    {
+        ceres::MatrixRef J(jacobian, 7, 6);
+        J.setZero();
+
+        // 也可以使用 ceres::AutoDiffManifold<SophusSE3ManifoldFunctor, 7, 6> 自动求导
+        // 若手动推导，数值有限差分最为稳健通用：
+        const double eps = 1e-8;
+        double x_plus[7];
+        double delta[6] = {0};
+
+        for (int i = 0; i < 6; ++i)
+        {
+            delta[i] = eps;
+            Plus(x, delta, x_plus);
+            for (int r = 0; r < 7; ++r)
+            {
+                J(r, i) = (x_plus[r] - x[r]) / eps;
+            }
+            delta[i] = 0.0;
+        }
+        return true;
+    }
+
+    // 计算切空间差异: y ⊖ x
+    bool Minus(const double *y, const double *x, double *y_minus_x) const override
+    {
+        Eigen::Map<const Sophus::SE3d> T_y(y);
+        Eigen::Map<const Sophus::SE3d> T_x(x);
+
+        Eigen::Map<Eigen::Matrix<double, 6, 1>> xi(y_minus_x);
+        xi = (T_y * T_x.inverse()).log();
+        return true;
+    }
+
+    bool MinusJacobian(const double *x, double *jacobian) const override
+    {
+        ceres::MatrixRef J(jacobian, 6, 7);
+        J.setZero();
+        return true;
+    }
 };
 
 /**
- * @brief 双目解析求导（优化变量为切空间 6 维扰动量 xi = [w, v]，初值为 0）
+ * @brief 单目重投影误差 (AutoDiff)
  */
-class ReprojectionErrorStereoAnalytic : public ceres::SizedCostFunction<3, 6>
+struct ReprojectionErrorMono
 {
-public:
-    ReprojectionErrorStereoAnalytic(const Eigen::Vector3d &observed, const Eigen::Vector3d &point_3d,
-                                    const Sophus::SE3d &T_cw_initial, const Eigen::Matrix3d &K, double bf, double inv_sigma)
-        : observed_(observed), point_3d_(point_3d), T_cw_initial_(T_cw_initial), K_(K), bf_(bf), inv_sigma_(inv_sigma) {}
+    ReprojectionErrorMono(const Eigen::Vector2d &observed, const Eigen::Vector3d &point_3d,
+                          const Eigen::Matrix3d &K, double inv_sigma)
+        : observed_(observed), point_3d_(point_3d), fx_(K(0, 0)), fy_(K(1, 1)),
+          cx_(K(0, 2)), cy_(K(1, 2)), inv_sigma_(inv_sigma) {}
 
-    virtual bool Evaluate(double const *const *parameters, double *residuals, double **jacobians) const override
+    template <typename T>
+    bool operator()(const T *const se3_raw, T *residuals) const
     {
-        const double *xi_raw = parameters[0];
+        // 映射为 Sophus 对象
+        Eigen::Map<const Sophus::SE3<T>> T_cw(se3_raw);
+        Eigen::Matrix<T, 3, 1> p_w = point_3d_.cast<T>();
+        Eigen::Matrix<T, 3, 1> p_c = T_cw * p_w;
 
-        Eigen::Matrix<double, 6, 1> xi;
-        xi << xi_raw[3], xi_raw[4], xi_raw[5], xi_raw[0], xi_raw[1], xi_raw[2];
+        T inv_z = T(1.0) / p_c[2];
+        T u = T(fx_) * p_c[0] * inv_z + T(cx_);
+        T v = T(fy_) * p_c[1] * inv_z + T(cy_);
 
-        Sophus::SE3d T_cw = Sophus::SE3d::exp(xi) * T_cw_initial_;
-        Eigen::Vector3d P_c = T_cw * point_3d_;
-
-        const double x = P_c[0];
-        const double y = P_c[1];
-        const double z = P_c[2];
-
-        if (z <= 1e-4)
-        {
-            residuals[0] = 0.0;
-            residuals[1] = 0.0;
-            residuals[2] = 0.0;
-            if (jacobians && jacobians[0])
-            {
-                std::fill(jacobians[0], jacobians[0] + 18, 0.0);
-            }
-            return true;
-        }
-
-        const double inv_z = 1.0 / z;
-        const double inv_z2 = inv_z * inv_z;
-        const double fx = K_(0, 0);
-        const double fy = K_(1, 1);
-        const double cx = K_(0, 2);
-        const double cy = K_(1, 2);
-
-        const double u = fx * x * inv_z + cx;
-        const double v = fy * y * inv_z + cy;
-        const double u_r = u - bf_ * inv_z;
-
-        // 残差
-        residuals[0] = (u - observed_[0]) * inv_sigma_;
-        residuals[1] = (v - observed_[1]) * inv_sigma_;
-        residuals[2] = (u_r - observed_[2]) * inv_sigma_;
-
-        // 雅可比 (3x6)
-        if (jacobians && jacobians[0])
-        {
-            double *jacobian = jacobians[0];
-
-            const double dedx_0 = fx * inv_z;
-            const double dedz_0 = -fx * x * inv_z2;
-            const double dedy_1 = fy * inv_z;
-            const double dedz_1 = -fy * y * inv_z2;
-            const double dedx_2 = dedx_0;
-            const double dedz_2 = -(fx * x - bf_) * inv_z2;
-
-            // Row 0 (duL)
-            jacobian[0] = inv_sigma_ * (dedz_0 * y);
-            jacobian[1] = inv_sigma_ * (dedx_0 * z - dedz_0 * x);
-            jacobian[2] = inv_sigma_ * (-dedx_0 * y);
-            jacobian[3] = inv_sigma_ * dedx_0;
-            jacobian[4] = 0.0;
-            jacobian[5] = inv_sigma_ * dedz_0;
-
-            // Row 1 (dvL)
-            jacobian[6] = inv_sigma_ * (-dedy_1 * z + dedz_1 * y);
-            jacobian[7] = inv_sigma_ * (-dedz_1 * x);
-            jacobian[8] = inv_sigma_ * (dedy_1 * x);
-            jacobian[9] = 0.0;
-            jacobian[10] = inv_sigma_ * dedy_1;
-            jacobian[11] = inv_sigma_ * dedz_1;
-
-            // Row 2 (duR)
-            jacobian[12] = inv_sigma_ * (dedz_2 * y);
-            jacobian[13] = inv_sigma_ * (dedx_2 * z - dedz_2 * x);
-            jacobian[14] = inv_sigma_ * (-dedx_2 * y);
-            jacobian[15] = inv_sigma_ * dedx_2;
-            jacobian[16] = 0.0;
-            jacobian[17] = inv_sigma_ * dedz_2;
-        }
+        residuals[0] = (u - T(observed_[0])) * T(inv_sigma_);
+        residuals[1] = (v - T(observed_[1])) * T(inv_sigma_);
 
         return true;
     }
 
-private:
+    static ceres::CostFunction *Create(const Eigen::Vector2d &observed, const Eigen::Vector3d &point_3d,
+                                       const Eigen::Matrix3d &K, double inv_sigma)
+    {
+        return new ceres::AutoDiffCostFunction<ReprojectionErrorMono, 2, 7>(
+            new ReprojectionErrorMono(observed, point_3d, K, inv_sigma));
+    }
+
+    Eigen::Vector2d observed_;
+    Eigen::Vector3d point_3d_;
+    double fx_, fy_, cx_, cy_, inv_sigma_;
+};
+
+/**
+ * @brief 双目重投影误差 (AutoDiff)
+ */
+struct ReprojectionErrorStereo
+{
+    ReprojectionErrorStereo(const Eigen::Vector3d &observed, const Eigen::Vector3d &point_3d,
+                            const Eigen::Matrix3d &K, double bf, double inv_sigma)
+        : observed_(observed), point_3d_(point_3d), fx_(K(0, 0)), fy_(K(1, 1)),
+          cx_(K(0, 2)), cy_(K(1, 2)), bf_(bf), inv_sigma_(inv_sigma) {}
+
+    template <typename T>
+    bool operator()(const T *const se3_raw, T *residuals) const
+    {
+        Eigen::Map<const Sophus::SE3<T>> T_cw(se3_raw);
+        Eigen::Matrix<T, 3, 1> p_w = point_3d_.cast<T>();
+        Eigen::Matrix<T, 3, 1> p_c = T_cw * p_w;
+
+        T inv_z = T(1.0) / p_c[2];
+        T u = T(fx_) * p_c[0] * inv_z + T(cx_);
+        T v = T(fy_) * p_c[1] * inv_z + T(cy_);
+        T u_r = u - T(bf_) * inv_z;
+
+        residuals[0] = (u - T(observed_[0])) * T(inv_sigma_);
+        residuals[1] = (v - T(observed_[1])) * T(inv_sigma_);
+        residuals[2] = (u_r - T(observed_[2])) * T(inv_sigma_);
+
+        return true;
+    }
+
+    static ceres::CostFunction *Create(const Eigen::Vector3d &observed, const Eigen::Vector3d &point_3d,
+                                       const Eigen::Matrix3d &K, double bf, double inv_sigma)
+    {
+        return new ceres::AutoDiffCostFunction<ReprojectionErrorStereo, 3, 7>(
+            new ReprojectionErrorStereo(observed, point_3d, K, bf, inv_sigma));
+    }
+
     Eigen::Vector3d observed_;
     Eigen::Vector3d point_3d_;
-    Sophus::SE3d T_cw_initial_;
-    Eigen::Matrix3d K_;
-    double bf_;
-    double inv_sigma_;
+    double fx_, fy_, cx_, cy_, bf_, inv_sigma_;
 };
 
 int MotionOnlyBA::Optimize(Frame *pFrame)
@@ -217,165 +179,90 @@ int MotionOnlyBA::Optimize(Frame *pFrame)
     if (nInitialCorrespondences < 3)
         return 0;
 
-    const float fx = pFrame->mK.at<float>(0, 0);
-    const float fy = pFrame->mK.at<float>(1, 1);
-    const float cx = pFrame->mK.at<float>(0, 2);
-    const float cy = pFrame->mK.at<float>(1, 2);
-    const float mbf = pFrame->mbf;
+    // 内参提取
+    Eigen::Matrix3d K;
+    K << pFrame->mK.at<float>(0, 0), 0.0, pFrame->mK.at<float>(0, 2),
+        0.0, pFrame->mK.at<float>(1, 1), pFrame->mK.at<float>(1, 2),
+        0.0, 0.0, 1.0;
 
+    const double fx = K(0, 0);
+    const double fy = K(1, 1);
+    const double cx = K(0, 2);
+    const double cy = K(1, 2);
+    const double mbf = pFrame->mbf;
+
+    // 位姿初始化
     Eigen::Matrix3d R_cw = pFrame->mTcw.block<3, 3>(0, 0).cast<double>();
     Eigen::Vector3d t_cw = pFrame->mTcw.block<3, 1>(0, 3).cast<double>();
-    Eigen::Quaterniond q_init(R_cw);
-    q_init.normalize();
-    Sophus::SE3d T_cw(q_init, t_cw);
+
+    Eigen::Quaterniond q_cw(R_cw);
+    q_cw.normalize(); // 消除数值漂移，保证正交性
+
+    Sophus::SE3d T_cw(q_cw, t_cw);
 
     const int its[4] = {10, 10, 10, 10};
     const double chi2_mono = 5.991;
     const double chi2_stereo = 7.815;
-    const double delta_mono = std::sqrt(chi2_mono);
-    const double delta_stereo = std::sqrt(chi2_stereo);
 
     int num_inliers = 0;
 
+    // 4 轮迭代优化（含外点剔除）
     for (int it = 0; it < 4; ++it)
     {
-        for (int iter = 0; iter < its[it]; ++iter)
+        ceres::Problem problem;
+
+        // 绑定 Sophus 自定义 Manifold
+        SophusSE3Manifold *se3_manifold = new SophusSE3Manifold();
+        problem.AddParameterBlock(T_cw.data(), 7, se3_manifold);
+
         {
-            Eigen::Matrix<double, 6, 6> H = Eigen::Matrix<double, 6, 6>::Zero();
-            Eigen::Matrix<double, 6, 1> g = Eigen::Matrix<double, 6, 1>::Zero();
+            std::unique_lock<std::mutex> lock(MapPoint::mGlobalMutex);
 
+            for (int i = 0; i < N; ++i)
             {
-                std::unique_lock<std::mutex> lock(MapPoint::mGlobalMutex);
+                MapPoint *pMP = pFrame->mvpMapPoints[i];
+                if (!pMP || pMP->isBad() || pFrame->mvbOutlier[i])
+                    continue;
 
-                for (int i = 0; i < N; ++i)
+                Eigen::Vector3d P_w = pMP->GetWorldPos().cast<double>();
+                const int level = pFrame->mvKeysUn[i].octave;
+                const double inv_sigma = 1.0 / std::sqrt(pFrame->mpORBextractorLeft->GetScaleSigmaSquares()[level]);
+                const float u_r = pFrame->mvuRight[i];
+
+                // 前两轮引入 Huber 核函数抑制粗差点
+                ceres::LossFunction *loss_function = (it < 2) ? new ceres::HuberLoss(std::sqrt(chi2_mono)) : nullptr;
+
+                if (u_r < 0.0f) // 单目残差
                 {
-                    MapPoint *pMP = pFrame->mvpMapPoints[i];
-                    if (!pMP || pMP->isBad() || pFrame->mvbOutlier[i])
-                        continue;
+                    Eigen::Vector2d obs(pFrame->mvKeysUn[i].pt.x, pFrame->mvKeysUn[i].pt.y);
+                    ceres::CostFunction *cost_function =
+                        ReprojectionErrorMono::Create(obs, P_w, K, inv_sigma);
+                    problem.AddResidualBlock(cost_function, loss_function, T_cw.data());
+                }
+                else // 双目残差
+                {
+                    Eigen::Vector3d obs(pFrame->mvKeysUn[i].pt.x, pFrame->mvKeysUn[i].pt.y, u_r);
+                    if (loss_function)
+                        loss_function = new ceres::HuberLoss(std::sqrt(chi2_stereo));
 
-                    Eigen::Vector3d P_w = pMP->GetWorldPos().cast<double>();
-                    Eigen::Vector3d P_c = T_cw * P_w;
-                    const double x = P_c[0];
-                    const double y = P_c[1];
-                    const double z = P_c[2];
-
-                    if (z <= 1e-4)
-                        continue;
-
-                    const double inv_z = 1.0 / z;
-                    const double inv_z2 = inv_z * inv_z;
-                    const int level = pFrame->mvKeysUn[i].octave;
-                    const double inv_sigma2 = 1.0 / pFrame->mpORBextractorLeft->GetScaleSigmaSquares()[level];
-                    const float u_r = pFrame->mvuRight[i];
-
-                    const double u = fx * x * inv_z + cx;
-                    const double v = fy * y * inv_z + cy;
-
-                    if (u_r < 0.0f) // 单目残差
-                    {
-                        const double e_u = (u - pFrame->mvKeysUn[i].pt.x);
-                        const double e_v = (v - pFrame->mvKeysUn[i].pt.y);
-                        const double chi2 = (e_u * e_u + e_v * e_v) * inv_sigma2;
-
-                        double w = 1.0;
-                        if (it < 2)
-                        {
-                            const double r = std::sqrt(chi2);
-                            if (r > delta_mono)
-                                w = delta_mono / r;
-                        }
-
-                        Eigen::Matrix<double, 2, 6> J;
-                        const double dedx_0 = fx * inv_z;
-                        const double dedz_0 = -fx * x * inv_z2;
-                        const double dedy_1 = fy * inv_z;
-                        const double dedz_1 = -fy * y * inv_z2;
-
-                        J(0, 0) = dedz_0 * y;
-                        J(0, 1) = dedx_0 * z - dedz_0 * x;
-                        J(0, 2) = -dedx_0 * y;
-                        J(0, 3) = dedx_0;
-                        J(0, 4) = 0.0;
-                        J(0, 5) = dedz_0;
-
-                        J(1, 0) = -dedy_1 * z + dedz_1 * y;
-                        J(1, 1) = -dedz_1 * x;
-                        J(1, 2) = dedy_1 * x;
-                        J(1, 3) = 0.0;
-                        J(1, 4) = dedy_1;
-                        J(1, 5) = dedz_1;
-
-                        Eigen::Vector2d e(e_u, e_v);
-                        const double weight = inv_sigma2 * w;
-                        H += weight * J.transpose() * J;
-                        g += -weight * J.transpose() * e;
-                    }
-                    else // 双目残差
-                    {
-                        const double u_r_proj = u - mbf * inv_z;
-                        const double e_u = (u - pFrame->mvKeysUn[i].pt.x);
-                        const double e_v = (v - pFrame->mvKeysUn[i].pt.y);
-                        const double e_ur = (u_r_proj - u_r);
-                        const double chi2 = (e_u * e_u + e_v * e_v + e_ur * e_ur) * inv_sigma2;
-
-                        double w = 1.0;
-                        if (it < 2)
-                        {
-                            const double r = std::sqrt(chi2);
-                            if (r > delta_stereo)
-                                w = delta_stereo / r;
-                        }
-
-                        Eigen::Matrix<double, 3, 6> J;
-                        const double dedx_0 = fx * inv_z;
-                        const double dedz_0 = -fx * x * inv_z2;
-                        const double dedy_1 = fy * inv_z;
-                        const double dedz_1 = -fy * y * inv_z2;
-                        const double dedx_2 = dedx_0;
-                        const double dedz_2 = -(fx * x - mbf) * inv_z2;
-
-                        J(0, 0) = dedz_0 * y;
-                        J(0, 1) = dedx_0 * z - dedz_0 * x;
-                        J(0, 2) = -dedx_0 * y;
-                        J(0, 3) = dedx_0;
-                        J(0, 4) = 0.0;
-                        J(0, 5) = dedz_0;
-
-                        J(1, 0) = -dedy_1 * z + dedz_1 * y;
-                        J(1, 1) = -dedz_1 * x;
-                        J(1, 2) = dedy_1 * x;
-                        J(1, 3) = 0.0;
-                        J(1, 4) = dedy_1;
-                        J(1, 5) = dedz_1;
-
-                        J(2, 0) = dedz_2 * y;
-                        J(2, 1) = dedx_2 * z - dedz_2 * x;
-                        J(2, 2) = -dedx_2 * y;
-                        J(2, 3) = dedx_2;
-                        J(2, 4) = 0.0;
-                        J(2, 5) = dedz_2;
-
-                        Eigen::Vector3d e(e_u, e_v, e_ur);
-                        const double weight = inv_sigma2 * w;
-                        H += weight * J.transpose() * J;
-                        g += -weight * J.transpose() * e;
-                    }
+                    ceres::CostFunction *cost_function =
+                        ReprojectionErrorStereo::Create(obs, P_w, K, mbf, inv_sigma);
+                    problem.AddResidualBlock(cost_function, loss_function, T_cw.data());
                 }
             }
-
-            Eigen::Matrix<double, 6, 1> dx = H.ldlt().solve(g);
-            if (std::isnan(dx[0]))
-                break;
-
-            Eigen::Matrix<double, 6, 1> xi;
-            xi << dx[3], dx[4], dx[5], dx[0], dx[1], dx[2];
-            T_cw = Sophus::SE3d::exp(xi) * T_cw;
-
-            if (dx.dot(dx) < 1e-12)
-                break;
         }
 
-        // 统计并标记 Outliers
+        // Ceres 配置与求解
+        ceres::Solver::Options options;
+        options.linear_solver_type = ceres::DENSE_QR;
+        options.max_num_iterations = its[it];
+        options.num_threads = 1;
+        options.minimizer_progress_to_stdout = false;
+
+        ceres::Solver::Summary summary;
+        ceres::Solve(options, &problem, &summary);
+
+        // 重新投影检验内点并标记 Outlier
         num_inliers = 0;
         {
             std::unique_lock<std::mutex> lock(MapPoint::mGlobalMutex);
@@ -434,6 +321,11 @@ int MotionOnlyBA::Optimize(Frame *pFrame)
         }
     }
 
-    pFrame->SetPose(T_cw.matrix().cast<float>());
+    // 回写优化后的位姿
+    Eigen::Quaterniond q_res = T_cw.unit_quaternion();
+    q_res.normalize();
+    Sophus::SE3d T_cw_normalized(q_res, T_cw.translation());
+    pFrame->SetPose(T_cw_normalized.matrix().cast<float>());
+    
     return num_inliers;
 }
