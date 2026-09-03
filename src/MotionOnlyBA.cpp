@@ -39,25 +39,53 @@ public:
     // Plus 的雅可比矩阵: d(Plus(x, delta)) / d(delta)|_{delta=0}
     bool PlusJacobian(const double *x, double *jacobian) const override
     {
-        ceres::MatrixRef J(jacobian, 7, 6);
+        // Ceres 默认要求行优先 (Row-major) 的 7x6 矩阵存储
+        Eigen::Map<Eigen::Matrix<double, 7, 6, Eigen::RowMajor>> J(jacobian);
         J.setZero();
 
-        // 也可以使用 ceres::AutoDiffManifold<SophusSE3ManifoldFunctor, 7, 6> 自动求导
-        // 若手动推导，数值有限差分最为稳健通用：
-        const double eps = 1e-8;
-        double x_plus[7];
-        double delta[6] = {0};
+        // 解析当前状态量
+        const double qx = x[0];
+        const double qy = x[1];
+        const double qz = x[2];
+        const double qw = x[3];
 
-        for (int i = 0; i < 6; ++i)
-        {
-            delta[i] = eps;
-            Plus(x, delta, x_plus);
-            for (int r = 0; r < 7; ++r)
-            {
-                J(r, i) = (x_plus[r] - x[r]) / eps;
-            }
-            delta[i] = 0.0;
-        }
+        const double tx = x[4];
+        const double ty = x[5];
+        const double tz = x[6];
+
+        // 1. d(q) / d(xi)
+        // d(q) / d(v) = 0
+        // d(q) / d(w) = 0.5 * [qw * I + [q_v]x; -q_v^T]
+        J(0, 3) = 0.5 * qw;
+        J(0, 4) = 0.5 * qz;
+        J(0, 5) = -0.5 * qy;
+        J(1, 3) = -0.5 * qz;
+        J(1, 4) = 0.5 * qw;
+        J(1, 5) = 0.5 * qx;
+        J(2, 3) = 0.5 * qy;
+        J(2, 4) = -0.5 * qx;
+        J(2, 5) = 0.5 * qw;
+        J(3, 3) = -0.5 * qx;
+        J(3, 4) = -0.5 * qy;
+        J(3, 5) = -0.5 * qz;
+
+        // 2. d(t) / d(xi)
+        // d(t) / d(v) = I_3x3
+        J(4, 0) = 1.0;
+        J(5, 1) = 1.0;
+        J(6, 2) = 1.0;
+
+        // d(t) / d(w) = -[t]x
+        J(4, 3) = 0.0;
+        J(4, 4) = tz;
+        J(4, 5) = -ty;
+        J(5, 3) = -tz;
+        J(5, 4) = 0.0;
+        J(5, 5) = tx;
+        J(6, 3) = ty;
+        J(6, 4) = -tx;
+        J(6, 5) = 0.0;
+
         return true;
     }
 
@@ -326,6 +354,6 @@ int MotionOnlyBA::Optimize(Frame *pFrame)
     q_res.normalize();
     Sophus::SE3d T_cw_normalized(q_res, T_cw.translation());
     pFrame->SetPose(T_cw_normalized.matrix().cast<float>());
-    
+
     return num_inliers;
 }
