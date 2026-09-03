@@ -746,7 +746,7 @@ void Optimizer::LocalBundleAdjustment(KeyFrame *pCurKF, bool *pbStopFlag, std::s
     ceres::Solver::Options options;
     options.linear_solver_type = ceres::SPARSE_SCHUR;
     options.trust_region_strategy_type = ceres::LEVENBERG_MARQUARDT;
-    options.num_threads = 4;
+    options.num_threads = 1;
     options.minimizer_progress_to_stdout = false;
     options.function_tolerance = 1e-4;
     options.gradient_tolerance = 1e-4;
@@ -1071,7 +1071,7 @@ void Optimizer::GlobalBundleAdjustment(Map *pMap, int nIterations, bool *pbStopF
     options.linear_solver_type = ceres::SPARSE_SCHUR;
     options.trust_region_strategy_type = ceres::LEVENBERG_MARQUARDT;
     options.max_num_iterations = nIterations;
-    options.num_threads = 4; // 开启多线程并行舒尔补分解
+    options.num_threads = 1; // 开启多线程并行舒尔补分解
     options.minimizer_progress_to_stdout = false;
 
     AbortCallback callback(pbStopFlag);
