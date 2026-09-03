@@ -37,6 +37,182 @@ private:
 };
 
 /**
+ * @brief Sophus SE(3) 自定义 Ceres Manifold (环境: Ceres >= 2.1)
+ * 参数块布局 (Ambient Size = 7):
+ *   - x[0..3]: Quaternion (x, y, z, w)
+ *   - x[4..6]: Translation (tx, ty, tz)
+ * 切空间布局 (Tangent Size = 6):
+ *   - delta[0..2]: 旋转李代数 phi (omega)
+ *   - delta[3..5]: 平移李代数 rho (v)
+ * 更新模型 (左乘扰动): T_plus = exp([rho, phi]) * T
+ */
+class SophusSE3Manifold : public ceres::Manifold
+{
+public:
+    ~SophusSE3Manifold() override = default;
+
+    int AmbientSize() const override { return 7; }
+    int TangentSize() const override { return 6; }
+
+    /**
+     * @brief 流形加法更新: x_plus = delta (+) x
+     */
+    bool Plus(const double *x, const double *delta, double *x_plus) const override
+    {
+        // 1. 读取当前估计的位姿
+        Eigen::Map<const Eigen::Quaterniond> q(x);
+        Eigen::Map<const Eigen::Vector3d> t(x + 4);
+        Sophus::SE3d T(q, t);
+
+        // 2. 读取 6 维李代数增量
+        // Sophus 的向量排布为 [v, omega]，这里 delta 为 [omega, v]
+        Eigen::Matrix<double, 6, 1> xi;
+        xi << delta[3], delta[4], delta[5], delta[0], delta[1], delta[2];
+
+        // 3. 施加左乘扰动
+        Sophus::SE3d T_plus = Sophus::SE3d::exp(xi) * T;
+
+        // 4. 写回 7 维参数
+        Eigen::Map<Eigen::Quaterniond> q_plus(x_plus);
+        Eigen::Map<Eigen::Vector3d> t_plus(x_plus + 4);
+
+        q_plus = T_plus.unit_quaternion();
+        t_plus = T_plus.translation();
+
+        return true;
+    }
+
+    /**
+     * @brief 解析求导计算 Plus 雅可比: J = d(x (+) delta) / d(delta) |_{delta=0} (7x6 矩阵)
+     * 行优先存储: 7 行 6 列
+     */
+    bool PlusJacobian(const double *x, double *jacobian) const override
+    {
+        // 初始化全部为 0
+        Eigen::Map<Eigen::Matrix<double, 7, 6, Eigen::RowMajor>> J(jacobian);
+        J.setZero();
+
+        const double qx = x[0];
+        const double qy = x[1];
+        const double qz = x[2];
+        const double qw = x[3];
+
+        const double tx = x[4];
+        const double ty = x[5];
+        const double tz = x[6];
+
+        // 1. 四元数关于旋转扰动 delta_phi 的导数 (4x3):
+        // q(+) = exp(phi/2) * q ≈ (1 + 0.5 * [phi]_x) * q
+        // d(q_plus)/d(phi) |_{phi=0} = 0.5 * [ qw*I + [q_vec]_x ; -q_vec^T ]
+        J(0, 0) = 0.5 * qw;
+        J(0, 1) = -0.5 * qz;
+        J(0, 2) = 0.5 * qy;
+        J(1, 0) = 0.5 * qz;
+        J(1, 1) = 0.5 * qw;
+        J(1, 2) = -0.5 * qx;
+        J(2, 0) = -0.5 * qy;
+        J(2, 1) = 0.5 * qx;
+        J(2, 2) = 0.5 * qw;
+        J(3, 0) = -0.5 * qx;
+        J(3, 1) = -0.5 * qy;
+        J(3, 2) = -0.5 * qz;
+
+        // 四元数关于平移扰动 delta_rho 的导数全为 0:
+        // J.block<4, 3>(0, 3).setZero(); 已初始化
+
+        // 2. 平移关于旋转与平移扰动的导数 (3x6):
+        // T_plus.t = exp(phi) * t + J_l * rho ≈ (I + [phi]_x) * t + rho = t - [t]_x * phi + rho
+        // d(t_plus)/d(phi) |_{phi=0} = -[t]_x
+        J(4, 0) = 0.0;
+        J(4, 1) = tz;
+        J(4, 2) = -ty;
+        J(5, 0) = -tz;
+        J(5, 1) = 0.0;
+        J(5, 2) = tx;
+        J(6, 0) = ty;
+        J(6, 1) = -tx;
+        J(6, 2) = 0.0;
+
+        // d(t_plus)/d(rho) |_{rho=0} = I (3x3 单位阵)
+        J(4, 3) = 1.0;
+        J(5, 4) = 1.0;
+        J(6, 5) = 1.0;
+
+        return true;
+    }
+
+    /**
+     * @brief 减法运算: delta = x_plus (-) x = log(T_plus * T^-1)
+     */
+    bool Minus(const double *y, const double *x, double *delta) const override
+    {
+        Eigen::Map<const Eigen::Quaterniond> q_x(x), q_y(y);
+        Eigen::Map<const Eigen::Vector3d> t_x(x + 4), t_y(y + 4);
+
+        Sophus::SE3d T_x(q_x, t_x);
+        Sophus::SE3d T_y(q_y, t_y);
+
+        Sophus::SE3d T_delta = T_y * T_x.inverse();
+        Eigen::Matrix<double, 6, 1> xi = T_delta.log(); // [v, omega]
+
+        delta[0] = xi[3];
+        delta[1] = xi[4];
+        delta[2] = xi[5];
+        delta[3] = xi[0];
+        delta[4] = xi[1];
+        delta[5] = xi[2];
+
+        return true;
+    }
+
+    /**
+     * @brief 减法雅可比: J = d(y (-) x) / d(y) |_{y=x} (6x7 矩阵)
+     */
+    bool MinusJacobian(const double *x, double *jacobian) const override
+    {
+        Eigen::Map<Eigen::Matrix<double, 6, 7, Eigen::RowMajor>> J(jacobian);
+        J.setZero();
+
+        const double qx = x[0];
+        const double qy = x[1];
+        const double qz = x[2];
+        const double qw = x[3];
+
+        const double tx = x[4];
+        const double ty = x[5];
+        const double tz = x[6];
+
+        // 旋转部分关于四元数的求导
+        J(0, 0) = 2.0 * qw;
+        J(0, 1) = 2.0 * qz;
+        J(0, 2) = -2.0 * qy;
+        J(0, 3) = -2.0 * qx;
+        J(1, 0) = -2.0 * qz;
+        J(1, 1) = 2.0 * qw;
+        J(1, 2) = 2.0 * qx;
+        J(1, 3) = -2.0 * qy;
+        J(2, 0) = 2.0 * qy;
+        J(2, 1) = -2.0 * qx;
+        J(2, 2) = 2.0 * qw;
+        J(2, 3) = -2.0 * qz;
+
+        // 平移部分
+        J(3, 4) = 1.0;
+        J(4, 5) = 1.0;
+        J(5, 6) = 1.0;
+
+        // 平移关于四元数求导 (在 y=x 处为 [t]_x * 2 * q_rel)
+        Eigen::Matrix3d tx_skew;
+        tx_skew << 0, -tz, ty,
+            tz, 0, -tx,
+            -ty, tx, 0;
+        J.block<3, 4>(3, 0) = tx_skew * J.block<3, 4>(0, 0);
+
+        return true;
+    }
+};
+
+/**
  * @brief 单目解析求导残差块（残差 2，参数块 0: 6维位姿增量, 参数块 1: 3维地图点）
  */
 class LocalRepoErrorAnalytic : public ceres::SizedCostFunction<2, 6, 3>
@@ -289,15 +465,15 @@ public:
         // 误差 e = log( T_ij_meas * T_jw * T_iw^-1 )
         Sophus::SE3d T_ij_est = T_iw * T_jw.inverse();
         Sophus::SE3d error_SE3 = T_ij_meas_ * T_ij_est.inverse();
-        
+
         // 提取 6 维李代数残差 [omega, v]
         Eigen::Matrix<double, 6, 1> error_vec = error_SE3.log(); // Sophus::log 返回 [v, w]
-        residuals[0] = error_vec[3]; // wx
-        residuals[1] = error_vec[4]; // wy
-        residuals[2] = error_vec[5]; // wz
-        residuals[3] = error_vec[0]; // vx
-        residuals[4] = error_vec[1]; // vy
-        residuals[5] = error_vec[2]; // vz
+        residuals[0] = error_vec[3];                             // wx
+        residuals[1] = error_vec[4];                             // wy
+        residuals[2] = error_vec[5];                             // wz
+        residuals[3] = error_vec[0];                             // vx
+        residuals[4] = error_vec[1];                             // vy
+        residuals[5] = error_vec[2];                             // vz
 
         if (jacobians)
         {
@@ -880,7 +1056,7 @@ void Optimizer::GlobalBundleAdjustment(Map *pMap, int nIterations, bool *pbStopF
             if (u_r >= 0.0f && depth > 0.0f && depth < pKF->mThDepth)
             {
                 cost = new LocalRepoErrorStereoAnalytic(fx, fy, cx, cy, pKF->mbf,
-                                                       kp.pt.x, kp.pt.y, u_r, T_init, sqrtInvSigma2);
+                                                        kp.pt.x, kp.pt.y, u_r, T_init, sqrtInvSigma2);
             }
             else
             {
