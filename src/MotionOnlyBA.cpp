@@ -109,84 +109,177 @@ public:
 };
 
 /**
- * @brief 单目重投影误差 (AutoDiff)
+ * @brief 单目重投影误差 (Analytic / 解析求导)
+ * 残差维度: 2, 参数块维度: 7 (qx, qy, qz, qw, tx, ty, tz)
  */
-struct ReprojectionErrorMono
+class ReprojectionErrorMono : public ceres::SizedCostFunction<2, 7>
 {
+public:
     ReprojectionErrorMono(const Eigen::Vector2d &observed, const Eigen::Vector3d &point_3d,
                           const Eigen::Matrix3d &K, double inv_sigma)
-        : observed_(observed), point_3d_(point_3d), fx_(K(0, 0)), fy_(K(1, 1)),
-          cx_(K(0, 2)), cy_(K(1, 2)), inv_sigma_(inv_sigma) {}
+        : observed_(observed), point_3d_(point_3d),
+          fx_(K(0, 0)), fy_(K(1, 1)), cx_(K(0, 2)), cy_(K(1, 2)),
+          inv_sigma_(inv_sigma) {}
 
-    template <typename T>
-    bool operator()(const T *const se3_raw, T *residuals) const
+    bool Evaluate(double const *const *parameters, double *residuals, double **jacobians) const override
     {
-        // 映射为 Sophus 对象
-        Eigen::Map<const Sophus::SE3<T>> T_cw(se3_raw);
-        Eigen::Matrix<T, 3, 1> p_w = point_3d_.cast<T>();
-        Eigen::Matrix<T, 3, 1> p_c = T_cw * p_w;
+        Eigen::Map<const Sophus::SE3d> T_cw(parameters[0]);
+        const Eigen::Vector3d P_c = T_cw * point_3d_;
 
-        T inv_z = T(1.0) / p_c[2];
-        T u = T(fx_) * p_c[0] * inv_z + T(cx_);
-        T v = T(fy_) * p_c[1] * inv_z + T(cy_);
+        const double X = P_c[0];
+        const double Y = P_c[1];
+        const double Z = P_c[2];
 
-        residuals[0] = (u - T(observed_[0])) * T(inv_sigma_);
-        residuals[1] = (v - T(observed_[1])) * T(inv_sigma_);
+        if (Z <= 0.0)
+            return false;
+
+        const double inv_z = 1.0 / Z;
+        const double inv_z2 = inv_z * inv_z;
+
+        const double u = fx_ * X * inv_z + cx_;
+        const double v = fy_ * Y * inv_z + cy_;
+
+        residuals[0] = (u - observed_[0]) * inv_sigma_;
+        residuals[1] = (v - observed_[1]) * inv_sigma_;
+
+        if (jacobians && jacobians[0])
+        {
+            Eigen::Map<Eigen::Matrix<double, 2, 7, Eigen::RowMajor>> J(jacobians[0]);
+            J.setZero();
+
+            // 1. d(res) / d(P_c)
+            Eigen::Matrix<double, 2, 3> J_proj;
+            J_proj(0, 0) = fx_ * inv_z * inv_sigma_;
+            J_proj(0, 1) = 0.0;
+            J_proj(0, 2) = -fx_ * X * inv_z2 * inv_sigma_;
+
+            J_proj(1, 0) = 0.0;
+            J_proj(1, 1) = fy_ * inv_z * inv_sigma_;
+            J_proj(1, 2) = -fy_ * Y * inv_z2 * inv_sigma_;
+
+            // 2. d(P_c) / d(q) 正确公式
+            const double Xw = point_3d_[0], Yw = point_3d_[1], Zw = point_3d_[2];
+            const Eigen::Quaterniond q = T_cw.unit_quaternion();
+            const double qx = q.x(), qy = q.y(), qz = q.z(), qw = q.w();
+
+            Eigen::Matrix<double, 3, 4> dPc_dq;
+            dPc_dq(0, 0) = 2.0 * (              qy * Yw + qz * Zw);
+            dPc_dq(0, 1) = 2.0 * (-2.0 * qy * Xw + qx * Yw + qw * Zw);
+            dPc_dq(0, 2) = 2.0 * (-2.0 * qz * Xw - qw * Yw + qx * Zw);
+            dPc_dq(0, 3) = 2.0 * (             - qz * Yw + qy * Zw);
+
+            dPc_dq(1, 0) = 2.0 * (  qy * Xw - 2.0 * qx * Yw - qw * Zw);
+            dPc_dq(1, 1) = 2.0 * (  qx * Xw              + qz * Zw);
+            dPc_dq(1, 2) = 2.0 * (  qw * Xw - 2.0 * qz * Yw + qy * Zw);
+            dPc_dq(1, 3) = 2.0 * (  qz * Xw              - qx * Zw);
+
+            dPc_dq(2, 0) = 2.0 * (  qz * Xw + qw * Yw - 2.0 * qx * Zw);
+            dPc_dq(2, 1) = 2.0 * (- qw * Xw + qz * Yw - 2.0 * qy * Zw);
+            dPc_dq(2, 2) = 2.0 * (  qx * Xw + qy * Yw             );
+            dPc_dq(2, 3) = 2.0 * (- qy * Xw + qx * Yw             );
+
+            // 3. 回填
+            J.block<2, 4>(0, 0) = J_proj * dPc_dq;
+            J.block<2, 3>(0, 4) = J_proj;
+        }
 
         return true;
     }
 
-    static ceres::CostFunction *Create(const Eigen::Vector2d &observed, const Eigen::Vector3d &point_3d,
-                                       const Eigen::Matrix3d &K, double inv_sigma)
-    {
-        return new ceres::AutoDiffCostFunction<ReprojectionErrorMono, 2, 7>(
-            new ReprojectionErrorMono(observed, point_3d, K, inv_sigma));
-    }
-
-    Eigen::Vector2d observed_;
-    Eigen::Vector3d point_3d_;
-    double fx_, fy_, cx_, cy_, inv_sigma_;
+private:
+    const Eigen::Vector2d observed_;
+    const Eigen::Vector3d point_3d_;
+    const double fx_, fy_, cx_, cy_, inv_sigma_;
 };
 
 /**
- * @brief 双目重投影误差 (AutoDiff)
+ * @brief 双目重投影误差 (Analytic / 解析求导)
+ * 残差维度: 3, 参数块维度: 7 (qx, qy, qz, qw, tx, ty, tz)
  */
-struct ReprojectionErrorStereo
+class ReprojectionErrorStereo : public ceres::SizedCostFunction<3, 7>
 {
+public:
     ReprojectionErrorStereo(const Eigen::Vector3d &observed, const Eigen::Vector3d &point_3d,
                             const Eigen::Matrix3d &K, double bf, double inv_sigma)
-        : observed_(observed), point_3d_(point_3d), fx_(K(0, 0)), fy_(K(1, 1)),
-          cx_(K(0, 2)), cy_(K(1, 2)), bf_(bf), inv_sigma_(inv_sigma) {}
+        : observed_(observed), point_3d_(point_3d),
+          fx_(K(0, 0)), fy_(K(1, 1)), cx_(K(0, 2)), cy_(K(1, 2)),
+          bf_(bf), inv_sigma_(inv_sigma) {}
 
-    template <typename T>
-    bool operator()(const T *const se3_raw, T *residuals) const
+    bool Evaluate(double const *const *parameters, double *residuals, double **jacobians) const override
     {
-        Eigen::Map<const Sophus::SE3<T>> T_cw(se3_raw);
-        Eigen::Matrix<T, 3, 1> p_w = point_3d_.cast<T>();
-        Eigen::Matrix<T, 3, 1> p_c = T_cw * p_w;
+        Eigen::Map<const Sophus::SE3d> T_cw(parameters[0]);
+        const Eigen::Vector3d P_c = T_cw * point_3d_;
 
-        T inv_z = T(1.0) / p_c[2];
-        T u = T(fx_) * p_c[0] * inv_z + T(cx_);
-        T v = T(fy_) * p_c[1] * inv_z + T(cy_);
-        T u_r = u - T(bf_) * inv_z;
+        const double X = P_c[0];
+        const double Y = P_c[1];
+        const double Z = P_c[2];
 
-        residuals[0] = (u - T(observed_[0])) * T(inv_sigma_);
-        residuals[1] = (v - T(observed_[1])) * T(inv_sigma_);
-        residuals[2] = (u_r - T(observed_[2])) * T(inv_sigma_);
+        if (Z <= 0.0)
+            return false;
+
+        const double inv_z = 1.0 / Z;
+        const double inv_z2 = inv_z * inv_z;
+
+        const double u = fx_ * X * inv_z + cx_;
+        const double v = fy_ * Y * inv_z + cy_;
+        const double u_r = u - bf_ * inv_z;
+
+        residuals[0] = (u - observed_[0]) * inv_sigma_;
+        residuals[1] = (v - observed_[1]) * inv_sigma_;
+        residuals[2] = (u_r - observed_[2]) * inv_sigma_;
+
+        if (jacobians && jacobians[0])
+        {
+            Eigen::Map<Eigen::Matrix<double, 3, 7, Eigen::RowMajor>> J(jacobians[0]);
+            J.setZero();
+
+            // 1. d(res) / d(P_c)
+            Eigen::Matrix<double, 3, 3> J_proj;
+            J_proj(0, 0) = fx_ * inv_z * inv_sigma_;
+            J_proj(0, 1) = 0.0;
+            J_proj(0, 2) = -fx_ * X * inv_z2 * inv_sigma_;
+
+            J_proj(1, 0) = 0.0;
+            J_proj(1, 1) = fy_ * inv_z * inv_sigma_;
+            J_proj(1, 2) = -fy_ * Y * inv_z2 * inv_sigma_;
+
+            J_proj(2, 0) = fx_ * inv_z * inv_sigma_;
+            J_proj(2, 1) = 0.0;
+            J_proj(2, 2) = -(fx_ * X - bf_) * inv_z2 * inv_sigma_;
+
+            // 2. d(P_c) / d(q) 正确公式
+            const double Xw = point_3d_[0], Yw = point_3d_[1], Zw = point_3d_[2];
+            const Eigen::Quaterniond q = T_cw.unit_quaternion();
+            const double qx = q.x(), qy = q.y(), qz = q.z(), qw = q.w();
+
+            Eigen::Matrix<double, 3, 4> dPc_dq;
+            dPc_dq(0, 0) = 2.0 * (              qy * Yw + qz * Zw);
+            dPc_dq(0, 1) = 2.0 * (-2.0 * qy * Xw + qx * Yw + qw * Zw);
+            dPc_dq(0, 2) = 2.0 * (-2.0 * qz * Xw - qw * Yw + qx * Zw);
+            dPc_dq(0, 3) = 2.0 * (             - qz * Yw + qy * Zw);
+
+            dPc_dq(1, 0) = 2.0 * (  qy * Xw - 2.0 * qx * Yw - qw * Zw);
+            dPc_dq(1, 1) = 2.0 * (  qx * Xw              + qz * Zw);
+            dPc_dq(1, 2) = 2.0 * (  qw * Xw - 2.0 * qz * Yw + qy * Zw);
+            dPc_dq(1, 3) = 2.0 * (  qz * Xw              - qx * Zw);
+
+            dPc_dq(2, 0) = 2.0 * (  qz * Xw + qw * Yw - 2.0 * qx * Zw);
+            dPc_dq(2, 1) = 2.0 * (- qw * Xw + qz * Yw - 2.0 * qy * Zw);
+            dPc_dq(2, 2) = 2.0 * (  qx * Xw + qy * Yw             );
+            dPc_dq(2, 3) = 2.0 * (- qy * Xw + qx * Yw             );
+
+            // 3. 回填
+            J.block<3, 4>(0, 0) = J_proj * dPc_dq;
+            J.block<3, 3>(0, 4) = J_proj;
+        }
 
         return true;
     }
 
-    static ceres::CostFunction *Create(const Eigen::Vector3d &observed, const Eigen::Vector3d &point_3d,
-                                       const Eigen::Matrix3d &K, double bf, double inv_sigma)
-    {
-        return new ceres::AutoDiffCostFunction<ReprojectionErrorStereo, 3, 7>(
-            new ReprojectionErrorStereo(observed, point_3d, K, bf, inv_sigma));
-    }
-
-    Eigen::Vector3d observed_;
-    Eigen::Vector3d point_3d_;
-    double fx_, fy_, cx_, cy_, bf_, inv_sigma_;
+private:
+    const Eigen::Vector3d observed_;
+    const Eigen::Vector3d point_3d_;
+    const double fx_, fy_, cx_, cy_, bf_, inv_sigma_;
 };
 
 int MotionOnlyBA::Optimize(Frame *pFrame)
@@ -264,7 +357,7 @@ int MotionOnlyBA::Optimize(Frame *pFrame)
                 {
                     Eigen::Vector2d obs(pFrame->mvKeysUn[i].pt.x, pFrame->mvKeysUn[i].pt.y);
                     ceres::CostFunction *cost_function =
-                        ReprojectionErrorMono::Create(obs, P_w, K, inv_sigma);
+                        new ReprojectionErrorMono(obs, P_w, K, inv_sigma);
                     problem.AddResidualBlock(cost_function, loss_function, T_cw.data());
                 }
                 else // 双目残差
@@ -274,7 +367,7 @@ int MotionOnlyBA::Optimize(Frame *pFrame)
                         loss_function = new ceres::HuberLoss(std::sqrt(chi2_stereo));
 
                     ceres::CostFunction *cost_function =
-                        ReprojectionErrorStereo::Create(obs, P_w, K, mbf, inv_sigma);
+                        new ReprojectionErrorStereo(obs, P_w, K, mbf, inv_sigma);
                     problem.AddResidualBlock(cost_function, loss_function, T_cw.data());
                 }
             }

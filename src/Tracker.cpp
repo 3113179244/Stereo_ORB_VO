@@ -215,7 +215,7 @@ bool Tracker::StereoInitialization()
         float z = mCurrentFrame.mvDepth[i];
 
         // 筛选条件：深度必须大于 0 且小于近点阈值 (mThDepth)
-        if (z > 0 && z < mCurrentFrame.mThDepth)
+        if (z > 0.0f && z < mCurrentFrame.mThDepth)
         {
             Eigen::Vector3f p3D = mCurrentFrame.UnprojectStereo(i);
             MapPoint *pMP = new MapPoint(p3D, pKFinit, mpMap.get());

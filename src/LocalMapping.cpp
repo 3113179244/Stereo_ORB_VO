@@ -321,8 +321,7 @@ void LocalMapping::CreateNewMapPoints()
 
             const cv::KeyPoint &kp0 = mpCurrentKeyFrame->mvKeysUn[i];
             const int level0 = kp0.octave;
-            const float fx_norm = mpCurrentKeyFrame->fx / 500.0f;
-            const float radius = 2.0f * (15.0f * std::max(1.0f, fx_norm)) * mpCurrentKeyFrame->mvScaleFactors[level0];
+            const float radius = 15.0f * mpCurrentKeyFrame->mvScaleFactors[level0];
             const std::vector<size_t> vCandidates =
                 pKF2->GetFeaturesInArea(kp0.pt.x, kp0.pt.y, radius, level0 - 1, level0 + 1);
             if (vCandidates.empty())
@@ -330,6 +329,7 @@ void LocalMapping::CreateNewMapPoints()
 
             const cv::Mat &d0 = Desc0.row(i);
             int bestDist = ORBmatcher::TH_LOW;
+            int secondBestDist = ORBmatcher::TH_LOW;
             int bestIdx2 = -1;
 
             for (size_t c = 0; c < vCandidates.size(); c++)
@@ -340,14 +340,23 @@ void LocalMapping::CreateNewMapPoints()
 
                 const cv::Mat &d2 = Desc2.row(j);
                 const int dist = ORBmatcher::DescriptorDistance(d0, d2);
+
                 if (dist < bestDist)
                 {
+                    secondBestDist = bestDist;
                     bestDist = dist;
                     bestIdx2 = static_cast<int>(j);
                 }
+                else if (dist < secondBestDist)
+                {
+                    secondBestDist = dist;
+                }
             }
 
+            // 2. 增加严格的 Ratio Test (0.7) 剔除模糊歧义匹配
             if (bestIdx2 < 0 || bestDist > ORBmatcher::TH_LOW)
+                continue;
+            if (static_cast<float>(bestDist) > 0.7f * static_cast<float>(secondBestDist))
                 continue;
 
             const Eigen::Matrix3f Rcw1 = Rcw0;
@@ -359,7 +368,7 @@ void LocalMapping::CreateNewMapPoints()
 
             float distEpipolar = CheckDistEpipolarLine(mpCurrentKeyFrame, pKF2, F12, i, bestIdx2);
             const float sigma2 = mpCurrentKeyFrame->mvLevelSigma2[level0];
-            if (distEpipolar > 3.841f * sigma2)
+            if (distEpipolar > 1.5f * std::sqrt(sigma2)) 
                 continue;
 
             Eigen::Vector2f xpi0((kp0.pt.x - cx) / fx, (kp0.pt.y - cy) / fy);

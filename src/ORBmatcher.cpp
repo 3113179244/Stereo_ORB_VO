@@ -423,13 +423,14 @@ int ORBmatcher::SearchByProjection(Frame &F, const std::vector<MapPoint *> &vpMa
         pMP->IncreaseVisible(1);
 
         // 5. 根据距离比例估算金字塔层级
-        const float ratio = pMP->GetMaxDistanceInvariance() / dist;
+        const float ratio = dist / pMP->GetMinDistanceInvariance();
         int predictedLevel = cvRound(std::log(ratio) / std::log(F.mpORBextractorLeft->GetScaleFactor()));
 
+        const int nLevels = F.mpORBextractorLeft->GetLevels();
         if (predictedLevel < 0)
             predictedLevel = 0;
-        else if (predictedLevel >= F.mpORBextractorLeft->GetLevels())
-            predictedLevel = F.mpORBextractorLeft->GetLevels() - 1;
+        else if (predictedLevel >= nLevels)
+            predictedLevel = nLevels - 1;
 
         // 6. 自适应搜索半径
         const float radius = th * F.mpORBextractorLeft->GetScaleFactors()[predictedLevel];
