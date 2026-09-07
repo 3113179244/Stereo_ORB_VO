@@ -130,8 +130,17 @@ public:
         const double Y = P_c[1];
         const double Z = P_c[2];
 
-        if (Z <= 0.0)
-            return false;
+        if (Z <= 1e-4)
+        {
+            residuals[0] = 0.0;
+            residuals[1] = 0.0;
+            if (jacobians && jacobians[0])
+            {
+                // 单目残差 2 维，位姿参数块 7 维，元素共 2 * 7 = 14 个
+                std::fill(jacobians[0], jacobians[0] + 14, 0.0);
+            }
+            return true;
+        }
 
         const double inv_z = 1.0 / Z;
         const double inv_z2 = inv_z * inv_z;
@@ -163,20 +172,20 @@ public:
             const double qx = q.x(), qy = q.y(), qz = q.z(), qw = q.w();
 
             Eigen::Matrix<double, 3, 4> dPc_dq;
-            dPc_dq(0, 0) = 2.0 * (              qy * Yw + qz * Zw);
+            dPc_dq(0, 0) = 2.0 * (qy * Yw + qz * Zw);
             dPc_dq(0, 1) = 2.0 * (-2.0 * qy * Xw + qx * Yw + qw * Zw);
             dPc_dq(0, 2) = 2.0 * (-2.0 * qz * Xw - qw * Yw + qx * Zw);
-            dPc_dq(0, 3) = 2.0 * (             - qz * Yw + qy * Zw);
+            dPc_dq(0, 3) = 2.0 * (-qz * Yw + qy * Zw);
 
-            dPc_dq(1, 0) = 2.0 * (  qy * Xw - 2.0 * qx * Yw - qw * Zw);
-            dPc_dq(1, 1) = 2.0 * (  qx * Xw              + qz * Zw);
-            dPc_dq(1, 2) = 2.0 * (  qw * Xw - 2.0 * qz * Yw + qy * Zw);
-            dPc_dq(1, 3) = 2.0 * (  qz * Xw              - qx * Zw);
+            dPc_dq(1, 0) = 2.0 * (qy * Xw - 2.0 * qx * Yw - qw * Zw);
+            dPc_dq(1, 1) = 2.0 * (qx * Xw + qz * Zw);
+            dPc_dq(1, 2) = 2.0 * (qw * Xw - 2.0 * qz * Yw + qy * Zw);
+            dPc_dq(1, 3) = 2.0 * (qz * Xw - qx * Zw);
 
-            dPc_dq(2, 0) = 2.0 * (  qz * Xw + qw * Yw - 2.0 * qx * Zw);
-            dPc_dq(2, 1) = 2.0 * (- qw * Xw + qz * Yw - 2.0 * qy * Zw);
-            dPc_dq(2, 2) = 2.0 * (  qx * Xw + qy * Yw             );
-            dPc_dq(2, 3) = 2.0 * (- qy * Xw + qx * Yw             );
+            dPc_dq(2, 0) = 2.0 * (qz * Xw + qw * Yw - 2.0 * qx * Zw);
+            dPc_dq(2, 1) = 2.0 * (-qw * Xw + qz * Yw - 2.0 * qy * Zw);
+            dPc_dq(2, 2) = 2.0 * (qx * Xw + qy * Yw);
+            dPc_dq(2, 3) = 2.0 * (-qy * Xw + qx * Yw);
 
             // 3. 回填
             J.block<2, 4>(0, 0) = J_proj * dPc_dq;
@@ -214,8 +223,18 @@ public:
         const double Y = P_c[1];
         const double Z = P_c[2];
 
-        if (Z <= 0.0)
-            return false;
+        if (Z <= 1e-4)
+        {
+            residuals[0] = 0.0;
+            residuals[1] = 0.0;
+            residuals[2] = 0.0;
+            if (jacobians && jacobians[0])
+            {
+                // 双目残差 3 维，位姿参数块 7 维，元素共 3 * 7 = 21 个
+                std::fill(jacobians[0], jacobians[0] + 21, 0.0);
+            }
+            return true;
+        }
 
         const double inv_z = 1.0 / Z;
         const double inv_z2 = inv_z * inv_z;
@@ -253,20 +272,20 @@ public:
             const double qx = q.x(), qy = q.y(), qz = q.z(), qw = q.w();
 
             Eigen::Matrix<double, 3, 4> dPc_dq;
-            dPc_dq(0, 0) = 2.0 * (              qy * Yw + qz * Zw);
+            dPc_dq(0, 0) = 2.0 * (qy * Yw + qz * Zw);
             dPc_dq(0, 1) = 2.0 * (-2.0 * qy * Xw + qx * Yw + qw * Zw);
             dPc_dq(0, 2) = 2.0 * (-2.0 * qz * Xw - qw * Yw + qx * Zw);
-            dPc_dq(0, 3) = 2.0 * (             - qz * Yw + qy * Zw);
+            dPc_dq(0, 3) = 2.0 * (-qz * Yw + qy * Zw);
 
-            dPc_dq(1, 0) = 2.0 * (  qy * Xw - 2.0 * qx * Yw - qw * Zw);
-            dPc_dq(1, 1) = 2.0 * (  qx * Xw              + qz * Zw);
-            dPc_dq(1, 2) = 2.0 * (  qw * Xw - 2.0 * qz * Yw + qy * Zw);
-            dPc_dq(1, 3) = 2.0 * (  qz * Xw              - qx * Zw);
+            dPc_dq(1, 0) = 2.0 * (qy * Xw - 2.0 * qx * Yw - qw * Zw);
+            dPc_dq(1, 1) = 2.0 * (qx * Xw + qz * Zw);
+            dPc_dq(1, 2) = 2.0 * (qw * Xw - 2.0 * qz * Yw + qy * Zw);
+            dPc_dq(1, 3) = 2.0 * (qz * Xw - qx * Zw);
 
-            dPc_dq(2, 0) = 2.0 * (  qz * Xw + qw * Yw - 2.0 * qx * Zw);
-            dPc_dq(2, 1) = 2.0 * (- qw * Xw + qz * Yw - 2.0 * qy * Zw);
-            dPc_dq(2, 2) = 2.0 * (  qx * Xw + qy * Yw             );
-            dPc_dq(2, 3) = 2.0 * (- qy * Xw + qx * Yw             );
+            dPc_dq(2, 0) = 2.0 * (qz * Xw + qw * Yw - 2.0 * qx * Zw);
+            dPc_dq(2, 1) = 2.0 * (-qw * Xw + qz * Yw - 2.0 * qy * Zw);
+            dPc_dq(2, 2) = 2.0 * (qx * Xw + qy * Yw);
+            dPc_dq(2, 3) = 2.0 * (-qy * Xw + qx * Yw);
 
             // 3. 回填
             J.block<3, 4>(0, 0) = J_proj * dPc_dq;
