@@ -112,7 +112,22 @@ int main(int argc, char **argv)
     cv::initUndistortRectifyMap(K_l, D_l, R_l, P_l.rowRange(0, 3).colRange(0, 3), imgSize, CV_32F, M1l, M2l);
     cv::initUndistortRectifyMap(K_r, D_r, R_r, P_r.rowRange(0, 3).colRange(0, 3), imgSize, CV_32F, M1r, M2r);
     std::cout << "[EuRoC] 极线校正与去畸变映射表初始化完成。" << std::endl;
+    // Config::setParameterFile(strConfigFile);
 
+    // // 极线校正后的虚拟理想内参来自 P_l 的左上角 3x3
+    // Config::g_dFx = P_l.at<double>(0, 0);
+    // Config::g_dFy = P_l.at<double>(1, 1);
+    // Config::g_dCx = P_l.at<double>(0, 2);
+    // Config::g_dCy = P_l.at<double>(1, 2);
+
+    // // 双目基线 bf = -P_r(0, 3)（OpenCV 标准极线校正矩阵中 P_r(0,3) = -fx * b）
+    // Config::g_dBf = std::fabs(P_r.at<double>(0, 3));
+
+    // // 已经通过 remap 去了畸变，畸变系数必须全部清零
+    // Config::g_dK1 = 0.0;
+    // Config::g_dK2 = 0.0;
+    // Config::g_dP1 = 0.0;
+    // Config::g_dP2 = 0.0;
     // 3. 初始化 SLAM 系统
     System SLAM(strConfigFile, strVocFile, System::STEREO, true);
     bool bIsPaused = false;

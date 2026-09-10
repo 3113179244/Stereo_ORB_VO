@@ -238,21 +238,7 @@ public:
 
         const double x = P_c[0];
         const double y = P_c[1];
-        const double z = P_c[2];
-
-        if (z <= 1e-4)
-        {
-            residuals[0] = 0.0;
-            residuals[1] = 0.0;
-            if (jacobians)
-            {
-                if (jacobians[0])
-                    std::fill(jacobians[0], jacobians[0] + 12, 0.0); // 2x6
-                if (jacobians[1])
-                    std::fill(jacobians[1], jacobians[1] + 6, 0.0); // 2x3
-            }
-            return true; // 返回 true，避免 Ceres 报错
-        }
+        const double z = std::max(P_c[2], 1e-4);
 
         const double inv_z = 1.0 / z;
         const double inv_z2 = inv_z * inv_z;
@@ -343,22 +329,7 @@ public:
 
         const double x = P_c[0];
         const double y = P_c[1];
-        const double z = P_c[2];
-
-        if (z <= 1e-4)
-        {
-            residuals[0] = 0.0;
-            residuals[1] = 0.0;
-            residuals[2] = 0.0;
-            if (jacobians)
-            {
-                if (jacobians[0])
-                    std::fill(jacobians[0], jacobians[0] + 18, 0.0); // 3x6
-                if (jacobians[1])
-                    std::fill(jacobians[1], jacobians[1] + 9, 0.0); // 3x3
-            }
-            return true; // 返回 true，避免 Ceres 报错
-        }
+        const double z = std::max(P_c[2], 1e-4);
 
         const double inv_z = 1.0 / z;
         const double inv_z2 = inv_z * inv_z;
@@ -549,11 +520,6 @@ static void ArrayToPose(KeyFrame *pKF, const double in[6])
     Tcw.block<3, 3>(0, 0) = R_cw.cast<float>();
     Tcw.block<3, 1>(0, 3) = t_cw.cast<float>();
     pKF->SetPose(Tcw);
-}
-
-int Optimizer::PoseOptimization(Frame *pFrame)
-{
-    return MotionOnlyBA::Optimize(pFrame);
 }
 
 /**
@@ -1005,7 +971,7 @@ void Optimizer::GlobalBundleAdjustment(Map *pMap, int nIterations, bool *pbStopF
     std::map<MapPoint *, Eigen::Vector3d> mapMP_Point;
     for (MapPoint *pMP : vpMPs)
     {
-        if (!pMP || pMP->isBad() || pMP->GetObservations().size() < 2)
+        if (!pMP || pMP->isBad() || pMP->GetObservations().size() < 3)
             continue;
         mapMP_Point[pMP] = pMP->GetWorldPos().cast<double>();
     }
@@ -1070,6 +1036,7 @@ void Optimizer::GlobalBundleAdjustment(Map *pMap, int nIterations, bool *pbStopF
     ceres::Solver::Options options;
     options.linear_solver_type = ceres::SPARSE_SCHUR;
     options.trust_region_strategy_type = ceres::LEVENBERG_MARQUARDT;
+    options.min_lm_diagonal = 1e-4; // 防止对角元过小
     options.max_num_iterations = nIterations;
     options.num_threads = 1; // 开启多线程并行舒尔补分解
     options.minimizer_progress_to_stdout = false;

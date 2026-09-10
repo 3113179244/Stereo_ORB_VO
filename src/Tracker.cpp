@@ -158,17 +158,13 @@ void Tracker::Track()
     if (mpFrameDrawer)
         mpFrameDrawer->Update(this);
 
-    if (mState == OK && !mCurrentFrame.mTcw.hasNaN() && !mCurrentFrame.mTcw.isZero())
+    // 只要不是 OK，或者存在 NaN，或者存在全零位姿，一律打上 LOST 标记
+    bool bPoseValid = (mState == OK) && (!mCurrentFrame.mTcw.hasNaN()) && (!mCurrentFrame.mTcw.isZero());
+
+    if (bPoseValid && mpReferenceKF)
     {
-        Eigen::Matrix4f Tcr = Eigen::Matrix4f::Identity();
-        if (mpReferenceKF && !mpReferenceKF->mbBad)
-        {
-            Tcr = mCurrentFrame.mTcw * mpReferenceKF->GetPoseInverse();
-        }
-        else
-        {
-            Tcr = mCurrentFrame.mTcw;
-        }
+        // 优先使用参考关键帧求相对位姿
+        Eigen::Matrix4f Tcr = mCurrentFrame.mTcw * mpReferenceKF->GetPoseInverse();
 
         mlRelativeFramePoses.push_back(Tcr);
         mlpReferences.push_back(mpReferenceKF);
@@ -177,19 +173,10 @@ void Tracker::Track()
     }
     else
     {
-        // 记录丢失帧
-        if (!mlRelativeFramePoses.empty())
-        {
-            mlRelativeFramePoses.push_back(mlRelativeFramePoses.back());
-            mlpReferences.push_back(mlpReferences.back());
-            mlFrameTimes.push_back(mCurrentFrame.mTimeStamp);
-        }
-        else
-        {
-            mlRelativeFramePoses.push_back(Eigen::Matrix4f::Identity());
-            mlpReferences.push_back(nullptr);
-            mlFrameTimes.push_back(mCurrentFrame.mTimeStamp);
-        }
+        // 丢失状态：填占位符，mlbLost 设为 true，确保导出轨迹时被过滤
+        mlRelativeFramePoses.push_back(Eigen::Matrix4f::Identity());
+        mlpReferences.push_back(nullptr);
+        mlFrameTimes.push_back(mCurrentFrame.mTimeStamp);
         mlbLost.push_back(true);
     }
 }

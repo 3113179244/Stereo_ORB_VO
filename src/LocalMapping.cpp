@@ -261,7 +261,7 @@ void LocalMapping::MapPointCulling()
             lit = mlpRecentAddedMapPoints.erase(lit);
         }
         // 3. 建立已超过 2 个关键帧，但观测帧数依然不足阈值
-        else if (((int)nCurrentKFid - (int)pMP->mnFirstKFid) >= 2 && static_cast<int>(pMP->GetObservations().size()) <= cnThObs)
+        else if (((int)nCurrentKFid - (int)pMP->mnFirstKFid) >= 2 && static_cast<int>(pMP->GetObservations().size()) < cnThObs)
         {
             pMP->SetBadFlag();
             lit = mlpRecentAddedMapPoints.erase(lit);
@@ -697,7 +697,7 @@ void LocalMapping::KeyFrameCulling()
 
                 // 地图点的观测关键帧数必须大于 3 才有可能冗余
                 const std::map<KeyFrame *, size_t> observations = pMP->GetObservations();
-                if (static_cast<int>(observations.size()) > thObs)
+                if (static_cast<int>(observations.size()) >= thObs)
                 {
                     const int &scaleLevel = pKF->mvKeysUn[i].octave;
 

@@ -221,20 +221,7 @@ public:
 
         const double X = P_c[0];
         const double Y = P_c[1];
-        const double Z = P_c[2];
-
-        if (Z <= 1e-4)
-        {
-            residuals[0] = 0.0;
-            residuals[1] = 0.0;
-            residuals[2] = 0.0;
-            if (jacobians && jacobians[0])
-            {
-                // 双目残差 3 维，位姿参数块 7 维，元素共 3 * 7 = 21 个
-                std::fill(jacobians[0], jacobians[0] + 21, 0.0);
-            }
-            return true;
-        }
+        const double Z = std::max(P_c[2], 1e-4);
 
         const double inv_z = 1.0 / Z;
         const double inv_z2 = inv_z * inv_z;
