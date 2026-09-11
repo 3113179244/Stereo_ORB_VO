@@ -116,69 +116,64 @@ static bool Triangulate(const Eigen::Matrix3f &R1, const Eigen::Vector3f &t1,
 
 void LocalMapping::Run()
 {
-    mbStopped = false;
+    mbFinished = false;
+
     while (1)
     {
-        // 【修改点 1】优先处理停止请求，避免卡死在内部死循环中
-        if (GetStopRequired())
-        {
-            {
-                std::unique_lock<std::mutex> lock(mMutexStop);
-                mbStopped = true;
-            }
+        // Step 1: 告诉 Tracking 线程当前 LocalMapping 处于繁忙状态
+        SetAcceptKeyFrames(false);
 
-            // 使用 mbStopRequested 作为循环判断条件，配合外部的 Release() 唤醒
-            while (GetStopRequired())
-            {
-                usleep(3000);
-            }
-
-            {
-                std::unique_lock<std::mutex> lock(mMutexStop);
-                mbStopped = false;
-            }
-        }
-
+        // Step 2: 检查队列中是否有待处理的关键帧
         if (CheckNewKeyFrames())
         {
-            SetNotStop();
-
-            // 1. 处理关键帧
+            // 2.1 处理列表最前端的关键帧（计算 BoW、关联地图点、更新共视连接并插入地图）
             ProcessNewKeyFrame();
 
-            // 2. 考核并剔除劣质地图点
+            // 2.2 严格考核并剔除质量不合格的新增地图点
             MapPointCulling();
 
-            // 3. 三角化新地图点
+            // 2.3 当前关键帧与高共视邻接关键帧进行特征匹配与三角化，生成新地图点
             CreateNewMapPoints();
 
-            // 4. 重复点融合
-            if (!CheckNewKeyFrames() && !GetStopRequired())
+            // 2.4 当队列中暂无新的待处理关键帧时，进行相邻关键帧的重复点融合
+            if (!CheckNewKeyFrames())
             {
                 SearchInNeighbors();
             }
 
-            // 5. 局部 BA 优化
+            mbAbortBA = false;
+
+            // 2.5 队列已空且外部未请求停止，执行优化与关键帧剔除
             if (!CheckNewKeyFrames() && !GetStopRequired())
             {
-                mbAbortBA = false;
-                Optimizer::LocalBundleAdjustment(mpCurrentKeyFrame, &mbAbortBA, mpMap);
+                // 局部地图内关键帧大于 2 帧时执行局部 BA
+                if (mpMap && mpMap->GetKeyFramesInMap() > 2)
+                {
+                    Optimizer::LocalBundleAdjustment(mpCurrentKeyFrame, &mbAbortBA, mpMap);
+                }
+
+                // 剔除共视图中 90% 以上地图点被重复观测的冗余关键帧
+                KeyFrameCulling();
             }
 
-            // 6. 剔除冗余关键帧
-            KeyFrameCulling();
-
+            // 2.6 将当前关键帧送入闭环检测队列
             if (mpSystem && mpSystem->GetLoopCloser())
             {
                 mpSystem->GetLoopCloser()->InsertKeyFrame(mpCurrentKeyFrame);
             }
-
+        }
+        else if (Stop()) // Step 3: 响应外部（如 LoopClosing）发出的停止/挂起请求
+        {
+            while (isStopped())
             {
-                std::unique_lock<std::mutex> lock(mMutexStop);
-                mbNotStop = false;
+                usleep(3000);
             }
         }
 
+        // Step 4: 循环尾部通知 Tracking 可以继续接收新关键帧
+        SetAcceptKeyFrames(true);
+
+        // Step 5: 避免空转占用 CPU，休眠 3 毫秒
         usleep(3000);
     }
 }
@@ -920,4 +915,15 @@ void LocalMapping::SetAcceptKeyFrames(bool flag)
 {
     std::unique_lock<std::mutex> lock(mMutexAccept);
     mbAcceptKeyFrames = flag;
+}
+
+bool LocalMapping::Stop()
+{
+    std::unique_lock<std::mutex> lock(mMutexStop);
+    if (mbStopRequested && !mbNotStop)
+    {
+        mbStopped = true;
+        return true;
+    }
+    return false;
 }

@@ -69,6 +69,8 @@ private:
     bool mbStopped;
     bool mbNotStop;
     bool mbAcceptKeyFrames;
+    bool mbFinished;
+    std::mutex mMutexFinish;
 };
 
 #endif // LOCALMAPPING_H

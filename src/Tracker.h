@@ -85,6 +85,8 @@ private:
     KeyFrame *mpReferenceKF;
     int mnLastKeyFrameId;
     int mnMatchesInliers;
+    unsigned long mnLastRelocFrameId = 0;
+    
 };
 
 #endif // TRACKER_H

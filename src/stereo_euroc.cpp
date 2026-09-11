@@ -98,7 +98,7 @@ int main(int argc, char **argv)
     fs["RIGHT.R"] >> R_r;
     fs["LEFT.P"] >> P_l;
     fs["RIGHT.P"] >> P_r;
-
+    
     int cols_l = fs["LEFT.width"];
     int rows_l = fs["LEFT.height"];
     int cols_r = fs["RIGHT.width"];
@@ -131,15 +131,12 @@ int main(int argc, char **argv)
     P_l.convertTo(P_l, CV_64F);
     P_r.convertTo(P_r, CV_64F);
 
-    // 3. 初始化 SLAM 系统 (内部会从 YAML 加载一遍配置)
-    System SLAM(strConfigFile, strVocFile, System::STEREO, true);
-
     // 4. 覆盖静态 Config 为校正后的真实内参
     Config::g_dFx = P_l.at<double>(0, 0);
     Config::g_dFy = P_l.at<double>(1, 1);
     Config::g_dCx = P_l.at<double>(0, 2);
     Config::g_dCy = P_l.at<double>(1, 2);
-
+    
     // 标准极线校正模型中：P_r(0, 3) = -fx * baseline
     Config::g_dBf = std::fabs(P_r.at<double>(0, 3));
 
@@ -154,6 +151,8 @@ int main(int argc, char **argv)
               << "  cx: " << Config::g_dCx << ", cy: " << Config::g_dCy << "\n"
               << "  bf: " << Config::g_dBf << " (Baseline: " << (Config::g_dBf / Config::g_dFx) << " m)\n"
               << "  k1, k2, p1, p2 均已重置为 0" << std::endl;
+              
+    System SLAM(strConfigFile, strVocFile, System::STEREO, true);
 
     bool bIsPaused = false;
 
