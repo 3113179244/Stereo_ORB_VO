@@ -129,26 +129,39 @@ void Frame::ComputeStereoMatches()
 
     const int thOrbDist = (ORBmatcher::TH_HIGH + ORBmatcher::TH_LOW) / 2;
 
-    const int nRows = mImGrayLeft.rows;
+    // 金字塔 0 层图像高度
+    const int nRows = mpORBextractorLeft->GetScaleFactors().empty() ? mImGrayLeft.rows : mImGrayLeft.rows;
     std::vector<std::vector<size_t>> vRowIndices(nRows, std::vector<size_t>());
+    for (int i = 0; i < nRows; i++)
+        vRowIndices[i].reserve(200);
 
-    for (int iR = 0; iR < static_cast<int>(mvKeysRight.size()); iR++)
+    const int Nr = mvKeysRight.size();
+
+    // 1. 建立右图特征点的行索引（考虑尺度半径扩展）
+    for (int iR = 0; iR < Nr; iR++)
     {
-        const cv::KeyPoint &kpR = mvKeysRight[iR];
-        const float &kpY = kpR.pt.y;
-        const float r = mpORBextractorLeft->GetScaleFactors()[kpR.octave] * 2.0f;
-
+        const cv::KeyPoint &kp = mvKeysRight[iR];
+        const float &kpY = kp.pt.y;
+        const float r = 2.0f * mpORBextractorLeft->GetScaleFactors()[kp.octave];
         const int maxr = std::ceil(kpY + r);
         const int minr = std::floor(kpY - r);
 
-        for (int recl = std::max(0, minr); recl <= std::min(nRows - 1, maxr); recl++)
-            vRowIndices[recl].push_back(iR);
+        for (int yi = minr; yi <= maxr; yi++)
+        {
+            if (yi >= 0 && yi < nRows)
+                vRowIndices[yi].push_back(iR);
+        }
     }
 
+    // 2. 视差范围约束
     const float minZ = mb;
     const float minD = 0.0f;
     const float maxD = mbf / minZ;
 
+    std::vector<std::pair<int, int>> vDistIdx;
+    vDistIdx.reserve(N);
+
+    // 3. 遍历左图特征点，搜索右图匹配
     for (int iL = 0; iL < N; iL++)
     {
         const cv::KeyPoint &kpL = mvKeys[iL];
@@ -166,14 +179,14 @@ void Frame::ComputeStereoMatches()
 
         const float minU = uL - maxD;
         const float maxU = uL - minD;
-        if (maxU < 0)
+        if (maxU < 0.0f)
             continue;
 
         int bestDist = ORBmatcher::TH_HIGH;
         size_t bestIdxR = 0;
-
         const cv::Mat &dL = mDescriptors.row(iL);
 
+        // 粗匹配：在极线范围内基于描述子汉明距离找最近邻
         for (size_t iC = 0; iC < vCandidates.size(); iC++)
         {
             const size_t iR = vCandidates[iC];
@@ -196,74 +209,140 @@ void Frame::ComputeStereoMatches()
             }
         }
 
+        // 4. 精确匹配：SAD 块滑动窗口与亚像素抛物线拟合
         if (bestDist < thOrbDist)
         {
             const cv::KeyPoint &kpR = mvKeysRight[bestIdxR];
             const float uR0 = kpR.pt.x;
-            const float vR0 = kpR.pt.y;
 
-            const int w = 5;
-            const int uL_round = cvRound(uL);
-            const int vR0_round = cvRound(vR0);
-            const int uR0_round = cvRound(uR0);
+            // 映射到金字塔当前层尺度
+            const float scaleFactor = mpORBextractorLeft->GetInverseScaleFactors()[levelL];
+            const float scaleduL = cvRound(kpL.pt.x * scaleFactor);
+            const float scaledvL = cvRound(kpL.pt.y * scaleFactor);
+            const float scaleduR0 = cvRound(uR0 * scaleFactor);
 
-            if (uL_round - w < 0 || uL_round + w >= mImGrayLeft.cols ||
-                vL_round - w < 0 || vL_round + w >= mImGrayLeft.rows ||
-                uR0_round - w - 2 < 0 || uR0_round + w + 2 >= mImGrayRight.cols ||
-                vR0_round - w < 0 || vR0_round + w >= mImGrayRight.rows)
+            const int w = 5; // 窗口半宽 (11x11 patch)
+            const int L = 5; // 滑动范围 [-L, L]
+
+            // 边界检查：确保左右图当前层 patch 不越界
+            // 采用原图与金字塔下采样图尺寸做校验
+            const int colsL = cvRound(mImGrayLeft.cols * scaleFactor);
+            const int rowsL = cvRound(mImGrayLeft.rows * scaleFactor);
+            const int colsR = cvRound(mImGrayRight.cols * scaleFactor);
+            const int rowsR = cvRound(mImGrayRight.rows * scaleFactor);
+
+            const int iniu = scaleduR0 - L - w;
+            const int endu = scaleduR0 + L + w + 1;
+
+            if (scaleduL - w < 0 || scaleduL + w + 1 > colsL ||
+                scaledvL - w < 0 || scaledvL + w + 1 > rowsL ||
+                iniu < 0 || endu > colsR)
                 continue;
 
-            int bestL = 0;
-            int distSubPixelMin = INT_MAX;
-            int vIdxToCost[5] = {0};
-
-            // 仅在水平方向 (incR) 滑动计算 SAD 块匹配代价
-            for (int incR = -2; incR <= 2; ++incR)
+            // 采样左图像块并去均值归一化 (直接在原灰度图按对应缩放比例采样像素，等价于原版金字塔抽取)
+            cv::Mat IL(2 * w + 1, 2 * w + 1, CV_32F);
+            const float invScale = mpORBextractorLeft->GetScaleFactors()[levelL];
+            for (int r = -w; r <= w; ++r)
             {
-                int distSubPixel = 0;
-                for (int wy = -w; wy <= w; ++wy)
-                {
-                    const uchar *pL = mImGrayLeft.ptr<uchar>(vL_round + wy);
-                    const uchar *pR = mImGrayRight.ptr<uchar>(vR0_round + wy); // 严格处于同一水平行
+                int origY = cvRound((scaledvL + r) * invScale);
+                origY = std::max(0, std::min(origY, mImGrayLeft.rows - 1));
+                const uchar *pL = mImGrayLeft.ptr<uchar>(origY);
+                float *pDst = IL.ptr<float>(r + w);
 
-                    for (int wx = -w; wx <= w; ++wx)
+                for (int c = -w; c <= w; ++c)
+                {
+                    int origX = cvRound((scaleduL + c) * invScale);
+                    origX = std::max(0, std::min(origX, mImGrayLeft.cols - 1));
+                    pDst[c + w] = static_cast<float>(pL[origX]);
+                }
+            }
+            IL = IL - IL.at<float>(w, w) * cv::Mat::ones(IL.rows, IL.cols, CV_32F);
+
+            float bestSadDist = std::numeric_limits<float>::max();
+            int bestincR = 0;
+            std::vector<float> vDists(2 * L + 1, 0.0f);
+
+            // 在 [-L, L] 范围内滑动
+            for (int incR = -L; incR <= L; incR++)
+            {
+                cv::Mat IR(2 * w + 1, 2 * w + 1, CV_32F);
+                for (int r = -w; r <= w; ++r)
+                {
+                    int origY = cvRound((scaledvL + r) * invScale);
+                    origY = std::max(0, std::min(origY, mImGrayRight.rows - 1));
+                    const uchar *pR = mImGrayRight.ptr<uchar>(origY);
+                    float *pDst = IR.ptr<float>(r + w);
+
+                    for (int c = -w; c <= w; ++c)
                     {
-                        distSubPixel += std::abs(pL[uL_round + wx] - pR[uR0_round + incR + wx]);
+                        int origX = cvRound((scaleduR0 + incR + c) * invScale);
+                        origX = std::max(0, std::min(origX, mImGrayRight.cols - 1));
+                        pDst[c + w] = static_cast<float>(pR[origX]);
                     }
                 }
+                IR = IR - IR.at<float>(w, w) * cv::Mat::ones(IR.rows, IR.cols, CV_32F);
 
-                vIdxToCost[incR + 2] = distSubPixel;
+                float sadDist = cv::norm(IL, IR, cv::NORM_L1);
+                vDists[L + incR] = sadDist;
 
-                if (distSubPixel < distSubPixelMin)
+                if (sadDist < bestSadDist)
                 {
-                    distSubPixelMin = distSubPixel;
-                    bestL = incR;
+                    bestSadDist = sadDist;
+                    bestincR = incR;
                 }
             }
 
-            if (bestL == -2 || bestL == 2)
+            // 极值落在边界则抛弃
+            if (bestincR == -L || bestincR == L)
                 continue;
 
-            // 抛物线拟合计算亚像素偏移
-            const float dist1 = vIdxToCost[bestL + 1];
-            const float dist2 = vIdxToCost[bestL + 2];
-            const float dist3 = vIdxToCost[bestL + 3];
+            // 抛物线亚像素插值
+            const float dist1 = vDists[L + bestincR - 1];
+            const float dist2 = vDists[L + bestincR];
+            const float dist3 = vDists[L + bestincR + 1];
 
             const float denom = 2.0f * (dist1 + dist3 - 2.0f * dist2);
             if (std::abs(denom) < 1e-5f)
                 continue;
 
-            const float delta = (dist1 - dist3) / denom;
-            if (delta < -1.0f || delta > 1.0f)
+            const float deltaR = (dist1 - dist3) / denom;
+            if (deltaR < -1.0f || deltaR > 1.0f)
                 continue;
 
-            const float bestuR = uR0_round + bestL + delta;
+            // 还原回原图尺度
+            float bestuR = invScale * (scaleduR0 + bestincR + deltaR);
             float disparity = uL - bestuR;
 
             if (disparity >= minD && disparity < maxD)
             {
+                if (disparity <= 0.0f)
+                {
+                    disparity = 0.01f;
+                    bestuR = uL - 0.01f;
+                }
+
                 mvDepth[iL] = mbf / disparity;
                 mvuRight[iL] = bestuR;
+                vDistIdx.push_back(std::make_pair(static_cast<int>(bestSadDist), iL));
+            }
+        }
+    }
+
+    // 5. ORB-SLAM2 官方外点剔除：基于中位数 SAD 过滤
+    if (!vDistIdx.empty())
+    {
+        std::sort(vDistIdx.begin(), vDistIdx.end());
+        const float median = vDistIdx[vDistIdx.size() / 2].first;
+        const float thDist = 1.5f * 1.4f * median;
+
+        for (int i = static_cast<int>(vDistIdx.size()) - 1; i >= 0; i--)
+        {
+            if (vDistIdx[i].first < thDist)
+                break;
+            else
+            {
+                mvuRight[vDistIdx[i].second] = -1.0f;
+                mvDepth[vDistIdx[i].second] = -1.0f;
             }
         }
     }

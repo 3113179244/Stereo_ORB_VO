@@ -33,6 +33,7 @@ public:
     void Release();
     bool SetNotStop();
     bool AcceptKeyFrames();
+    void SetAcceptKeyFrames(bool flag);
     bool GetStopRequired();
     void RequestStopBA();
     int KeyframesInQueue();
@@ -59,10 +60,11 @@ private:
     // 当前正在处理的关键帧与最近新增的地图点列表
     KeyFrame* mpCurrentKeyFrame;
     std::list<MapPoint*> mlpRecentAddedMapPoints;
-
-    // 线程与控制变量
+    
+    // 线程与控制变量   
     std::thread* mpThread;
     std::mutex mMutexStop;
+    std::mutex mMutexAccept;
     bool mbStopRequested;
     bool mbStopped;
     bool mbNotStop;

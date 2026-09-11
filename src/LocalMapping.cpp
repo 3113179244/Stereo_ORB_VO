@@ -242,31 +242,31 @@ void LocalMapping::MapPointCulling()
     auto lit = mlpRecentAddedMapPoints.begin();
     const unsigned long int nCurrentKFid = mpCurrentKeyFrame->mnId;
 
-    // 单目需要 2 个关键帧观测，双目系统有右目视差约束，3 帧观测更严格稳定
+    // 单目为 2，双目 / RGB-D 为 3
     const int cnThObs = 3;
 
     while (lit != mlpRecentAddedMapPoints.end())
     {
         MapPoint *pMP = *lit;
 
-        // 1. 若已被标记为坏点，直接从队列移出
         if (pMP->isBad())
         {
             lit = mlpRecentAddedMapPoints.erase(lit);
         }
-        // 2. 跟踪比例不合格（跟踪到的次数 / 预计可见次数 < 25%）
+        // 条件 1: 跟踪比例小于 25% 剔除
         else if (pMP->GetFoundRatio() < 0.25f)
         {
             pMP->SetBadFlag();
             lit = mlpRecentAddedMapPoints.erase(lit);
         }
-        // 3. 建立已超过 2 个关键帧，但观测帧数依然不足阈值
-        else if (((int)nCurrentKFid - (int)pMP->mnFirstKFid) >= 2 && static_cast<int>(pMP->GetObservations().size()) < cnThObs)
+        // 条件 2: 建立已过至少 2 个关键帧，但观测数 <= cnThObs 则判定为劣质点剔除
+        else if (((int)nCurrentKFid - (int)pMP->mnFirstKFid) >= 2 &&
+                 static_cast<int>(pMP->GetObservations().size()) <= cnThObs)
         {
             pMP->SetBadFlag();
             lit = mlpRecentAddedMapPoints.erase(lit);
         }
-        // 4. 连续存活达 3 个关键帧以上，顺利通过考核转正
+        // 条件 3: 连续存活 3 帧以上，考核通过转正
         else if (((int)nCurrentKFid - (int)pMP->mnFirstKFid) >= 3)
         {
             lit = mlpRecentAddedMapPoints.erase(lit);
@@ -278,147 +278,277 @@ void LocalMapping::MapPointCulling()
     }
 }
 
+static cv::Mat ComputeF12(KeyFrame *pKF1, KeyFrame *pKF2)
+{
+    Eigen::Matrix3f R1w_eig = pKF1->GetRotation();
+    Eigen::Vector3f t1w_eig = pKF1->GetTranslation();
+    Eigen::Matrix3f R2w_eig = pKF2->GetRotation();
+    Eigen::Vector3f t2w_eig = pKF2->GetTranslation();
+
+    Eigen::Matrix3f R12_eig = R1w_eig * R2w_eig.transpose();
+    Eigen::Vector3f t12_eig = -R1w_eig * R2w_eig.transpose() * t2w_eig + t1w_eig;
+
+    cv::Mat R12(3, 3, CV_32F);
+    for (int r = 0; r < 3; ++r)
+        for (int c = 0; c < 3; ++c)
+            R12.at<float>(r, c) = R12_eig(r, c);
+
+    cv::Mat t12x = (cv::Mat_<float>(3, 3) << 0.0f, -t12_eig(2), t12_eig(1),
+                    t12_eig(2), 0.0f, -t12_eig(0),
+                    -t12_eig(1), t12_eig(0), 0.0f);
+
+    const cv::Mat &K1 = pKF1->mK;
+    const cv::Mat &K2 = pKF2->mK;
+
+    return K1.t().inv() * t12x * R12 * K2.inv();
+}
+
 void LocalMapping::CreateNewMapPoints()
 {
-    if (mpMap->GetKeyFramesInMap() < 2)
-        return;
+    // 双目系统固定取权重排名前 10 的共视邻居
+    const int nn = 10;
+    const std::vector<KeyFrame *> vpNeighKFs = mpCurrentKeyFrame->GetBestCovisibilityKeyFrames(nn);
 
-    const int nn = 20;
-    std::vector<KeyFrame *> vpNeighKFs = mpCurrentKeyFrame->GetBestCovisibilityKeyFrames(nn);
-    if (vpNeighKFs.empty())
-        return;
+    ORBmatcher matcher(0.6f, false);
 
-    const Eigen::Matrix3f Rcw0 = mpCurrentKeyFrame->GetRotation();
-    const Eigen::Vector3f tcw0 = mpCurrentKeyFrame->GetTranslation();
-    const Eigen::Vector3f Ow0 = mpCurrentKeyFrame->GetCameraCenter();
+    Eigen::Matrix3f Rcw1_eig = mpCurrentKeyFrame->GetRotation();
+    Eigen::Matrix3f Rwc1_eig = Rcw1_eig.transpose();
+    Eigen::Vector3f tcw1_eig = mpCurrentKeyFrame->GetTranslation();
+    Eigen::Vector3f Ow1_eig = mpCurrentKeyFrame->GetCameraCenter();
 
-    const float fx = mpCurrentKeyFrame->fx;
-    const float fy = mpCurrentKeyFrame->fy;
-    const float cx = mpCurrentKeyFrame->cx;
-    const float cy = mpCurrentKeyFrame->cy;
-
-    std::vector<MapPoint *> vpMapPoints0 = mpCurrentKeyFrame->GetMapPointMatches();
-
-    for (size_t n = 0; n < vpNeighKFs.size(); n++)
+    cv::Mat Rcw1(3, 3, CV_32F), Rwc1(3, 3, CV_32F), tcw1(3, 1, CV_32F), Ow1(3, 1, CV_32F);
+    for (int r = 0; r < 3; ++r)
     {
-        KeyFrame *pKF2 = vpNeighKFs[n];
-        if (pKF2->mbBad)
-            continue;
-
-        const Eigen::Vector3f Ow2 = pKF2->GetCameraCenter();
-        const Eigen::Vector3f vBaseline = Ow2 - Ow0;
-        if (vBaseline.norm() < 1e-5f)
-            continue;
-
-        const cv::Mat &Desc0 = mpCurrentKeyFrame->mDescriptors;
-        const cv::Mat &Desc2 = pKF2->mDescriptors;
-        const std::vector<MapPoint *> vpMapPoints2 = pKF2->GetMapPointMatches();
-
-        for (int i = 0; i < mpCurrentKeyFrame->N; i++)
+        tcw1.at<float>(r) = tcw1_eig(r);
+        Ow1.at<float>(r) = Ow1_eig(r);
+        for (int c = 0; c < 3; ++c)
         {
-            if (vpMapPoints0[i])
-                continue;
+            Rcw1.at<float>(r, c) = Rcw1_eig(r, c);
+            Rwc1.at<float>(r, c) = Rwc1_eig(r, c);
+        }
+    }
 
-            const cv::KeyPoint &kp0 = mpCurrentKeyFrame->mvKeysUn[i];
-            const int level0 = kp0.octave;
-            const float radius = 15.0f * mpCurrentKeyFrame->mvScaleFactors[level0];
-            const std::vector<size_t> vCandidates =
-                pKF2->GetFeaturesInArea(kp0.pt.x, kp0.pt.y, radius, level0 - 1, level0 + 1);
-            if (vCandidates.empty())
-                continue;
+    cv::Mat Tcw1(3, 4, CV_32F);
+    Rcw1.copyTo(Tcw1.colRange(0, 3));
+    tcw1.copyTo(Tcw1.col(3));
 
-            const cv::Mat &d0 = Desc0.row(i);
-            int bestDist = ORBmatcher::TH_LOW;
-            int secondBestDist = ORBmatcher::TH_LOW;
-            int bestIdx2 = -1;
+    const float &fx1 = mpCurrentKeyFrame->fx;
+    const float &fy1 = mpCurrentKeyFrame->fy;
+    const float &cx1 = mpCurrentKeyFrame->cx;
+    const float &cy1 = mpCurrentKeyFrame->cy;
+    const float &invfx1 = mpCurrentKeyFrame->invfx;
+    const float &invfy1 = mpCurrentKeyFrame->invfy;
 
-            for (size_t c = 0; c < vCandidates.size(); c++)
+    const float ratioFactor = 1.5f * mpCurrentKeyFrame->mfScaleFactor;
+
+    for (size_t i = 0; i < vpNeighKFs.size(); i++)
+    {
+        if (i > 0 && CheckNewKeyFrames())
+            return;
+
+        KeyFrame *pKF2 = vpNeighKFs[i];
+        if (!pKF2 || pKF2->mbBad)
+            continue;
+
+        // 双目运动基线检查：相机移动距离小于物理基线时跳过
+        Eigen::Vector3f Ow2_eig = pKF2->GetCameraCenter();
+        cv::Mat Ow2 = (cv::Mat_<float>(3, 1) << Ow2_eig.x(), Ow2_eig.y(), Ow2_eig.z());
+        cv::Mat vBaseline = Ow2 - Ow1;
+        const float baseline = cv::norm(vBaseline);
+        if (baseline < pKF2->mb)
+            continue;
+
+        cv::Mat F12 = ComputeF12(mpCurrentKeyFrame, pKF2);
+
+        std::vector<std::pair<size_t, size_t>> vMatchedIndices;
+        matcher.SearchForTriangulation(mpCurrentKeyFrame, pKF2, F12, vMatchedIndices, false);
+
+        Eigen::Matrix3f Rcw2_eig = pKF2->GetRotation();
+        Eigen::Matrix3f Rwc2_eig = Rcw2_eig.transpose();
+        Eigen::Vector3f tcw2_eig = pKF2->GetTranslation();
+
+        cv::Mat Rcw2(3, 3, CV_32F), Rwc2(3, 3, CV_32F), tcw2(3, 1, CV_32F);
+        for (int r = 0; r < 3; ++r)
+        {
+            tcw2.at<float>(r) = tcw2_eig(r);
+            for (int c = 0; c < 3; ++c)
             {
-                const size_t j = vCandidates[c];
-                if (vpMapPoints2[j])
+                Rcw2.at<float>(r, c) = Rcw2_eig(r, c);
+                Rwc2.at<float>(r, c) = Rwc2_eig(r, c);
+            }
+        }
+
+        cv::Mat Tcw2(3, 4, CV_32F);
+        Rcw2.copyTo(Tcw2.colRange(0, 3));
+        tcw2.copyTo(Tcw2.col(3));
+
+        const float &fx2 = pKF2->fx;
+        const float &fy2 = pKF2->fy;
+        const float &cx2 = pKF2->cx;
+        const float &cy2 = pKF2->cy;
+        const float &invfx2 = pKF2->invfx;
+        const float &invfy2 = pKF2->invfy;
+
+        for (size_t ikp = 0; ikp < vMatchedIndices.size(); ikp++)
+        {
+            const int idx1 = vMatchedIndices[ikp].first;
+            const int idx2 = vMatchedIndices[ikp].second;
+
+            const cv::KeyPoint &kp1 = mpCurrentKeyFrame->mvKeysUn[idx1];
+            const float kp1_ur = mpCurrentKeyFrame->mvuRight[idx1];
+            const bool bStereo1 = (kp1_ur >= 0.0f);
+
+            const cv::KeyPoint &kp2 = pKF2->mvKeysUn[idx2];
+            const float kp2_ur = pKF2->mvuRight[idx2];
+            const bool bStereo2 = (kp2_ur >= 0.0f);
+
+            cv::Mat xn1 = (cv::Mat_<float>(3, 1) << (kp1.pt.x - cx1) * invfx1, (kp1.pt.y - cy1) * invfy1, 1.0f);
+            cv::Mat xn2 = (cv::Mat_<float>(3, 1) << (kp2.pt.x - cx2) * invfx2, (kp2.pt.y - cy2) * invfy2, 1.0f);
+
+            cv::Mat ray1 = Rwc1 * xn1;
+            cv::Mat ray2 = Rwc2 * xn2;
+            const float cosParallaxRays = ray1.dot(ray2) / (cv::norm(ray1) * cv::norm(ray2));
+
+            float cosParallaxStereo = cosParallaxRays + 1.0f;
+            float cosParallaxStereo1 = cosParallaxStereo;
+            float cosParallaxStereo2 = cosParallaxStereo;
+
+            // 独立评估两帧的双目等效视差角（修复 else-if 的单向遮蔽）
+            if (bStereo1)
+                cosParallaxStereo1 = cos(2.0f * atan2(mpCurrentKeyFrame->mb / 2.0f, mpCurrentKeyFrame->mvDepth[idx1]));
+            if (bStereo2)
+                cosParallaxStereo2 = cos(2.0f * atan2(pKF2->mb / 2.0f, pKF2->mvDepth[idx2]));
+
+            cosParallaxStereo = std::min(cosParallaxStereo1, cosParallaxStereo2);
+
+            cv::Mat x3D;
+            // 视差角合适时使用两帧三角化，否则优先选用视差角更大且满足视差阈值的双目反投影点
+            if (cosParallaxRays < cosParallaxStereo && cosParallaxRays > 0.0f && (bStereo1 || bStereo2 || cosParallaxRays < 0.9998f))
+            {
+                cv::Mat A(4, 4, CV_32F);
+                A.row(0) = xn1.at<float>(0) * Tcw1.row(2) - Tcw1.row(0);
+                A.row(1) = xn1.at<float>(1) * Tcw1.row(2) - Tcw1.row(1);
+                A.row(2) = xn2.at<float>(0) * Tcw2.row(2) - Tcw2.row(0);
+                A.row(3) = xn2.at<float>(1) * Tcw2.row(2) - Tcw2.row(1);
+
+                cv::Mat w, u, vt;
+                cv::SVD::compute(A, w, u, vt, cv::SVD::MODIFY_A | cv::SVD::FULL_UV);
+
+                x3D = vt.row(3).t();
+                if (x3D.at<float>(3) == 0.0f)
                     continue;
 
-                const cv::Mat &d2 = Desc2.row(j);
-                const int dist = ORBmatcher::DescriptorDistance(d0, d2);
-
-                if (dist < bestDist)
-                {
-                    secondBestDist = bestDist;
-                    bestDist = dist;
-                    bestIdx2 = static_cast<int>(j);
-                }
-                else if (dist < secondBestDist)
-                {
-                    secondBestDist = dist;
-                }
+                x3D = x3D.rowRange(0, 3) / x3D.at<float>(3);
+            }
+            else if (bStereo1 && cosParallaxStereo1 < 0.9998f && (cosParallaxStereo1 < cosParallaxStereo2 || !bStereo2))
+            {
+                Eigen::Vector3f x3D_eig = mpCurrentKeyFrame->UnprojectStereo(idx1);
+                x3D = (cv::Mat_<float>(3, 1) << x3D_eig.x(), x3D_eig.y(), x3D_eig.z());
+            }
+            else if (bStereo2 && cosParallaxStereo2 < 0.9998f)
+            {
+                Eigen::Vector3f x3D_eig = pKF2->UnprojectStereo(idx2);
+                x3D = (cv::Mat_<float>(3, 1) << x3D_eig.x(), x3D_eig.y(), x3D_eig.z());
+            }
+            else
+            {
+                continue;
             }
 
-            // 2. 增加严格的 Ratio Test (0.7) 剔除模糊歧义匹配
-            if (bestIdx2 < 0 || bestDist > ORBmatcher::TH_LOW)
-                continue;
-            if (static_cast<float>(bestDist) > 0.7f * static_cast<float>(secondBestDist))
-                continue;
+            cv::Mat x3Dt = x3D.t();
 
-            const Eigen::Matrix3f Rcw1 = Rcw0;
-            const Eigen::Vector3f tcw1 = tcw0;
-            const Eigen::Matrix3f Rcw2 = pKF2->GetRotation();
-            const Eigen::Vector3f tcw2 = pKF2->GetTranslation();
-
-            Eigen::Matrix3f F12 = ComputeFundamentalMatrix(Rcw1, tcw1, Rcw2, tcw2, fx, fy, cx, cy);
-
-            float distEpipolar = CheckDistEpipolarLine(mpCurrentKeyFrame, pKF2, F12, i, bestIdx2);
-            const float sigma2 = mpCurrentKeyFrame->mvLevelSigma2[level0];
-            if (distEpipolar > 1.5f * std::sqrt(sigma2)) 
+            float z1 = Rcw1.row(2).dot(x3Dt) + tcw1.at<float>(2);
+            if (z1 <= 0.0f)
                 continue;
 
-            Eigen::Vector2f xpi0((kp0.pt.x - cx) / fx, (kp0.pt.y - cy) / fy);
-            Eigen::Vector2f xpi2((pKF2->mvKeysUn[bestIdx2].pt.x - cx) / fx,
-                                 (pKF2->mvKeysUn[bestIdx2].pt.y - cy) / fy);
-
-            Eigen::Vector3f x3D;
-            if (!Triangulate(Rcw1, tcw1, Rcw2, tcw2, xpi0, xpi2, x3D))
-                continue;
-            if (std::isnan(x3D(0)) || std::isnan(x3D(1)) || std::isnan(x3D(2)))
+            float z2 = Rcw2.row(2).dot(x3Dt) + tcw2.at<float>(2);
+            if (z2 <= 0.0f)
                 continue;
 
-            Eigen::Vector3f Pc0 = Rcw1 * x3D + tcw1;
-            if (Pc0.z() <= 0.0f)
-                continue;
-            Eigen::Vector3f Pc2 = Rcw2 * x3D + tcw2;
-            if (Pc2.z() <= 0.0f)
+            // 检查当前关键帧重投影误差
+            const float &sigmaSquare1 = mpCurrentKeyFrame->mvLevelSigma2[kp1.octave];
+            const float x1 = Rcw1.row(0).dot(x3Dt) + tcw1.at<float>(0);
+            const float y1 = Rcw1.row(1).dot(x3Dt) + tcw1.at<float>(1);
+            const float invz1 = 1.0f / z1;
+
+            if (!bStereo1)
+            {
+                float u1 = fx1 * x1 * invz1 + cx1;
+                float v1 = fy1 * y1 * invz1 + cy1;
+                float errX1 = u1 - kp1.pt.x;
+                float errY1 = v1 - kp1.pt.y;
+                if ((errX1 * errX1 + errY1 * errY1) > 5.991f * sigmaSquare1)
+                    continue;
+            }
+            else
+            {
+                float u1 = fx1 * x1 * invz1 + cx1;
+                float u1_r = u1 - mpCurrentKeyFrame->mbf * invz1;
+                float v1 = fy1 * y1 * invz1 + cy1;
+                float errX1 = u1 - kp1.pt.x;
+                float errY1 = v1 - kp1.pt.y;
+                float errX1_r = u1_r - kp1_ur;
+                if ((errX1 * errX1 + errY1 * errY1 + errX1_r * errX1_r) > 7.815f * sigmaSquare1)
+                    continue;
+            }
+
+            // 检查相邻关键帧重投影误差（使用 pKF2 对应的 mbf）
+            const float sigmaSquare2 = pKF2->mvLevelSigma2[kp2.octave];
+            const float x2 = Rcw2.row(0).dot(x3Dt) + tcw2.at<float>(0);
+            const float y2 = Rcw2.row(1).dot(x3Dt) + tcw2.at<float>(1);
+            const float invz2 = 1.0f / z2;
+
+            if (!bStereo2)
+            {
+                float u2 = fx2 * x2 * invz2 + cx2;
+                float v2 = fy2 * y2 * invz2 + cy2;
+                float errX2 = u2 - kp2.pt.x;
+                float errY2 = v2 - kp2.pt.y;
+                if ((errX2 * errX2 + errY2 * errY2) > 5.991f * sigmaSquare2)
+                    continue;
+            }
+            else
+            {
+                float u2 = fx2 * x2 * invz2 + cx2;
+                float u2_r = u2 - pKF2->mbf * invz2;
+                float v2 = fy2 * y2 * invz2 + cy2;
+                float errX2 = u2 - kp2.pt.x;
+                float errY2 = v2 - kp2.pt.y;
+                float errX2_r = u2_r - kp2_ur;
+                if ((errX2 * errX2 + errY2 * errY2 + errX2_r * errX2_r) > 7.815f * sigmaSquare2)
+                    continue;
+            }
+
+            // 尺度一致性检验
+            cv::Mat normal1 = x3D - Ow1;
+            float dist1 = cv::norm(normal1);
+            cv::Mat normal2 = x3D - Ow2;
+            float dist2 = cv::norm(normal2);
+
+            if (dist1 == 0.0f || dist2 == 0.0f)
                 continue;
 
-            // 重投影误差检验
-            const float u0 = fx * Pc0.x() / Pc0.z() + cx;
-            const float v0 = fy * Pc0.y() / Pc0.z() + cy;
-            const float reprojErr0 = (u0 - kp0.pt.x) * (u0 - kp0.pt.x) + (v0 - kp0.pt.y) * (v0 - kp0.pt.y);
-            if (reprojErr0 > 5.991f * sigma2)
+            const float ratioDist = dist2 / dist1;
+            const float ratioOctave = mpCurrentKeyFrame->mvScaleFactors[kp1.octave] / pKF2->mvScaleFactors[kp2.octave];
+
+            if (ratioDist * ratioFactor < ratioOctave || ratioDist > ratioOctave * ratioFactor)
                 continue;
 
-            const float u2 = fx * Pc2.x() / Pc2.z() + cx;
-            const float v2 = fy * Pc2.y() / Pc2.z() + cy;
-            const float reprojErr2 = (u2 - pKF2->mvKeysUn[bestIdx2].pt.x) * (u2 - pKF2->mvKeysUn[bestIdx2].pt.x) +
-                                     (v2 - pKF2->mvKeysUn[bestIdx2].pt.y) * (v2 - pKF2->mvKeysUn[bestIdx2].pt.y);
-            if (reprojErr2 > 5.991f * sigma2)
-                continue;
+            // 创建并注册新地图点
+            Eigen::Vector3f x3D_pos(x3D.at<float>(0), x3D.at<float>(1), x3D.at<float>(2));
+            MapPoint *pMP = new MapPoint(x3D_pos, mpCurrentKeyFrame, mpMap.get());
 
-            const Eigen::Vector3f ray0 = (x3D - Ow0).normalized();
-            const Eigen::Vector3f ray2 = (x3D - Ow2).normalized();
-            if (ComputeParallax(ray0, ray2) < 1.0)
-                continue;
+            pMP->AddObservation(mpCurrentKeyFrame, idx1);
+            pMP->AddObservation(pKF2, idx2);
 
-            MapPoint *pMP = new MapPoint(x3D, mpCurrentKeyFrame, mpMap.get());
-            pMP->AddObservation(mpCurrentKeyFrame, i);
-            pMP->AddObservation(pKF2, bestIdx2);
-            mpCurrentKeyFrame->AddMapPoint(pMP, i);
-            pKF2->AddMapPoint(pMP, bestIdx2);
+            mpCurrentKeyFrame->AddMapPoint(pMP, idx1);
+            pKF2->AddMapPoint(pMP, idx2);
 
             pMP->ComputeDistinctiveDescriptor();
             pMP->UpdateNormalAndDepth();
 
             mpMap->AddMapPoint(pMP);
             mlpRecentAddedMapPoints.push_back(pMP);
-            vpMapPoints0[i] = pMP;
         }
     }
 }
@@ -664,45 +794,40 @@ void LocalMapping::SearchInNeighbors()
  */
 void LocalMapping::KeyFrameCulling()
 {
-    // Step 1: 获取当前关键帧所有的共视关键帧
-    std::vector<KeyFrame *> vpLocalKeyFrames = mpCurrentKeyFrame->GetConnectedKeyFrames();
+    // 获取按共视权重降序排列的共视关键帧列表
+    const std::vector<KeyFrame *> vpLocalKeyFrames = mpCurrentKeyFrame->GetVectorCovisibleKeyFrames();
 
-    // 对所有的共视关键帧进行遍历
-    for (std::vector<KeyFrame *>::iterator vit = vpLocalKeyFrames.begin(), vend = vpLocalKeyFrames.end(); vit != vend; ++vit)
+    for (std::vector<KeyFrame *>::const_iterator vit = vpLocalKeyFrames.begin(), vend = vpLocalKeyFrames.end(); vit != vend; ++vit)
     {
         KeyFrame *pKF = *vit;
-
-        // 保护初始关键帧不被剔除，跳过坏帧
         if (!pKF || pKF->mnId == 0 || pKF->mbBad)
             continue;
 
-        // Step 2: 提取该共视关键帧关联的所有地图点
         const std::vector<MapPoint *> vpMapPoints = pKF->GetMapPointMatches();
 
-        const int thObs = 3;            // 冗余观测次数门槛
-        int nRedundantObservations = 0; // 记录冗余地图点数量
-        int nMPs = 0;                   // 记录该帧有效近处地图点总数
+        const int thObs = 3;
+        int nRedundantObservations = 0;
+        int nMPs = 0;
 
-        // Step 3: 遍历该关键帧下的所有地图点
-        for (size_t i = 0; i < vpMapPoints.size(); i++)
+        for (size_t i = 0; i < vpMapPoints.size(); ++i)
         {
             MapPoint *pMP = vpMapPoints[i];
             if (pMP && !pMP->isBad())
             {
-                // 双目专属逻辑：仅考虑深度有效的近点来进行冗余评估（远点不作为主冗余依据）
-                if (pKF->mvDepth[i] > pKF->mThDepth || pKF->mvDepth[i] <= 0.0f)
+                // 对齐 ORB-SLAM2 官方双目逻辑：跳过深度无效 (<=0) 或超过近点阈值的远点
+                const float &z = pKF->mvDepth[i];
+                if (z <= 0.0f || z > pKF->mThDepth)
                     continue;
 
                 nMPs++;
 
-                // 地图点的观测关键帧数必须大于 3 才有可能冗余
+                // 地图点总观测数 > 3 才可能冗余
                 const std::map<KeyFrame *, size_t> observations = pMP->GetObservations();
-                if (static_cast<int>(observations.size()) >= thObs)
+                if (static_cast<int>(observations.size()) > thObs)
                 {
-                    const int &scaleLevel = pKF->mvKeysUn[i].octave;
-
+                    const int scaleLevel = pKF->mvKeysUn[i].octave;
                     int nObs = 0;
-                    // 遍历观测到该地图点的所有关键帧
+
                     for (auto mit = observations.begin(), mend = observations.end(); mit != mend; ++mit)
                     {
                         KeyFrame *pKFi = mit->first;
@@ -713,10 +838,10 @@ void LocalMapping::KeyFrameCulling()
                         if (idx_i >= pKFi->mvKeysUn.size())
                             continue;
 
-                        const int &scaleLeveli = pKFi->mvKeysUn[idx_i].octave;
+                        const int scaleLeveli = pKFi->mvKeysUn[idx_i].octave;
 
-                        // 尺度约束：只有其它关键帧的观测分辨率优于或等同于当前帧时（即 scaleLeveli <= scaleLevel + 1），才算作有效冗余观测
-                        if (scaleLeveli <= scaleLevel+1)
+                        // 尺度条件：在相同或更优尺度层级 (scaleLeveli <= scaleLevel + 1) 下被观测
+                        if (scaleLeveli <= scaleLevel + 1)
                         {
                             nObs++;
                             if (nObs >= thObs)
@@ -724,16 +849,13 @@ void LocalMapping::KeyFrameCulling()
                         }
                     }
 
-                    // 该地图点在相同/更优尺度下被至少 3 个其它关键帧观测到
                     if (nObs >= thObs)
-                    {
                         nRedundantObservations++;
-                    }
                 }
             }
         }
 
-        // Step 4: 90% 以上的有效近点为冗余观测点时，删除该关键帧
+        // 冗余点超过 90% 则标记剔除
         if (nMPs > 0 && (float)nRedundantObservations > 0.90f * (float)nMPs)
         {
             pKF->SetBadFlag();
@@ -786,4 +908,16 @@ void LocalMapping::Release()
     mbStopRequested = false;
     mbStopped = false;
     mbNotStop = false;
+}
+
+bool LocalMapping::AcceptKeyFrames()
+{
+    std::unique_lock<std::mutex> lock(mMutexAccept);
+    return mbAcceptKeyFrames;
+}
+
+void LocalMapping::SetAcceptKeyFrames(bool flag)
+{
+    std::unique_lock<std::mutex> lock(mMutexAccept);
+    mbAcceptKeyFrames = flag;
 }

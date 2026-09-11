@@ -592,3 +592,24 @@ Eigen::Matrix4f KeyFrame::GetRelativePoseToParent()
     std::unique_lock<std::mutex> lock(mMutexPose);
     return mTcp;
 }
+
+std::vector<KeyFrame*> KeyFrame::GetVectorCovisibleKeyFrames()
+{
+    std::unique_lock<std::mutex> lock(mMutexConnections);
+    return mvpOrderedConnectedKeyFrames;
+}
+
+Eigen::Vector3f KeyFrame::UnprojectStereo(int i)
+{
+    const float z = mvDepth[i];
+    if (z > 0.0f)
+    {
+        const float u = mvKeysUn[i].pt.x;
+        const float v = mvKeysUn[i].pt.y;
+        const float x = (u - cx) * z * invfx;
+        const float y = (v - cy) * z * invfy;
+        Eigen::Vector3f x3Dc(x, y, z);
+        return GetPoseInverse().block<3, 3>(0, 0) * x3Dc + GetCameraCenter();
+    }
+    return Eigen::Vector3f::Zero();
+}

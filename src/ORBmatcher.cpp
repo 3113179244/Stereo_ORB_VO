@@ -645,3 +645,175 @@ int ORBmatcher::SearchByBoW(KeyFrame *pKF1, KeyFrame *pKF2, std::vector<MapPoint
 
     return nmatches;
 }
+
+int ORBmatcher::SearchForTriangulation(KeyFrame *pKF1, KeyFrame *pKF2, cv::Mat F12,
+                                       std::vector<std::pair<size_t, size_t> > &vMatchedPairs,
+                                       const bool bOnlyStereo)
+{
+    const DBoW3::FeatureVector &vFeatVec1 = pKF1->mFeatVec;
+    const DBoW3::FeatureVector &vFeatVec2 = pKF2->mFeatVec;
+
+    // 使用 Eigen 接收位姿并计算极点
+    Eigen::Matrix3f Rcw2_eig = pKF2->GetRotation();
+    Eigen::Vector3f tcw2_eig = pKF2->GetTranslation();
+    Eigen::Vector3f Ow1_eig = pKF1->GetCameraCenter();
+
+    // pKF1 的光心在 pKF2 相机坐标系下的坐标: e2 = Rcw2 * Ow1 + tcw2
+    Eigen::Vector3f e2 = Rcw2_eig * Ow1_eig + tcw2_eig;
+    float e2x = e2.x();
+    float e2y = e2.y();
+    float e2z = e2.z();
+    float invz = 1.0f / e2z;
+    float ex = pKF2->fx * e2x * invz + pKF2->cx;
+    float ey = pKF2->fy * e2y * invz + pKF2->cy;
+
+    std::vector<int> vMatched2(pKF2->N, -1);
+    std::vector<int> vMatched1(pKF1->N, -1);
+    std::vector<int> vMatchedDistance(pKF2->N, INT_MAX);
+
+    std::vector<int> rotHist[HISTO_LENGTH];
+    int histo[HISTO_LENGTH] = {0};
+    const float rotFactor = static_cast<float>(HISTO_LENGTH) / 360.0f;
+
+    int nmatches = 0;
+
+    auto f1it = vFeatVec1.begin();
+    auto f2it = vFeatVec2.begin();
+    auto f1end = vFeatVec1.end();
+    auto f2end = vFeatVec2.end();
+
+    while (f1it != f1end && f2it != f2end)
+    {
+        if (f1it->first == f2it->first)
+        {
+            for (size_t i1 = 0; i1 < f1it->second.size(); i1++)
+            {
+                const size_t idx1 = f1it->second[i1];
+                MapPoint *pMP1 = pKF1->GetMapPoint(idx1);
+                if (pMP1)
+                    continue;
+
+                const bool bStereo1 = pKF1->mvuRight[idx1] >= 0;
+                if (bOnlyStereo && !bStereo1)
+                    continue;
+
+                const cv::KeyPoint &kp1 = pKF1->mvKeysUn[idx1];
+                const cv::Mat &d1 = pKF1->mDescriptors.row(idx1);
+
+                int bestDist = TH_LOW;
+                int bestIdx2 = -1;
+
+                for (size_t i2 = 0; i2 < f2it->second.size(); i2++)
+                {
+                    const size_t idx2 = f2it->second[i2];
+                    MapPoint *pMP2 = pKF2->GetMapPoint(idx2);
+                    if (pMP2)
+                        continue;
+
+                    const bool bStereo2 = pKF2->mvuRight[idx2] >= 0;
+                    if (bOnlyStereo && !bStereo2)
+                        continue;
+
+                    const cv::Mat &d2 = pKF2->mDescriptors.row(idx2);
+                    const int dist = DescriptorDistance(d1, d2);
+                    if (dist > TH_LOW || dist > bestDist)
+                        continue;
+
+                    const cv::KeyPoint &kp2 = pKF2->mvKeysUn[idx2];
+
+                    if (!bStereo1 && !bStereo2)
+                    {
+                        float distex = kp2.pt.x - ex;
+                        float distey = kp2.pt.y - ey;
+                        if (distex * distex + distey * distey < 100.0f * pKF2->mvScaleFactors[kp2.octave])
+                            continue;
+                    }
+
+                    // 极线距离检查: l = F12 * p1
+                    const float a = kp1.pt.x * F12.at<float>(0, 0) + kp1.pt.y * F12.at<float>(1, 0) + F12.at<float>(2, 0);
+                    const float b = kp1.pt.x * F12.at<float>(0, 1) + kp1.pt.y * F12.at<float>(1, 1) + F12.at<float>(2, 1);
+                    const float c = kp1.pt.x * F12.at<float>(0, 2) + kp1.pt.y * F12.at<float>(1, 2) + F12.at<float>(2, 2);
+
+                    const float num = a * kp2.pt.x + b * kp2.pt.y + c;
+                    const float den = a * a + b * b;
+                    if (den == 0.0f)
+                        continue;
+
+                    if ((num * num / den) > 3.841f * pKF2->mvLevelSigma2[kp2.octave])
+                        continue;
+
+                    if (dist < bestDist)
+                    {
+                        bestDist = dist;
+                        bestIdx2 = idx2;
+                    }
+                }
+
+                if (bestIdx2 >= 0)
+                {
+                    if (vMatchedDistance[bestIdx2] > bestDist)
+                    {
+                        if (vMatched2[bestIdx2] >= 0)
+                            vMatched1[vMatched2[bestIdx2]] = -1;
+                        else
+                            nmatches++;
+
+                        vMatched2[bestIdx2] = idx1;
+                        vMatched1[idx1] = bestIdx2;
+                        vMatchedDistance[bestIdx2] = bestDist;
+
+                        if (mbCheckOrientation)
+                        {
+                            float rot = pKF1->mvKeysUn[idx1].angle - pKF2->mvKeysUn[bestIdx2].angle;
+                            if (rot < 0.0f)
+                                rot += 360.0f;
+                            int bin = cvRound(rot * rotFactor);
+                            if (bin == HISTO_LENGTH)
+                                bin = 0;
+                            rotHist[bin].push_back(idx1);
+                            histo[bin]++;
+                        }
+                    }
+                }
+            }
+            f1it++;
+            f2it++;
+        }
+        else if (f1it->first < f2it->first)
+            f1it++;
+        else
+            f2it++;
+    }
+
+    if (mbCheckOrientation)
+    {
+        int ind1 = -1, ind2 = -1, ind3 = -1;
+        ComputeThreeBestIdx(histo, HISTO_LENGTH, ind1, ind2, ind3);
+
+        for (int i = 0; i < HISTO_LENGTH; i++)
+        {
+            if (i == ind1 || i == ind2 || i == ind3)
+                continue;
+            for (size_t j = 0; j < rotHist[i].size(); j++)
+            {
+                int idx1 = rotHist[i][j];
+                if (vMatched1[idx1] >= 0)
+                {
+                    vMatched2[vMatched1[idx1]] = -1;
+                    vMatched1[idx1] = -1;
+                    nmatches--;
+                }
+            }
+        }
+    }
+
+    vMatchedPairs.clear();
+    vMatchedPairs.reserve(nmatches);
+    for (int i = 0; i < pKF1->N; i++)
+    {
+        if (vMatched1[i] >= 0)
+            vMatchedPairs.push_back(std::make_pair(i, vMatched1[i]));
+    }
+
+    return nmatches;
+}

@@ -159,13 +159,11 @@ void System::SaveTrajectoryKITTI(const std::string &filename)
         return;
     }
 
-    // 1. 严格按照关键帧 ID 从小到大排序，拿到第 0 个关键帧
+    // 1. 按关键帧 ID 递增排序，保证第一帧关键帧排在首位
     std::sort(vpKFs.begin(), vpKFs.end(),
-              [](KeyFrame *a, KeyFrame *b)
-              { return a->mnId < b->mnId; });
+              [](KeyFrame *a, KeyFrame *b) { return a->mnId < b->mnId; });
 
-    // 2. 原版官方定义：Two 即第一帧关键帧的 GetPoseInverse() (T_w0_c0)
-    // 变换所有关键帧使其以第一帧为原点
+    // 2. 官方原点校正：以第 0 个关键帧的位姿逆作为全局原点变换矩阵
     Eigen::Matrix4f Two = vpKFs[0]->GetPoseInverse();
 
     std::ofstream f(filename.c_str());
@@ -177,9 +175,9 @@ void System::SaveTrajectoryKITTI(const std::string &filename)
     f << std::fixed;
 
     auto lRit = mpTracker->mlpReferences.begin();
-    auto lT = mpTracker->mlFrameTimes.begin();
+    auto lT   = mpTracker->mlFrameTimes.begin();
 
-    // 3. 遍历每一普通帧的相对位姿队列
+    // 3. 遍历普通帧队列
     for (auto lit = mpTracker->mlRelativeFramePoses.begin(), lend = mpTracker->mlRelativeFramePoses.end();
          lit != lend; ++lit, ++lRit, ++lT)
     {
@@ -189,7 +187,7 @@ void System::SaveTrajectoryKITTI(const std::string &filename)
 
         Eigen::Matrix4f Trw = Eigen::Matrix4f::Identity();
 
-        // 4. 如果参考关键帧在建图过程中被剔除(Bad)，沿生成树向上遍历回溯
+        // 4. 若参考关键帧已被剔除，沿生成树递归向上回溯至有效父节点
         while (pKF->mbBad)
         {
             Trw = Trw * pKF->GetRelativePoseToParent();
@@ -201,20 +199,19 @@ void System::SaveTrajectoryKITTI(const std::string &filename)
         if (!pKF)
             continue;
 
-        // 5. 严格按照官方顺序相乘: Trw = Trw * pKF->GetPose() * Two
+        // 5. 按照 ORB-SLAM2 官方顺序级联矩阵：Trw = Trw * T_pKF_w * Two
         Trw = Trw * pKF->GetPose() * Two;
 
-        // 6. 当前普通帧的世界坐标系变换 Tcw = (*lit) * Trw
+        // 6. 还原当前帧在世界坐标系下的变换 Tcw = Tcr * Trw
         Eigen::Matrix4f Tcw = (*lit) * Trw;
 
-        // 7. 计算相机在世界坐标系下的旋转与平移: Rwc = Rcw^T, twc = -Rwc * tcw
+        // 7. 转为相机到世界坐标系（Twc）：Rwc = Rcw^T, twc = -Rwc * tcw
         Eigen::Matrix3f Rcw = Tcw.block<3, 3>(0, 0);
         Eigen::Vector3f tcw = Tcw.block<3, 1>(0, 3);
-
         Eigen::Matrix3f Rwc = Rcw.transpose();
         Eigen::Vector3f twc = -Rwc * tcw;
 
-        // 8. 严格按照 KITTI 官方格式输出 12 个参数: [Rwc | twc]
+        // 8. 写入 12 个参数 [Rwc | twc]
         f << std::setprecision(9)
           << Rwc(0, 0) << " " << Rwc(0, 1) << " " << Rwc(0, 2) << " " << twc(0) << " "
           << Rwc(1, 0) << " " << Rwc(1, 1) << " " << Rwc(1, 2) << " " << twc(1) << " "
@@ -222,13 +219,13 @@ void System::SaveTrajectoryKITTI(const std::string &filename)
     }
 
     f.close();
-    std::cout << "trajectory saved!" << std::endl;
+    std::cout << "Trajectory successfully saved to " << filename << std::endl;
 }
 
 void System::SaveTrajectoryTUM(const std::string &filename)
 {
-    std::cout << std::endl
-              << "Saving camera trajectory to " << filename << " ..." << std::endl;
+    std::cout << "\nSaving camera trajectory to " << filename << " ..." << std::endl;
+
     if (mSensor == MONOCULAR)
     {
         std::cerr << "ERROR: SaveTrajectoryTUM cannot be used for monocular." << std::endl;
@@ -238,15 +235,15 @@ void System::SaveTrajectoryTUM(const std::string &filename)
     std::vector<KeyFrame *> vpKFs = mpMap->GetAllKeyFrames();
     if (vpKFs.empty())
     {
-        std::cerr << "ERROR: Map has no KeyFrames!" << std::endl;
+        std::cerr << "ERROR: Map has no KeyFrames, cannot save trajectory!" << std::endl;
         return;
     }
 
+    // 1. 按关键帧 ID 排序
     std::sort(vpKFs.begin(), vpKFs.end(),
-              [](KeyFrame *a, KeyFrame *b)
-              { return a->mnId < b->mnId; });
+              [](KeyFrame *a, KeyFrame *b) { return a->mnId < b->mnId; });
 
-    // 官方定义：第一帧的逆位姿作为全局原点变换基准
+    // 2. 原点校正矩阵
     Eigen::Matrix4f Two = vpKFs[0]->GetPoseInverse();
 
     std::ofstream f(filename.c_str());
@@ -257,14 +254,14 @@ void System::SaveTrajectoryTUM(const std::string &filename)
     }
     f << std::fixed;
 
-    auto lit = mpTracker->mlRelativeFramePoses.begin();
+    auto lit  = mpTracker->mlRelativeFramePoses.begin();
     auto lRit = mpTracker->mlpReferences.begin();
-    auto lT = mpTracker->mlFrameTimes.begin();
-    auto lbL = mpTracker->mlbLost.begin();
+    auto lT   = mpTracker->mlFrameTimes.begin();
+    auto lbL  = mpTracker->mlbLost.begin();
 
     for (; lit != mpTracker->mlRelativeFramePoses.end(); ++lit, ++lRit, ++lT, ++lbL)
     {
-        // 严格丢弃任何被标记为 LOST 的帧
+        // 3. TUM 官方标准：跟踪失败/丢失的帧严格跳过不输出
         if (*lbL)
             continue;
 
@@ -274,7 +271,7 @@ void System::SaveTrajectoryTUM(const std::string &filename)
 
         Eigen::Matrix4f Trw = Eigen::Matrix4f::Identity();
 
-        // 沿生成树向上回溯有效父节点
+        // 4. 沿生成树向上回溯有效父节点
         while (pKF->mbBad)
         {
             Trw = Trw * pKF->GetRelativePoseToParent();
@@ -289,21 +286,23 @@ void System::SaveTrajectoryTUM(const std::string &filename)
         Trw = Trw * pKF->GetPose() * Two;
         Eigen::Matrix4f Tcw = (*lit) * Trw;
 
-        // 检查数值是否有效，防止输出 NaN 或 Inf
         if (Tcw.hasNaN())
             continue;
 
+        // 5. 提取 Rwc 与 twc
         Eigen::Matrix3f Rcw = Tcw.block<3, 3>(0, 0);
         Eigen::Vector3f tcw = Tcw.block<3, 1>(0, 3);
         Eigen::Matrix3f Rwc = Rcw.transpose();
         Eigen::Vector3f twc = -Rwc * tcw;
 
+        // 6. 构造四元数并归一化
         Eigen::Quaternionf q(Rwc);
         q.normalize();
 
+        // 7. TUM 格式输出: timestamp tx ty tz qx qy qz qw
         f << std::setprecision(6) << *lT << " "
           << std::setprecision(9) << twc.x() << " " << twc.y() << " " << twc.z() << " "
-          << q.x() << " " << q.y() << " " << q.z() << " " << q.w() << std::endl;
+          << q.x() << " " << q.y() << " " << q.z() << " " << q.w() << "\n";
     }
 
     f.close();

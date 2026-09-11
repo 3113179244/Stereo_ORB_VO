@@ -34,6 +34,10 @@ public:
     int SearchByProjection(Frame &CurrentFrame, const Frame &LastFrame, const float th, const bool bMono = false);
     // 2. 局部地图点投影匹配（TrackLocalMap 使用）
     int SearchByProjection(Frame &F, const std::vector<MapPoint *> &vpMapPoints, const float th = 3.0f);
+    // 依据极线约束和 BoW 特征向量，在两个关键帧间搜索用于三角化的匹配点对
+    int SearchForTriangulation(KeyFrame *pKF1, KeyFrame *pKF2, cv::Mat F12,
+                               std::vector<std::pair<size_t, size_t>> &vMatchedPairs,
+                               const bool bOnlyStereo);
     /**
      * @brief 通过词袋 (BoW) 匹配 KeyFrame 与 Frame 中的特征点
      * @param pKF 关键帧指针

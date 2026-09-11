@@ -150,34 +150,50 @@ void Tracker::Track()
             mState = LOST;
             mVelocity.setIdentity();
         }
+        
+        if (!mCurrentFrame.mpReferenceKF)
+            mCurrentFrame.mpReferenceKF = mpReferenceKF;
 
-        // 保存上一帧
+        // 保存上一帧数据 (当前帧变上一帧)
         mLastFrame = Frame(mCurrentFrame);
     }
-
+    
     if (mpFrameDrawer)
         mpFrameDrawer->Update(this);
 
-    // 只要不是 OK，或者存在 NaN，或者存在全零位姿，一律打上 LOST 标记
+    // Step 11: 记录位姿信息，用于最后导出相机轨
     bool bPoseValid = (mState == OK) && (!mCurrentFrame.mTcw.hasNaN()) && (!mCurrentFrame.mTcw.isZero());
 
-    if (bPoseValid && mpReferenceKF)
+    if (bPoseValid && mCurrentFrame.mpReferenceKF)
     {
-        // 优先使用参考关键帧求相对位姿
-        Eigen::Matrix4f Tcr = mCurrentFrame.mTcw * mpReferenceKF->GetPoseInverse();
+        // 相对位姿: Tcr = Tcw * Twr, 其中 Twr = Trw^-1
+        Eigen::Matrix4f Tcr = mCurrentFrame.mTcw * mCurrentFrame.mpReferenceKF->GetPoseInverse();
 
         mlRelativeFramePoses.push_back(Tcr);
-        mlpReferences.push_back(mpReferenceKF);
+        mlpReferences.push_back(mCurrentFrame.mpReferenceKF);
         mlFrameTimes.push_back(mCurrentFrame.mTimeStamp);
         mlbLost.push_back(false);
     }
     else
     {
-        // 丢失状态：填占位符，mlbLost 设为 true，确保导出轨迹时被过滤
-        mlRelativeFramePoses.push_back(Eigen::Matrix4f::Identity());
-        mlpReferences.push_back(nullptr);
-        mlFrameTimes.push_back(mCurrentFrame.mTimeStamp);
-        mlbLost.push_back(true);
+        // 跟踪失败/丢失时的处理：
+        // 继承上一个有效帧的相对位姿和参考关键帧，绝不能 push 空指针！
+        // 这样可以确保 KITTI 格式导出时总行数与真实帧数严格对齐
+        if (!mlRelativeFramePoses.empty())
+        {
+            mlRelativeFramePoses.push_back(mlRelativeFramePoses.back());
+            mlpReferences.push_back(mlpReferences.back());
+            mlFrameTimes.push_back(mCurrentFrame.mTimeStamp);
+            mlbLost.push_back(true);
+        }
+        else
+        {
+            // 防御性处理：如果在系统初始化第一帧就异常
+            mlRelativeFramePoses.push_back(Eigen::Matrix4f::Identity());
+            mlpReferences.push_back(mpReferenceKF);
+            mlFrameTimes.push_back(mCurrentFrame.mTimeStamp);
+            mlbLost.push_back(true);
+        }
     }
 }
 
@@ -236,102 +252,90 @@ bool Tracker::StereoInitialization()
 
 bool Tracker::TrackWithMotionModel()
 {
-    // ORB-SLAM2 标准：基于运动模型投影搜索，使用 0.9 的 NN Ratio，检查旋转一致性
     ORBmatcher matcher(0.9f, true);
 
-    // 1. 基于恒速模型预测当前帧初始位姿
+    // 1. 基于恒速模型预测位姿初值
     mCurrentFrame.SetPose(mVelocity * mLastFrame.mTcw);
     std::fill(mCurrentFrame.mvpMapPoints.begin(), mCurrentFrame.mvpMapPoints.end(), nullptr);
 
-    // 阶段 1：使用标准搜索半径 th = 7.0f (单目为 15.0f，双目因有视差约束基准设为 7.0f)
-    int nmatches = matcher.SearchByProjection(mCurrentFrame, mLastFrame, 7.0f, false);
+    // 2. 双目基础搜索窗口为 7
+    int th = 7;
+    int nmatches = matcher.SearchByProjection(mCurrentFrame, mLastFrame, th, false);
 
-    // 阶段 2：若匹配数过少，放宽到 15.0f 重新搜索
+    // 3. 若匹配过少，扩大 2 倍窗口重新搜索
     if (nmatches < 20)
     {
         std::fill(mCurrentFrame.mvpMapPoints.begin(), mCurrentFrame.mvpMapPoints.end(), nullptr);
-        nmatches = matcher.SearchByProjection(mCurrentFrame, mLastFrame, 15.0f, false);
+        nmatches = matcher.SearchByProjection(mCurrentFrame, mLastFrame, 2 * th, false);
     }
 
-    if (nmatches < 10)
+    if (nmatches < 20)
         return false;
 
-    // 第一次位姿优化 (Motion-only BA)
+    // 4. 执行位姿优化 (Motion-only BA，内部已含 4 轮核函数外点剔除)
     int num_inliers = MotionOnlyBA::Optimize(&mCurrentFrame);
 
-    // 阶段 3：如果优化后内点不足 40，使用 2 倍半径 (th = 15.0f) 补搜未匹配点并二次优化
-    if (num_inliers < 40)
-    {
-        for (int i = 0; i < mCurrentFrame.N; ++i)
-        {
-            if (mCurrentFrame.mvpMapPoints[i] && mCurrentFrame.mvbOutlier[i])
-                mCurrentFrame.mvpMapPoints[i] = nullptr;
-        }
-
-        int additional_matches = matcher.SearchByProjection(mCurrentFrame, mLastFrame, 15.0f, false);
-        if (num_inliers + additional_matches >= 20)
-        {
-            num_inliers = MotionOnlyBA::Optimize(&mCurrentFrame);
-        }
-    }
-
-    // 剔除 Outliers
+    // 5. 剔除被判定为 Outlier 的地图点
     for (int i = 0; i < mCurrentFrame.N; ++i)
     {
         if (mCurrentFrame.mvpMapPoints[i] && mCurrentFrame.mvbOutlier[i])
+        {
             mCurrentFrame.mvpMapPoints[i] = nullptr;
+            mCurrentFrame.mvbOutlier[i] = false;
+        }
     }
 
-    // ORB-SLAM2 判定恒速模型跟踪成功的标准：内点数 >= 10
+    // 6. 原版判定标准：内点数 >= 10 即可交付给 TrackLocalMap
     return num_inliers >= 10;
 }
 
 bool Tracker::TrackReferenceKeyFrame()
 {
-    // 假设初值继承上一帧位姿
-    mCurrentFrame.SetPose(mLastFrame.mTcw);
+    // Step 1: 将当前帧描述子转化为 BoW 向量加速匹配
+    mCurrentFrame.ComputeBoW();
 
-    // 清空当前帧关联的地图点
-    mCurrentFrame.mvpMapPoints = std::vector<MapPoint *>(mCurrentFrame.N, static_cast<MapPoint *>(nullptr));
-
-    if (!mpReferenceKF || mpReferenceKF->mbBad)
-        return false;
-
-    // 通过词袋模型 (BoW) 或描述子匹配参考关键帧与当前帧特征点
-    ORBmatcher matcher(0.7, true);
+    // Step 2: 通过词袋向量加速当前帧与参考关键帧之间的特征匹配
+    ORBmatcher matcher(0.7f, true);
     std::vector<MapPoint *> vpMapPointMatches;
 
-    // 搜索参考关键帧 mpReferenceKF 在当前帧中的匹配点
     int nmatches = matcher.SearchByBoW(mpReferenceKF, mCurrentFrame, vpMapPointMatches);
 
+    // 粗匹配门槛：少于 15 对直接判定失败
     if (nmatches < 15)
         return false;
 
-    // 将匹配到的 MapPoints 赋值给当前帧
+    // Step 3: 将参考关键帧匹配到的地图点绑定到当前帧，初值继承上一帧位姿加速收敛
+    mCurrentFrame.mvpMapPoints = vpMapPointMatches;
+    mCurrentFrame.SetPose(mLastFrame.mTcw);
+
+    // Step 4: 执行位姿优化 (Motion-Only BA)
+    MotionOnlyBA::Optimize(&mCurrentFrame);
+
+    // Step 5: 根据优化结果剔除外点，并严格统计有效地图点的内点数
+    int nmatchesMap = 0;
     for (int i = 0; i < mCurrentFrame.N; i++)
     {
-        if (vpMapPointMatches[i])
+        MapPoint *pMP = mCurrentFrame.mvpMapPoints[i];
+        if (pMP)
         {
-            mCurrentFrame.mvpMapPoints[i] = vpMapPointMatches[i];
+            if (mCurrentFrame.mvbOutlier[i])
+            {
+                mCurrentFrame.mvpMapPoints[i] = static_cast<MapPoint *>(nullptr);
+                mCurrentFrame.mvbOutlier[i] = false;
+                pMP->mnVisible++; // 或重置观测状态
+                nmatches--;
+            }
+            else if (pMP->GetObservations().size() > 0)
+            {
+                nmatchesMap++;
+            }
         }
     }
 
-    // 位姿优化 (Motion-Only BA)
-    int nInliers = MotionOnlyBA::Optimize(&mCurrentFrame);
+    mnMatchesInliers = nmatchesMap;
 
-    // 剔除外点
-    for (int i = 0; i < mCurrentFrame.N; i++)
-    {
-        if (mCurrentFrame.mvpMapPoints[i] && mCurrentFrame.mvbOutlier[i])
-        {
-            mCurrentFrame.mvpMapPoints[i] = static_cast<MapPoint *>(nullptr);
-            mCurrentFrame.mvbOutlier[i] = false;
-        }
-    }
-
-    mnMatchesInliers = nInliers;
-
-    return nInliers >= 10;
+    // Step 6: 有效内点数 >= 10 判定跟踪成功
+    return nmatchesMap >= 10;
 }
 
 bool Tracker::Relocalize()
@@ -514,7 +518,7 @@ bool Tracker::NeedNewKeyFrame()
         nRefMatches = 1; // 避免除零
 
     // 4. 查询 LocalMapping 是否处于空闲状态
-    bool bLocalMappingIdle = mpLocalMapper ? (mpLocalMapper->KeyframesInQueue() == 0) : true;
+    bool bLocalMappingIdle = mpLocalMapper ? mpLocalMapper->AcceptKeyFrames() : true;
 
     // 5. 双目专属逻辑：统计近点（Close Points）跟踪状况
     int nNonTrackedClose = 0; // 当前帧中存在有效深度但尚未绑定地图点的近点

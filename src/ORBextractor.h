@@ -63,6 +63,7 @@ public:
     const std::vector<float>& GetInverseScaleFactors() const { return mvInvScaleFactor; }
     const std::vector<float>& GetScaleSigmaSquares() const { return mvLevelSigma2; }
     const std::vector<float>& GetInverseScaleSigmaSquares() const { return mvInvLevelSigma2; }
+    const std::vector<cv::Mat> &GetImagePyramid() const { return mvImagePyramid; }
 
 private:
     // 构建图像金字塔（生成多尺度图像以实现特征的尺度不变性）

@@ -9,6 +9,7 @@
 #include <DBoW3/DBoW3.h>
 class MapPoint;
 class ORBextractor;
+class KeyFrame;
 typedef DBoW3::Vocabulary ORBVocabulary;
 // 定义图像网格的行数和列数，用于将特征点分配到网格中，以加速局部特征匹配
 #define FRAME_GRID_ROWS 48
@@ -111,6 +112,7 @@ public:
 
     // 标志位：是否是第一次进行相机的内参和网格参数计算
     static bool mbInitialComputations;
+    KeyFrame* mpReferenceKF = nullptr; // 当前帧绑定的参考关键帧
 
 private:
     // 计算双目匹配，得到视差和深度

@@ -75,6 +75,8 @@ public:
     void ComputeBoW();
     void SetBadFlag();
     int TrackedMapPoints(const int &minObs);
+    Eigen::Vector3f UnprojectStereo(int i);
+    std::vector<KeyFrame*> GetVectorCovisibleKeyFrames();
     // 获取当自身被标记为 bad 时相对于父节点的相对位姿
     Eigen::Matrix4f GetRelativePoseToParent();
     std::vector<size_t> GetFeaturesInArea(const float &x, const float &y, const float &r,
