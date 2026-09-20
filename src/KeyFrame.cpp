@@ -301,12 +301,20 @@ void KeyFrame::SetBadFlag()
         std::unique_lock<std::mutex> lockCon(mMutexConnections);
         if (mbBad)
             return;
+            
+        if (mnId == 0)
+            return;
+
+        if (mbNotErase)
+        {
+            mbToBeErased = true; // 处于回环处理保护期，先不删，标记为待删除
+            return;
+        }
         mbBad = true;
         connectedKFs = mConnectedKeyFrameWeights;
         pParent = mpParent;
         vChildren = mspChildren;
 
-        // 【关键】：必须计算并保存 T_child_parent
         if (pParent)
         {
             mTcp = GetPose() * pParent->GetPoseInverse();
@@ -533,7 +541,8 @@ std::vector<size_t> KeyFrame::GetFeaturesInArea(
 
 void KeyFrame::SetParent(KeyFrame *pKF)
 {
-    if (pKF == this) return; // 避免自环
+    if (pKF == this)
+        return; // 避免自环
     {
         std::unique_lock<std::mutex> lock(mMutexConnections);
         mpParent = pKF;
@@ -595,7 +604,7 @@ Eigen::Matrix4f KeyFrame::GetRelativePoseToParent()
     return mTcp;
 }
 
-std::vector<KeyFrame*> KeyFrame::GetVectorCovisibleKeyFrames()
+std::vector<KeyFrame *> KeyFrame::GetVectorCovisibleKeyFrames()
 {
     std::unique_lock<std::mutex> lock(mMutexConnections);
     return mvpOrderedConnectedKeyFrames;
@@ -614,4 +623,37 @@ Eigen::Vector3f KeyFrame::UnprojectStereo(int i)
         return GetPoseInverse().block<3, 3>(0, 0) * x3Dc + GetCameraCenter();
     }
     return Eigen::Vector3f::Zero();
+}
+
+void KeyFrame::SetNotErase()
+{
+    std::unique_lock<std::mutex> lock(mMutexConnections);
+    mbNotErase = true;
+}
+
+void KeyFrame::SetErase()
+{
+    {
+        std::unique_lock<std::mutex> lock(mMutexConnections);
+        if (mbToBeErased)
+        {
+            mbToBeErased = false;
+            mbNotErase = false;
+            SetBadFlag();
+            return;
+        }
+        mbNotErase = false;
+    }
+}
+
+void KeyFrame::AddLoopEdge(KeyFrame *pKF)
+{
+    std::unique_lock<std::mutex> lock(mMutexConnections);
+    mspLoopEdges.insert(pKF);
+}
+
+std::set<KeyFrame *> KeyFrame::GetLoopEdges()
+{
+    std::unique_lock<std::mutex> lock(mMutexConnections);
+    return mspLoopEdges;
 }

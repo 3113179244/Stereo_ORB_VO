@@ -78,6 +78,10 @@ public:
     float mfMinDistance;      // 能够观测到该点的最小距离
     float mfMaxDistance;      // 能够观测到该点的最大距离
 
+    long unsigned int mnCorrectedByKF = 0;       // 记录该点已被哪个关键帧发起的闭环校正过
+    long unsigned int mnCorrectedReference = 0;  // 记录校正该点时所依据的参考关键帧 ID
+    long unsigned int mnLoopPointForKF = 0;      // 记录参与闭环融合的关键帧 ID
+
 private:
     // ---- 线程安全数据，防止多线程（如跟踪、局部建图、闭环）发生数据竞争 ----
     std::mutex mMutexPos;      // 保护位置数据的互斥锁

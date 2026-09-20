@@ -147,12 +147,7 @@ void LocalMapping::Run()
                     {
                         Optimizer::LocalBundleAdjustment(mpCurrentKeyFrame, &mbAbortBA, mpMap);
                     }
-
-                    // 官方逻辑：只有 BA 完整执行且中途没有被前端打断时，才执行冗余关键帧剔除
-                    if (!mbAbortBA)
-                    {
-                        KeyFrameCulling();
-                    }
+                    KeyFrameCulling();
                 }
             }
 
@@ -178,6 +173,68 @@ void LocalMapping::Run()
         // Step 5: 避免空转占用 CPU，休眠 3 毫秒
         usleep(3000);
     }
+}
+
+bool LocalMapping::stopRequested()
+{
+    std::unique_lock<std::mutex> lock(mMutexStop);
+    return mbStopRequested;
+}
+
+void LocalMapping::RequestReset()
+{
+    {
+        std::unique_lock<std::mutex> lock(mMutexReset);
+        mbResetRequested = true;
+    }
+
+    while (1)
+    {
+        {
+            std::unique_lock<std::mutex> lock(mMutexReset);
+            if (!mbResetRequested)
+                break;
+        }
+        usleep(3000);
+    }
+}
+
+void LocalMapping::ResetIfRequested()
+{
+    std::unique_lock<std::mutex> lock(mMutexReset);
+    if (mbResetRequested)
+    {
+        std::unique_lock<std::mutex> lockKFs(mMutexNewKeyBase);
+        mlNewKeyFrames.clear();
+        mlpRecentAddedMapPoints.clear();
+        mbResetRequested = false;
+    }
+}
+
+void LocalMapping::RequestFinish()
+{
+    std::unique_lock<std::mutex> lock(mMutexFinish);
+    mbFinishRequested = true;
+}
+
+bool LocalMapping::CheckFinish()
+{
+    std::unique_lock<std::mutex> lock(mMutexFinish);
+    return mbFinishRequested;
+}
+
+void LocalMapping::SetFinish()
+{
+    std::unique_lock<std::mutex> lock(mMutexFinish);
+    mbFinished = true;
+    std::unique_lock<std::mutex> lock2(mMutexStop);
+    mbStopped = true;
+}
+
+bool LocalMapping::isFinished()
+{
+    std::unique_lock<std::mutex> lock(mMutexFinish);
+    return mbFinished;
 }
 
 void LocalMapping::InsertKeyFrame(KeyFrame *pKF)
@@ -878,12 +935,12 @@ bool LocalMapping::isStopped()
     return mbStopped;
 }
 
-bool LocalMapping::SetNotStop()
+bool LocalMapping::SetNotStop(bool flag)
 {
     std::unique_lock<std::mutex> lock(mMutexStop);
-    if (mbStopped)
+    if (flag && mbStopped)
         return false;
-    mbNotStop = true;
+    mbNotStop = flag;
     return true;
 }
 

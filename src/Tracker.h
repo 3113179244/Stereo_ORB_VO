@@ -52,6 +52,7 @@ public:
     std::list<KeyFrame*> mlpReferences;             // 对应的参考关键帧指针
     std::list<double> mlFrameTimes;                 // 每一帧的时间戳
     std::list<bool> mlbLost;                        // 追踪丢失标记
+    std::mutex mMutexForceReloc;
 private:
     void Track();
     bool StereoInitialization();
@@ -64,6 +65,7 @@ private:
     void SearchLocalPoints();
     bool NeedNewKeyFrame();
     void CreateNewKeyFrame();
+    std::list<MapPoint*> mlpTemporalPoints;
     std::shared_ptr<FrameDrawer> mpFrameDrawer;
     System *mpSystem;
     KeyFrameDatabase* mpKeyFrameDB;

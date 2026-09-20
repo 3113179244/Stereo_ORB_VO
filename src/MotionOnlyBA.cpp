@@ -2,7 +2,7 @@
 #include "Frame.h"
 #include "MapPoint.h"
 #include "ORBextractor.h"
-
+#include <iomanip>
 #include <ceres/ceres.h>
 #include <ceres/manifold.h>
 #include <sophus/se3.hpp>
@@ -306,6 +306,12 @@ int MotionOnlyBA::Optimize(Frame *pFrame)
     if (nInitialCorrespondences < 3)
         return 0;
 
+    Eigen::Vector3d t_init = pFrame->mTcw.block<3, 1>(0, 3).cast<double>();
+    Eigen::Matrix3d R_init = pFrame->mTcw.block<3, 3>(0, 0).cast<double>();
+
+    double first_initial_cost = 0.0;
+    double final_cost = 0.0;
+
     // 内参提取
     Eigen::Matrix3d K;
     K << pFrame->mK.at<float>(0, 0), 0.0, pFrame->mK.at<float>(0, 2),
@@ -333,7 +339,6 @@ int MotionOnlyBA::Optimize(Frame *pFrame)
 
     int num_inliers = 0;
 
-    // ======================== 【核心改动 1：缓存 3D 点】 ========================
     // 在进入优化循环前，一次性把坐标拷贝到局部 vector，自带的 GetWorldPos 会加锁保证单点完整性
     std::vector<Eigen::Vector3d> vPoints3D(N, Eigen::Vector3d::Zero());
     std::vector<bool> vbValidMP(N, false);
@@ -347,7 +352,6 @@ int MotionOnlyBA::Optimize(Frame *pFrame)
             vbValidMP[i] = true;
         }
     }
-    // =========================================================================
 
     // 4 轮迭代优化（含外点剔除）
     for (int it = 0; it < 4; ++it)
@@ -358,7 +362,6 @@ int MotionOnlyBA::Optimize(Frame *pFrame)
         SophusSE3Manifold *se3_manifold = new SophusSE3Manifold();
         problem.AddParameterBlock(T_cw.data(), 7, se3_manifold);
 
-        // ======================== 【核心改动 2：移除全局锁，使用缓存坐标】 ========================
         // 原本这里的 std::unique_lock<std::mutex> lock(MapPoint::mGlobalMutex); 已经删掉！
         for (int i = 0; i < N; ++i)
         {
@@ -374,7 +377,8 @@ int MotionOnlyBA::Optimize(Frame *pFrame)
             // 前两轮引入 Huber 核函数抑制粗差点
             ceres::LossFunction *loss_function = (it < 2) ? new ceres::HuberLoss(std::sqrt(chi2_mono)) : nullptr;
 
-            if (u_r < 0.0f) // 单目残差
+            const float depth = pFrame->mvDepth[i];
+            if (u_r < 0.0f || depth >= pFrame->mThDepth || depth <= 0.0f)
             {
                 Eigen::Vector2d obs(pFrame->mvKeysUn[i].pt.x, pFrame->mvKeysUn[i].pt.y);
                 ceres::CostFunction *cost_function =
@@ -392,7 +396,6 @@ int MotionOnlyBA::Optimize(Frame *pFrame)
                 problem.AddResidualBlock(cost_function, loss_function, T_cw.data());
             }
         }
-        // ==================================================================================
 
         // Ceres 配置与求解
         ceres::Solver::Options options;
@@ -404,7 +407,12 @@ int MotionOnlyBA::Optimize(Frame *pFrame)
         ceres::Solver::Summary summary;
         ceres::Solve(options, &problem, &summary);
 
-        // ======================== 【核心改动 3：重新校验外点】 ========================
+        if (it == 0)
+        {
+            first_initial_cost = summary.initial_cost;
+        }
+        final_cost = summary.final_cost;
+
         // 同样移除原本包裹这里的 std::unique_lock<std::mutex> lock(MapPoint::mGlobalMutex);
         num_inliers = 0;
         for (int i = 0; i < N; ++i)
@@ -458,7 +466,6 @@ int MotionOnlyBA::Optimize(Frame *pFrame)
                 }
             }
         }
-        // ==========================================================================
     }
 
     // 回写优化后的位姿
@@ -466,6 +473,12 @@ int MotionOnlyBA::Optimize(Frame *pFrame)
     q_res.normalize();
     Sophus::SE3d T_cw_normalized(q_res, T_cw.translation());
     pFrame->SetPose(T_cw_normalized.matrix().cast<float>());
+
+    // std::cout << "[PoseBA-Debug] Frame ID: " << pFrame->mnId
+    //           << " | 匹配数: " << nInitialCorrespondences
+    //           << " -> 内点数: " << num_inliers
+    //           << " | 初始残差: " << std::fixed << std::setprecision(2) << first_initial_cost
+    //           << " -> 最终残差: " << final_cost << std::endl;
 
     return num_inliers;
 }

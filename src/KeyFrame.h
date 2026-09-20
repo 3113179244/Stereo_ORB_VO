@@ -124,6 +124,11 @@ public:
     int mnRelocWords = 0;
     float mRelocScore = 0.0f;
 
+    void SetNotErase();
+    void SetErase();
+    void AddLoopEdge(KeyFrame* pKF);
+    std::set<KeyFrame*> GetLoopEdges();
+    
 private:
     KeyFrame *mpParent = nullptr;     // 父节点指针
     std::set<KeyFrame *> mspChildren; // 子节点集合
@@ -143,7 +148,7 @@ private:
     Eigen::Vector3f tcw; // 平移向量 (世界 -> 相机)
     Eigen::Matrix3f Rwc; // 旋转矩阵的逆 (相机 -> 世界)
                          // 保存被剔除时相对于父节点的位姿: T_child_parent
-    Eigen::Matrix4f mTcp;
+    Eigen::Matrix4f mTcp = Eigen::Matrix4f::Identity();
     // 记录特征点关联的 3D 地图点（按特征点索引排列，空则为 nullptr）
     std::vector<MapPoint *> mvpMapPoints;
 
@@ -155,6 +160,11 @@ private:
     // 关联的地图指针与词典指针
     Map *mpMap;
     ORBVocabulary *mpORBvocabulary;
+
+    // 回环保护与回环边变量
+    bool mbNotErase = false;
+    bool mbToBeErased = false;
+    std::set<KeyFrame*> mspLoopEdges;
 };
 
 #endif // KEYFRAME_H
