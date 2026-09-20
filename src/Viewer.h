@@ -18,7 +18,7 @@ class MapPoint;
 class Viewer
 {
 public:
-    Viewer(System *pSystem, std::shared_ptr<Map> pMap, std::shared_ptr<FrameDrawer> pFrameDrawer = nullptr);
+    Viewer(System *pSystem, std::shared_ptr<Map> pMap, std::shared_ptr<FrameDrawer> pFrameDrawer, const std::string &strSettingPath);
     ~Viewer();
 
     void SetTracker(Tracker *pTracker) { mpTracker = pTracker; }

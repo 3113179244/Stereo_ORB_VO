@@ -8,7 +8,7 @@
 
 #include "Frame.h"
 #include "System.h"
-
+#include <string>
 class Map;
 class Viewer;
 class ORBextractor;
@@ -30,7 +30,7 @@ public:
         OK = 2,
         LOST = 3
     };
-    Tracker(System *pSys, ORBVocabulary* pVoc, KeyFrameDatabase* pKFDB, std::shared_ptr<Map> pMap, System::eSensor sensor);
+    Tracker(System *pSys, ORBVocabulary* pVoc, KeyFrameDatabase* pKFDB, std::shared_ptr<Map> pMap, System::eSensor sensor, const std::string &strSettingPath);
     ~Tracker();
     void SetFrameDrawer(std::shared_ptr<FrameDrawer> pFrameDrawer) { mpFrameDrawer = pFrameDrawer; }
     // 图像数据Grab接口
@@ -86,6 +86,12 @@ private:
     int mnLastKeyFrameId;
     int mnMatchesInliers;
     unsigned long mnLastRelocFrameId = 0;
+
+    cv::Mat mK;
+    cv::Mat mDistCoef;
+    float mbf;
+    float mThDepth;
+    float mFps;
     
 };
 

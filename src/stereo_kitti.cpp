@@ -8,7 +8,6 @@
 #include <opencv2/opencv.hpp>
 #include <opencv2/core/utils/filesystem.hpp>
 #include "System.h"
-#include "Config.h"
 #include "Viewer.h"
 #include "Map.h"
 int main(int argc, char **argv)
@@ -107,15 +106,6 @@ int main(int argc, char **argv)
             auto t_start = std::chrono::steady_clock::now();
 
             Eigen::Matrix4f Tcw = SLAM.TrackStereo(image0, image1, dCurrentTimestamp);
-
-            if (!image0.empty() && !image1.empty())
-            {
-                cv::Mat imDraw = SLAM.DrawFrame();
-                if (!imDraw.empty())
-                {
-                    cv::imshow("ORB-SLAM2 Frame Drawer", imDraw);
-                }
-            }
 
             // 记录当前帧跟踪结束时间并计算处理耗时 (单位: 秒)
             auto t_end = std::chrono::steady_clock::now();

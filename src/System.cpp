@@ -1,5 +1,4 @@
 #include "System.h"
-#include "Config.h"
 #include "Map.h"
 #include "KeyFrame.h"
 #include "Tracker.h"
@@ -16,12 +15,16 @@ System::System(const std::string &strConfigFile, const std::string &strVocFile, 
 {
     std::cout << "Starting ORB-SLAM2 Stereo System..." << std::endl;
 
-    // 加载参数配置文件
-    if (!Config::setParameterFile(strConfigFile))
+    // 1. 验证配置文件能够打开
+    cv::FileStorage fsSettings(strConfigFile, cv::FileStorage::READ);
+    if (!fsSettings.isOpened())
     {
-        std::cerr << "[System] Failed to load config file: " << strConfigFile << std::endl;
-        return;
+        std::cerr << "Failed to open settings file at: " << strConfigFile << std::endl;
+        exit(-1);
     }
+    fsSettings.release();
+
+    // 2. 加载词典
     mpVocabulary = std::make_shared<ORBVocabulary>();
     std::cout << "Loading Vocabulary file from: " << strVocFile << " ..." << std::endl;
     try
@@ -40,17 +43,16 @@ System::System(const std::string &strConfigFile, const std::string &strVocFile, 
         exit(-1);
     }
     std::cout << "Vocabulary loaded successfully." << std::endl;
-    // 初始化全局地图 Map
+
+    // 3. 初始化全局地图与各个模块
     mpMap = std::make_shared<Map>();
-
     mpFrameDrawer = std::make_shared<FrameDrawer>(mpMap.get());
-
     mpKeyFrameDatabase = new KeyFrameDatabase(mpVocabulary.get());
 
-    mpTracker = std::make_shared<Tracker>(this, mpVocabulary.get(), mpKeyFrameDatabase, mpMap, sensor);
+    // 传递 strConfigFile 初始化 Tracker
+    mpTracker = std::make_shared<Tracker>(this, mpVocabulary.get(), mpKeyFrameDatabase, mpMap, sensor, strConfigFile);
 
     mpLocalMapper = std::make_shared<LocalMapping>(this, mpMap);
-
     mpLoopCloser = std::make_shared<LoopClosing>(mpMap.get(), mpKeyFrameDatabase, mpVocabulary.get(), true);
 
     mpTracker->SetFrameDrawer(mpFrameDrawer);
@@ -58,12 +60,13 @@ System::System(const std::string &strConfigFile, const std::string &strVocFile, 
     mpTracker->SetLoopClosing(mpLoopCloser.get());
 
     mpLocalMapper->SetTracker(mpTracker.get());
-
     mpLoopCloser->SetTracker(mpTracker.get());
     mpLoopCloser->SetLocalMapper(mpLocalMapper.get());
+
     if (bUseViewer)
     {
-        mpViewer = std::make_shared<Viewer>(this, mpMap);
+        // 传递 strConfigFile 初始化 Viewer
+        mpViewer = std::make_shared<Viewer>(this, mpMap, mpFrameDrawer, strConfigFile);
         mpViewerThread = new std::thread(&Viewer::Run, mpViewer.get());
         mpTracker->SetViewer(mpViewer);
     }
@@ -152,20 +155,6 @@ void System::SaveTrajectoryKITTI(const std::string &filename)
         return;
     }
 
-    std::vector<KeyFrame *> vpKFs = mpMap->GetAllKeyFrames();
-    if (vpKFs.empty())
-    {
-        std::cerr << "ERROR: Map has no KeyFrames, cannot save trajectory!" << std::endl;
-        return;
-    }
-
-    // 1. 按关键帧 ID 递增排序，保证第一帧关键帧排在首位
-    std::sort(vpKFs.begin(), vpKFs.end(),
-              [](KeyFrame *a, KeyFrame *b) { return a->mnId < b->mnId; });
-
-    // 2. 官方原点校正：以第 0 个关键帧的位姿逆作为全局原点变换矩阵
-    Eigen::Matrix4f Two = vpKFs[0]->GetPoseInverse();
-
     std::ofstream f(filename.c_str());
     if (!f.is_open())
     {
@@ -177,7 +166,6 @@ void System::SaveTrajectoryKITTI(const std::string &filename)
     auto lRit = mpTracker->mlpReferences.begin();
     auto lT   = mpTracker->mlFrameTimes.begin();
 
-    // 3. 遍历普通帧队列
     for (auto lit = mpTracker->mlRelativeFramePoses.begin(), lend = mpTracker->mlRelativeFramePoses.end();
          lit != lend; ++lit, ++lRit, ++lT)
     {
@@ -185,9 +173,11 @@ void System::SaveTrajectoryKITTI(const std::string &filename)
         if (!pKF)
             continue;
 
+        // 1. 初始化级联变换矩阵为单位阵
         Eigen::Matrix4f Trw = Eigen::Matrix4f::Identity();
 
-        // 4. 若参考关键帧已被剔除，沿生成树递归向上回溯至有效父节点
+        // 2. 【核心修复】：严格遵循 ORB-SLAM2 原版右乘级联
+        // 每向上回溯一层父节点，变换依次右乘该坏关键帧的 mTcp (即 T_child_parent)
         while (pKF->mbBad)
         {
             Trw = Trw * pKF->GetRelativePoseToParent();
@@ -199,19 +189,19 @@ void System::SaveTrajectoryKITTI(const std::string &filename)
         if (!pKF)
             continue;
 
-        // 5. 按照 ORB-SLAM2 官方顺序级联矩阵：Trw = Trw * T_pKF_w * Two
-        Trw = Trw * pKF->GetPose() * Two;
+        // 3. 乘上最终有效父关键帧的最新位姿: Trw = Trw * T_parent_w
+        Trw = Trw * pKF->GetPose();
 
-        // 6. 还原当前帧在世界坐标系下的变换 Tcw = Tcr * Trw
+        // 4. 计算当前帧世界位姿: Tcw = Tcr * Trw
         Eigen::Matrix4f Tcw = (*lit) * Trw;
 
-        // 7. 转为相机到世界坐标系（Twc）：Rwc = Rcw^T, twc = -Rwc * tcw
+        // 5. 还原相机在世界系下的绝对位姿 Twc = Tcw^-1
         Eigen::Matrix3f Rcw = Tcw.block<3, 3>(0, 0);
         Eigen::Vector3f tcw = Tcw.block<3, 1>(0, 3);
         Eigen::Matrix3f Rwc = Rcw.transpose();
         Eigen::Vector3f twc = -Rwc * tcw;
 
-        // 8. 写入 12 个参数 [Rwc | twc]
+        // 6. 写入 KITTI 格式
         f << std::setprecision(9)
           << Rwc(0, 0) << " " << Rwc(0, 1) << " " << Rwc(0, 2) << " " << twc(0) << " "
           << Rwc(1, 0) << " " << Rwc(1, 1) << " " << Rwc(1, 2) << " " << twc(1) << " "
@@ -232,20 +222,6 @@ void System::SaveTrajectoryTUM(const std::string &filename)
         return;
     }
 
-    std::vector<KeyFrame *> vpKFs = mpMap->GetAllKeyFrames();
-    if (vpKFs.empty())
-    {
-        std::cerr << "ERROR: Map has no KeyFrames, cannot save trajectory!" << std::endl;
-        return;
-    }
-
-    // 1. 按关键帧 ID 排序
-    std::sort(vpKFs.begin(), vpKFs.end(),
-              [](KeyFrame *a, KeyFrame *b) { return a->mnId < b->mnId; });
-
-    // 2. 原点校正矩阵
-    Eigen::Matrix4f Two = vpKFs[0]->GetPoseInverse();
-
     std::ofstream f(filename.c_str());
     if (!f.is_open())
     {
@@ -261,7 +237,6 @@ void System::SaveTrajectoryTUM(const std::string &filename)
 
     for (; lit != mpTracker->mlRelativeFramePoses.end(); ++lit, ++lRit, ++lT, ++lbL)
     {
-        // 3. TUM 官方标准：跟踪失败/丢失的帧严格跳过不输出
         if (*lbL)
             continue;
 
@@ -271,7 +246,7 @@ void System::SaveTrajectoryTUM(const std::string &filename)
 
         Eigen::Matrix4f Trw = Eigen::Matrix4f::Identity();
 
-        // 4. 沿生成树向上回溯有效父节点
+        // 严格遵循 ORB-SLAM2 原版右乘级联
         while (pKF->mbBad)
         {
             Trw = Trw * pKF->GetRelativePoseToParent();
@@ -283,25 +258,24 @@ void System::SaveTrajectoryTUM(const std::string &filename)
         if (!pKF)
             continue;
 
-        Trw = Trw * pKF->GetPose() * Two;
+        Trw = Trw * pKF->GetPose();
         Eigen::Matrix4f Tcw = (*lit) * Trw;
 
         if (Tcw.hasNaN())
             continue;
 
-        // 5. 提取 Rwc 与 twc
         Eigen::Matrix3f Rcw = Tcw.block<3, 3>(0, 0);
         Eigen::Vector3f tcw = Tcw.block<3, 1>(0, 3);
         Eigen::Matrix3f Rwc = Rcw.transpose();
         Eigen::Vector3f twc = -Rwc * tcw;
 
-        // 6. 构造四元数并归一化
         Eigen::Quaternionf q(Rwc);
         q.normalize();
 
-        // 7. TUM 格式输出: timestamp tx ty tz qx qy qz qw
+        // TUM 格式: timestamp tx ty tz qx qy qz qw
         f << std::setprecision(6) << *lT << " "
-          << std::setprecision(9) << twc.x() << " " << twc.y() << " " << twc.z() << " "
+          << std::setprecision(9) 
+          << twc.x() << " " << twc.y() << " " << twc.z() << " "
           << q.x() << " " << q.y() << " " << q.z() << " " << q.w() << "\n";
     }
 

@@ -3,7 +3,6 @@
 #include "ORBmatcher.h"
 #include <thread>
 #include <cmath>
-#include "Config.h"
 #include <algorithm>
 #include <limits>
 #include "MapPoint.h"
@@ -49,8 +48,6 @@ Frame::Frame(const cv::Mat &imLeft, const cv::Mat &imRight, const double &timeSt
     // mImGrayRight = imRight.clone();
     mb = mbf / mK.at<float>(0, 0);
     mThDepth = thDepth * mb;
-    // 双目匹配，通过左右目特征点匹配计算视差，进而获得深度信息
-    ComputeStereoMatches();
 
     // 初始化地图点和外点标记数组，大小为特征点总数 N
     mvpMapPoints = std::vector<MapPoint *>(N, nullptr);
@@ -75,7 +72,8 @@ Frame::Frame(const cv::Mat &imLeft, const cv::Mat &imRight, const double &timeSt
 
         mbInitialComputations = false;
     }
-
+    // 双目匹配，通过左右目特征点匹配计算视差，进而获得深度信息
+    ComputeStereoMatches();
     // 将特征点划分到网格中，加速局部区域特征匹配搜索
     AssignFeaturesToGrid();
 }
@@ -403,10 +401,9 @@ void Frame::AssignFeaturesToGrid()
 // 根据特征点像素坐标，计算对应的网格索引，判断是否在图像网格范围内
 bool Frame::PosInGrid(const cv::KeyPoint &kp, int &posX, int &posY)
 {
-    posX = round((kp.pt.x - mnMinX) * mfGridElementWidthInv);
-    posY = round((kp.pt.y - mnMinY) * mfGridElementHeightInv);
+    posX = std::floor((kp.pt.x - mnMinX) * mfGridElementWidthInv);
+    posY = std::floor((kp.pt.y - mnMinY) * mfGridElementHeightInv);
 
-    // 检查是否越界
     if (posX < 0 || posX >= FRAME_GRID_COLS || posY < 0 || posY >= FRAME_GRID_ROWS)
         return false;
 

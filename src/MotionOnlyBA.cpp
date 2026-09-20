@@ -323,7 +323,7 @@ int MotionOnlyBA::Optimize(Frame *pFrame)
     Eigen::Vector3d t_cw = pFrame->mTcw.block<3, 1>(0, 3).cast<double>();
 
     Eigen::Quaterniond q_cw(R_cw);
-    q_cw.normalize(); // 消除数值漂移，保证正交性
+    q_cw.normalize();
 
     Sophus::SE3d T_cw(q_cw, t_cw);
 
@@ -332,6 +332,22 @@ int MotionOnlyBA::Optimize(Frame *pFrame)
     const double chi2_stereo = 7.815;
 
     int num_inliers = 0;
+
+    // ======================== 【核心改动 1：缓存 3D 点】 ========================
+    // 在进入优化循环前，一次性把坐标拷贝到局部 vector，自带的 GetWorldPos 会加锁保证单点完整性
+    std::vector<Eigen::Vector3d> vPoints3D(N, Eigen::Vector3d::Zero());
+    std::vector<bool> vbValidMP(N, false);
+
+    for (int i = 0; i < N; ++i)
+    {
+        MapPoint *pMP = pFrame->mvpMapPoints[i];
+        if (pMP && !pMP->isBad())
+        {
+            vPoints3D[i] = pMP->GetWorldPos().cast<double>(); // 线程安全读取
+            vbValidMP[i] = true;
+        }
+    }
+    // =========================================================================
 
     // 4 轮迭代优化（含外点剔除）
     for (int it = 0; it < 4; ++it)
@@ -342,42 +358,41 @@ int MotionOnlyBA::Optimize(Frame *pFrame)
         SophusSE3Manifold *se3_manifold = new SophusSE3Manifold();
         problem.AddParameterBlock(T_cw.data(), 7, se3_manifold);
 
+        // ======================== 【核心改动 2：移除全局锁，使用缓存坐标】 ========================
+        // 原本这里的 std::unique_lock<std::mutex> lock(MapPoint::mGlobalMutex); 已经删掉！
+        for (int i = 0; i < N; ++i)
         {
-            std::unique_lock<std::mutex> lock(MapPoint::mGlobalMutex);
+            if (!vbValidMP[i] || pFrame->mvbOutlier[i])
+                continue;
 
-            for (int i = 0; i < N; ++i)
+            // 使用前面缓存好的坐标 P_w，不管后端怎么改，当前帧优化期间坐标都不会变化
+            const Eigen::Vector3d &P_w = vPoints3D[i];
+            const int level = pFrame->mvKeysUn[i].octave;
+            const double inv_sigma = 1.0 / std::sqrt(pFrame->mpORBextractorLeft->GetScaleSigmaSquares()[level]);
+            const float u_r = pFrame->mvuRight[i];
+
+            // 前两轮引入 Huber 核函数抑制粗差点
+            ceres::LossFunction *loss_function = (it < 2) ? new ceres::HuberLoss(std::sqrt(chi2_mono)) : nullptr;
+
+            if (u_r < 0.0f) // 单目残差
             {
-                MapPoint *pMP = pFrame->mvpMapPoints[i];
-                if (!pMP || pMP->isBad() || pFrame->mvbOutlier[i])
-                    continue;
+                Eigen::Vector2d obs(pFrame->mvKeysUn[i].pt.x, pFrame->mvKeysUn[i].pt.y);
+                ceres::CostFunction *cost_function =
+                    new ReprojectionErrorMono(obs, P_w, K, inv_sigma);
+                problem.AddResidualBlock(cost_function, loss_function, T_cw.data());
+            }
+            else // 双目残差
+            {
+                Eigen::Vector3d obs(pFrame->mvKeysUn[i].pt.x, pFrame->mvKeysUn[i].pt.y, u_r);
+                if (loss_function)
+                    loss_function = new ceres::HuberLoss(std::sqrt(chi2_stereo));
 
-                Eigen::Vector3d P_w = pMP->GetWorldPos().cast<double>();
-                const int level = pFrame->mvKeysUn[i].octave;
-                const double inv_sigma = 1.0 / std::sqrt(pFrame->mpORBextractorLeft->GetScaleSigmaSquares()[level]);
-                const float u_r = pFrame->mvuRight[i];
-
-                // 前两轮引入 Huber 核函数抑制粗差点
-                ceres::LossFunction *loss_function = (it < 2) ? new ceres::HuberLoss(std::sqrt(chi2_mono)) : nullptr;
-
-                if (u_r < 0.0f) // 单目残差
-                {
-                    Eigen::Vector2d obs(pFrame->mvKeysUn[i].pt.x, pFrame->mvKeysUn[i].pt.y);
-                    ceres::CostFunction *cost_function =
-                        new ReprojectionErrorMono(obs, P_w, K, inv_sigma);
-                    problem.AddResidualBlock(cost_function, loss_function, T_cw.data());
-                }
-                else // 双目残差
-                {
-                    Eigen::Vector3d obs(pFrame->mvKeysUn[i].pt.x, pFrame->mvKeysUn[i].pt.y, u_r);
-                    if (loss_function)
-                        loss_function = new ceres::HuberLoss(std::sqrt(chi2_stereo));
-
-                    ceres::CostFunction *cost_function =
-                        new ReprojectionErrorStereo(obs, P_w, K, mbf, inv_sigma);
-                    problem.AddResidualBlock(cost_function, loss_function, T_cw.data());
-                }
+                ceres::CostFunction *cost_function =
+                    new ReprojectionErrorStereo(obs, P_w, K, mbf, inv_sigma);
+                problem.AddResidualBlock(cost_function, loss_function, T_cw.data());
             }
         }
+        // ==================================================================================
 
         // Ceres 配置与求解
         ceres::Solver::Options options;
@@ -389,63 +404,61 @@ int MotionOnlyBA::Optimize(Frame *pFrame)
         ceres::Solver::Summary summary;
         ceres::Solve(options, &problem, &summary);
 
-        // 重新投影检验内点并标记 Outlier
+        // ======================== 【核心改动 3：重新校验外点】 ========================
+        // 同样移除原本包裹这里的 std::unique_lock<std::mutex> lock(MapPoint::mGlobalMutex);
         num_inliers = 0;
+        for (int i = 0; i < N; ++i)
         {
-            std::unique_lock<std::mutex> lock(MapPoint::mGlobalMutex);
-            for (int i = 0; i < N; ++i)
+            if (!vbValidMP[i])
+                continue;
+
+            const Eigen::Vector3d &P_w = vPoints3D[i]; // 仍然使用同一个稳定的局部坐标
+            Eigen::Vector3d P_c = T_cw * P_w;
+            const double depth = P_c[2];
+
+            if (depth <= 0.0)
             {
-                MapPoint *pMP = pFrame->mvpMapPoints[i];
-                if (!pMP || pMP->isBad())
-                    continue;
+                pFrame->mvbOutlier[i] = true;
+                continue;
+            }
 
-                Eigen::Vector3d P_w = pMP->GetWorldPos().cast<double>();
-                Eigen::Vector3d P_c = T_cw * P_w;
-                const double depth = P_c[2];
+            const double inv_z = 1.0 / depth;
+            const double u = fx * P_c[0] * inv_z + cx;
+            const double v = fy * P_c[1] * inv_z + cy;
+            const int level = pFrame->mvKeysUn[i].octave;
+            const double inv_sigma2 = 1.0 / pFrame->mpORBextractorLeft->GetScaleSigmaSquares()[level];
+            const float u_r = pFrame->mvuRight[i];
 
-                if (depth <= 0.0)
-                {
+            const double du = u - pFrame->mvKeysUn[i].pt.x;
+            const double dv = v - pFrame->mvKeysUn[i].pt.y;
+
+            if (u_r < 0.0f)
+            {
+                const double chi2 = (du * du + dv * dv) * inv_sigma2;
+                if (chi2 > chi2_mono)
                     pFrame->mvbOutlier[i] = true;
-                    continue;
-                }
-
-                const double inv_z = 1.0 / depth;
-                const double u = fx * P_c[0] * inv_z + cx;
-                const double v = fy * P_c[1] * inv_z + cy;
-                const int level = pFrame->mvKeysUn[i].octave;
-                const double inv_sigma2 = 1.0 / pFrame->mpORBextractorLeft->GetScaleSigmaSquares()[level];
-                const float u_r = pFrame->mvuRight[i];
-
-                const double du = u - pFrame->mvKeysUn[i].pt.x;
-                const double dv = v - pFrame->mvKeysUn[i].pt.y;
-
-                if (u_r < 0.0f)
-                {
-                    const double chi2 = (du * du + dv * dv) * inv_sigma2;
-                    if (chi2 > chi2_mono)
-                        pFrame->mvbOutlier[i] = true;
-                    else
-                    {
-                        pFrame->mvbOutlier[i] = false;
-                        num_inliers++;
-                    }
-                }
                 else
                 {
-                    const double u_r_proj = u - mbf * inv_z;
-                    const double du_r = u_r_proj - u_r;
-                    const double chi2 = (du * du + dv * dv + du_r * du_r) * inv_sigma2;
+                    pFrame->mvbOutlier[i] = false;
+                    num_inliers++;
+                }
+            }
+            else
+            {
+                const double u_r_proj = u - mbf * inv_z;
+                const double du_r = u_r_proj - u_r;
+                const double chi2 = (du * du + dv * dv + du_r * du_r) * inv_sigma2;
 
-                    if (chi2 > chi2_stereo)
-                        pFrame->mvbOutlier[i] = true;
-                    else
-                    {
-                        pFrame->mvbOutlier[i] = false;
-                        num_inliers++;
-                    }
+                if (chi2 > chi2_stereo)
+                    pFrame->mvbOutlier[i] = true;
+                else
+                {
+                    pFrame->mvbOutlier[i] = false;
+                    num_inliers++;
                 }
             }
         }
+        // ==========================================================================
     }
 
     // 回写优化后的位姿

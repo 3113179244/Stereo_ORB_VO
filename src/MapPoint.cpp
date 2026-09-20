@@ -245,32 +245,31 @@ void MapPoint::Replace(MapPoint *pMP)
     int nvisible, nfound;
     std::map<KeyFrame *, size_t> obs;
 
-    // 1. 同时对 this 和 pMP 的互斥锁加锁，杜绝多线程下的 ABBA 死锁
+    // 1. 仅锁定 this 自身提取信息并打上 bad 标记
     {
-        std::unique_lock<std::mutex> lock1(mMutexFeatures, std::defer_lock);
-        std::unique_lock<std::mutex> lock2(mMutexPos, std::defer_lock);
-        std::unique_lock<std::mutex> lock3(pMP->mMutexFeatures, std::defer_lock);
-        std::unique_lock<std::mutex> lock4(pMP->mMutexPos, std::defer_lock);
-
-        // 一次性安全锁定四个互斥量
-        std::lock(lock1, lock2, lock3, lock4);
+        std::unique_lock<std::mutex> lock1(mMutexFeatures);
+        std::unique_lock<std::mutex> lock2(mMutexPos);
 
         obs = mObservations;
         mObservations.clear();
 
         mbBad = true;
         mpReplaced = pMP;
-
-        // 继承统计量
-        pMP->mnVisible += mnVisible;
-        pMP->mnFound += mnFound;
+        nvisible = mnVisible;
+        nfound = mnFound;
     }
 
-    // 2. 转移关键帧观测记录（在 MapPoint 自身锁释放后执行，防止与 KeyFrame 的锁发生交叉死锁）
-    for (auto mit = obs.begin(); mit != obs.end(); mit++)
+    // 2. 锁定目标 pMP 更新统计
+    {
+        std::unique_lock<std::mutex> lockMP(pMP->mMutexFeatures);
+        pMP->mnVisible += nvisible;
+        pMP->mnFound += nfound;
+    }
+
+    // 3. 逐个更新关键帧，绝不在持有自身锁时去锁对方
+    for (auto mit = obs.begin(); mit != obs.end(); ++mit)
     {
         KeyFrame *pKF = mit->first;
-
         if (!pMP->IsInKeyFrame(pKF))
         {
             pKF->ReplaceMapPointMatch(mit->second, pMP);
@@ -278,16 +277,13 @@ void MapPoint::Replace(MapPoint *pMP)
         }
         else
         {
-            // 若新点已在该关键帧存在观测，则直接抹除旧点的槽位匹配
             pKF->EraseMapPointMatch(mit->second);
         }
     }
 
-    // 3. 在锁外重新计算新点的代表性描述子与平均法向量深度
     pMP->ComputeDistinctiveDescriptor();
     pMP->UpdateNormalAndDepth();
 
-    // 4. 从全局地图中删除当前被替换的点
     mpMap->EraseMapPoint(this);
 }
 

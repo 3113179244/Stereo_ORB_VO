@@ -139,22 +139,24 @@ void LocalMapping::Run()
             if (!CheckNewKeyFrames())
             {
                 SearchInNeighbors();
+
+                // 2.5 融合完成后再次检查队列与停止请求，如果未被打断则启动优化
+                if (!CheckNewKeyFrames() && !GetStopRequired())
+                {
+                    if (mpMap && mpMap->GetKeyFramesInMap() > 2)
+                    {
+                        Optimizer::LocalBundleAdjustment(mpCurrentKeyFrame, &mbAbortBA, mpMap);
+                    }
+
+                    // 官方逻辑：只有 BA 完整执行且中途没有被前端打断时，才执行冗余关键帧剔除
+                    if (!mbAbortBA)
+                    {
+                        KeyFrameCulling();
+                    }
+                }
             }
 
             mbAbortBA = false;
-
-            // 2.5 队列已空且外部未请求停止，执行优化与关键帧剔除
-            if (!CheckNewKeyFrames() && !GetStopRequired())
-            {
-                // 局部地图内关键帧大于 2 帧时执行局部 BA
-                if (mpMap && mpMap->GetKeyFramesInMap() > 2)
-                {
-                    Optimizer::LocalBundleAdjustment(mpCurrentKeyFrame, &mbAbortBA, mpMap);
-                }
-
-                // 剔除共视图中 90% 以上地图点被重复观测的冗余关键帧
-                KeyFrameCulling();
-            }
 
             // 2.6 将当前关键帧送入闭环检测队列
             if (mpSystem && mpSystem->GetLoopCloser())

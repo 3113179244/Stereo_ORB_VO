@@ -40,7 +40,6 @@ include_directories(
 # 1. 编译核心算法库
 add_library(${PROJECT_NAME}_lib SHARED
   src/Camera.cpp
-  src/Config.cpp
   src/ORBmatcher.cpp
   src/ORBextractor.cpp
   src/Frame.cpp

@@ -336,8 +336,11 @@ bool LoopClosing::ComputeSE3()
 }
 
 // 阶段 3: 闭环校正与地图融合 (无位姿图优化)
+// 阶段 3: 闭环校正与地图融合 (严格对齐 ORB-SLAM2 官方实现)
 void LoopClosing::CorrectLoop()
 {
+    std::cout << "\033[32;1m>>> [LoopClosing] Loop detected! 开始闭环融合与位姿图优化... <<<\033[0m" << std::endl;
+
     // 1. 请求暂停 LocalMapping 线程并中断局部 BA
     if (mpLocalMapper)
     {
@@ -355,21 +358,87 @@ void LoopClosing::CorrectLoop()
         {
             std::unique_lock<std::mutex> lock(mMutexGBA);
             mbStopGBA = true;
+            mnFullBAIdx++;
         }
 
         if (mpThreadGBA)
         {
-            mpThreadGBA->join();
+            mpThreadGBA->detach();
             delete mpThreadGBA;
             mpThreadGBA = nullptr;
         }
     }
 
-    // 地图全局更新互斥锁（仅保护闭环校正与位姿图优化阶段）
+    // 确保当前关键帧连接关系是最新的
+    mpCurrentKF->UpdateConnections();
+
+    // 收集当前关键帧及其相连共视组
+    std::vector<KeyFrame *> vpCurrentConnectedKFs = mpCurrentKF->GetVectorCovisibleKeyFrames();
+    vpCurrentConnectedKFs.push_back(mpCurrentKF);
+
+    // 【核心修复 1】：对齐 ORB-SLAM2 官方，定义 CorrectedPoses 与 NonCorrectedPoses
+    std::map<KeyFrame *, Eigen::Matrix4f> CorrectedPoses;
+    std::map<KeyFrame *, Eigen::Matrix4f> NonCorrectedPoses;
+
+    // 当前关键帧的校正位姿即为闭环求解得到的 mTcw_loop
+    CorrectedPoses[mpCurrentKF] = mTcw_loop;
+    Eigen::Matrix4f Twc_cur_old = mpCurrentKF->GetPoseInverse();
+
+    // 地图全局更新互斥锁：锁定后 Tracking 和 LocalMapping 都不能变更地图
     {
         std::unique_lock<std::mutex> lockMap(mpMap->mMutexMapUpdate);
 
-        // 3. 将闭环匹配点替换到当前关键帧
+        // 3. 计算共视组在闭环调整前后的位姿传播 (对齐 ORB-SLAM2 官方 Sim3/SE3 传播)
+        for (KeyFrame *pKFi : vpCurrentConnectedKFs)
+        {
+            if (!pKFi || pKFi->mbBad)
+                continue;
+
+            Eigen::Matrix4f Tiw_old = pKFi->GetPose();
+
+            if (pKFi != mpCurrentKF)
+            {
+                // 计算该共视帧相对于当前帧的相对位姿: T_i_c = Tiw * Twc
+                Eigen::Matrix4f Tic = Tiw_old * Twc_cur_old;
+                // 依据闭环后当前帧的新位姿传播: T_i_w_new = Tic * Tcw_loop
+                Eigen::Matrix4f Tiw_corrected = Tic * mTcw_loop;
+                CorrectedPoses[pKFi] = Tiw_corrected;
+            }
+
+            // 保存未校正前的原始位姿，用于位姿图优化提供准确的相对边约束！
+            NonCorrectedPoses[pKFi] = Tiw_old;
+        }
+
+        // 4. 校正当前组观测到的所有地图点坐标，避免点发生畸变拉扯
+        for (auto &mit : CorrectedPoses)
+        {
+            KeyFrame *pKFi = mit.first;
+            Eigen::Matrix4f Tiw_corrected = mit.second;
+            Eigen::Matrix4f Tw_i_corrected = Tiw_corrected.inverse();
+            Eigen::Matrix4f Tiw_old = NonCorrectedPoses[pKFi];
+
+            std::vector<MapPoint *> vpMPsi = pKFi->GetMapPointMatches();
+            for (size_t iMP = 0; iMP < vpMPsi.size(); iMP++)
+            {
+                MapPoint *pMPi = vpMPsi[iMP];
+                if (!pMPi || pMPi->isBad())
+                    continue;
+
+                // 将点从旧世界系投回相机系，再根据校正后的相机系投影回新世界系
+                Eigen::Vector3f Pw_old = pMPi->GetWorldPos();
+                Eigen::Vector3f Pc = Tiw_old.block<3, 3>(0, 0) * Pw_old + Tiw_old.block<3, 1>(0, 3);
+                Eigen::Vector3f Pw_corrected = Tw_i_corrected.block<3, 3>(0, 0) * Pc + Tw_i_corrected.block<3, 1>(0, 3);
+
+                pMPi->SetWorldPos(Pw_corrected);
+                pMPi->UpdateNormalAndDepth();
+            }
+
+            // 更新关键帧位姿
+            pKFi->SetPose(Tiw_corrected);
+            pKFi->UpdateConnections();
+        }
+
+        // 5. 替换闭环匹配地图点
         for (size_t i = 0; i < mvpLoopMatchedPoints.size(); i++)
         {
             MapPoint *pLoopMP = mvpLoopMatchedPoints[i];
@@ -384,64 +453,54 @@ void LoopClosing::CorrectLoop()
                 {
                     mpCurrentKF->AddMapPoint(pLoopMP, i);
                     pLoopMP->AddObservation(mpCurrentKF, i);
+                    pLoopMP->ComputeDistinctiveDescriptor();
                 }
             }
         }
 
-        // 4. 投影反向融合
+        // 6. 区域投影融合重合点
         std::vector<KeyFrame *> vpLoopConnectedKFs = mpMatchedKF->GetBestCovisibilityKeyFrames(10);
         vpLoopConnectedKFs.push_back(mpMatchedKF);
         SearchAndFuse(vpLoopConnectedKFs);
 
-        // 5. 更新共视关系
-        std::vector<KeyFrame *> vpCurrentConnectedKFs = mpCurrentKF->GetBestCovisibilityKeyFrames(15);
-        vpCurrentConnectedKFs.push_back(mpCurrentKF);
-
+        // 7. 更新共视图边连接
         for (KeyFrame *pKFi : vpCurrentConnectedKFs)
+        {
             if (pKFi && !pKFi->mbBad)
                 pKFi->UpdateConnections();
-
+        }
         for (KeyFrame *pKFm : vpLoopConnectedKFs)
+        {
             if (pKFm && !pKFm->mbBad)
                 pKFm->UpdateConnections();
+        }
 
-        // 在位姿图优化前，提前保存当前关键帧的旧位姿
-        Eigen::Matrix4f Tcw_cur_old = mpCurrentKF->GetPose();
+        // 步骤 8: 执行 Essential Graph 位姿图优化
+        Optimizer::OptimizeEssentialGraph(mpMap, mpMatchedKF, mpCurrentKF, NonCorrectedPoses, CorrectedPoses);
 
-        // 6. 执行 Essential Graph 位姿图优化
-        Optimizer::OptimizeEssentialGraph(mpMap, mpMatchedKF, mpCurrentKF, mTcw_loop);
-
-        // 7. 将位姿跃变增量补偿给 Tracker，并重置速度模型
+        // 步骤 9: 同步校正 Tracker 中的当前帧与上一帧位姿
         if (mpTracker)
         {
-            // 获取闭环优化后当前关键帧的新位姿
-            Eigen::Matrix4f Tcw_cur_new = mpCurrentKF->GetPose();
-
-            // 计算校正引起的真实变换增量
-            Eigen::Matrix4f delta_T = Tcw_cur_new * Tcw_cur_old.inverse();
-
-            // 将增量补偿到 Tracker 的当前帧与上一帧
-            mpTracker->mCurrentFrame.SetPose(delta_T * mpTracker->mCurrentFrame.mTcw);
-            mpTracker->mLastFrame.SetPose(delta_T * mpTracker->mLastFrame.mTcw);
-
-            // 重置恒速模型速度，避免使用跳变前的旧速度导致下一帧外推失配
             mpTracker->ResetVelocity();
+            mpTracker->CheckReplacedInLastFrame();
         }
-    } // 离开 lockMap 作用域，释放地图锁
 
-    // 8. 恢复 LocalMapping 线程运行
+    } // 释放 lockMap 互斥锁
+
+    // 10. 恢复 LocalMapping 线程运行
     if (mpLocalMapper)
     {
         mpLocalMapper->Release();
     }
 
-    // 9. 开启独立新线程在后台运行 GlobalBundleAdjustment
+    // 11. 启动全局 BA 线程 (对齐官方，后台执行)
     mbStopGBA = false;
     mbRunningGBA = true;
     if (mpThreadGBA)
     {
         mpThreadGBA->join();
         delete mpThreadGBA;
+        mpThreadGBA = nullptr;
     }
     mpThreadGBA = new std::thread(&LoopClosing::RunGlobalBundleAdjustment, this, mpCurrentKF->mnId);
 }
@@ -552,7 +611,12 @@ void LoopClosing::RunGlobalBundleAdjustment(unsigned long nLoopKF)
     std::cout << "\033[32m[GBA Thread] 开始在后台执行全局 BA (LoopKF ID: " << nLoopKF << ")...\033[0m" << std::endl;
 
     // 调用支持中断的 GBA
-    Optimizer::GlobalBundleAdjustment(mpMap, 35, &mbStopGBA);
+    Optimizer::GlobalBundleAdjustment(mpMap, 20, &mbStopGBA, nLoopKF, true);
+
+    {
+        std::unique_lock<std::mutex> lock(mMutexGBA);
+        mbStopGBA = false;
+    }
 
     {
         std::unique_lock<std::mutex> lock(mMutexGBA);

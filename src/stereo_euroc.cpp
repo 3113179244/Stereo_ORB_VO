@@ -9,7 +9,6 @@
 #include <opencv2/core/utils/filesystem.hpp>
 
 #include "System.h"
-#include "Config.h"
 #include "Viewer.h"
 #include "Map.h"
 
@@ -35,7 +34,8 @@ bool LoadImagesEuRoC(const std::string &strSeqDir,
 
     while (std::getline(fileCsv, line))
     {
-        if (line.empty()) continue;
+        if (line.empty())
+            continue;
         std::stringstream ss(line);
         std::string sTimestamp, sImgName;
         std::getline(ss, sTimestamp, ',');
@@ -81,7 +81,7 @@ int main(int argc, char **argv)
     const int nImages = vstrLeft.size();
     std::cout << "[EuRoC] 成功加载 " << nImages << " 帧立体图像。" << std::endl;
 
-    // 2. 读取配置文件中的双目立体标定矩阵并生成 Remap 映射表
+    // 2. 读取配置文件中的双目立体标定矩阵并生成 Remap 映射表 (与 ORB-SLAM2 官方保持一致)
     cv::FileStorage fs(strConfigFile, cv::FileStorage::READ);
     if (!fs.isOpened())
     {
@@ -98,7 +98,7 @@ int main(int argc, char **argv)
     fs["RIGHT.R"] >> R_r;
     fs["LEFT.P"] >> P_l;
     fs["RIGHT.P"] >> P_r;
-    
+
     int cols_l = fs["LEFT.width"];
     int rows_l = fs["LEFT.height"];
     int cols_r = fs["RIGHT.width"];
@@ -119,44 +119,30 @@ int main(int argc, char **argv)
         return -1;
     }
 
-    // 补回映射矩阵声明并初始化极线校正映射表 (CV_32F)
+    K_l.convertTo(K_l, CV_32F);
+    K_r.convertTo(K_r, CV_32F);
+    D_l.convertTo(D_l, CV_32F);
+    D_r.convertTo(D_r, CV_32F);
+    R_l.convertTo(R_l, CV_32F);
+    R_r.convertTo(R_r, CV_32F);
+    P_l.convertTo(P_l, CV_32F);
+    P_r.convertTo(P_r, CV_32F);
+    
+    // 初始化极线校正映射表 (CV_32F)
     cv::Mat M1l, M2l, M1r, M2r;
     cv::initUndistortRectifyMap(K_l, D_l, R_l, P_l.rowRange(0, 3).colRange(0, 3),
                                 cv::Size(cols_l, rows_l), CV_32F, M1l, M2l);
     cv::initUndistortRectifyMap(K_r, D_r, R_r, P_r.rowRange(0, 3).colRange(0, 3),
                                 cv::Size(cols_r, rows_r), CV_32F, M1r, M2r);
     std::cout << "[EuRoC] 极线校正与去畸变映射表 (initUndistortRectifyMap) 初始化完成。" << std::endl;
+    fs.release();
 
-    // 确保转换为 CV_64F (double)，防止 at<double> 产生数据错位
-    P_l.convertTo(P_l, CV_64F);
-    P_r.convertTo(P_r, CV_64F);
-
-    // 4. 覆盖静态 Config 为校正后的真实内参
-    Config::g_dFx = P_l.at<double>(0, 0);
-    Config::g_dFy = P_l.at<double>(1, 1);
-    Config::g_dCx = P_l.at<double>(0, 2);
-    Config::g_dCy = P_l.at<double>(1, 2);
-    
-    // 标准极线校正模型中：P_r(0, 3) = -fx * baseline
-    Config::g_dBf = std::fabs(P_r.at<double>(0, 3));
-
-    // 图像已由 remap 去除畸变，畸变参数必须全部置为 0
-    Config::g_dK1 = 0.0;
-    Config::g_dK2 = 0.0;
-    Config::g_dP1 = 0.0;
-    Config::g_dP2 = 0.0;
-
-    std::cout << "[EuRoC] 校正后生效的内参参数: \n"
-              << "  fx: " << Config::g_dFx << ", fy: " << Config::g_dFy << "\n"
-              << "  cx: " << Config::g_dCx << ", cy: " << Config::g_dCy << "\n"
-              << "  bf: " << Config::g_dBf << " (Baseline: " << (Config::g_dBf / Config::g_dFx) << " m)\n"
-              << "  k1, k2, p1, p2 均已重置为 0" << std::endl;
-              
+    // 3. 初始化 SLAM 系统 (System 内部会解析 strConfigFile 中的 Camera.* 参数，与 ORB-SLAM2 完全一致)
     System SLAM(strConfigFile, strVocFile, System::STEREO, true);
 
     bool bIsPaused = false;
 
-    // 5. 循环处理每一帧
+    // 4. 循环处理每一帧
     for (int nFrameId = 0; nFrameId < nImages; ++nFrameId)
     {
         while (bIsPaused)
@@ -167,7 +153,8 @@ int main(int argc, char **argv)
                 bIsPaused = false;
                 std::cout << "\r[状态] 恢复播放...                      " << std::flush;
             }
-            else if (cKey == 27) break;
+            else if (cKey == 27)
+                break;
         }
 
         cv::Mat image0 = cv::imread(vstrLeft[nFrameId], cv::IMREAD_GRAYSCALE);
@@ -188,12 +175,6 @@ int main(int argc, char **argv)
 
         // 跟踪处理
         SLAM.TrackStereo(imLeftRect, imRightRect, dCurrentTimestamp);
-
-        cv::Mat imDraw = SLAM.DrawFrame();
-        if (!imDraw.empty())
-        {
-            cv::imshow("ORB-SLAM2 Frame Drawer", imDraw);
-        }
 
         auto t_end = std::chrono::steady_clock::now();
         double dTrackElapsed = std::chrono::duration_cast<std::chrono::duration<double>>(t_end - t_start).count();
@@ -226,7 +207,7 @@ int main(int argc, char **argv)
 
     cv::destroyAllWindows();
 
-    // 6. 保存轨迹 (EuRoC 数据集通常使用 TUM 格式便于与 ground truth 对齐评估)
+    // 5. 保存轨迹 (EuRoC 数据集使用 TUM 格式便于与 ground truth 对齐评估)
     std::string strTrajDir = "/home/wzj/output";
     cv::utils::fs::createDirectories(strTrajDir);
     SLAM.SaveTrajectoryTUM(strTrajDir + "/CameraTrajectory.txt");

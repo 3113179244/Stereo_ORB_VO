@@ -17,8 +17,10 @@ class Optimizer
 {
 public:
     static void LocalBundleAdjustment(KeyFrame *pCurKF, bool *pbStopFlag, std::shared_ptr<Map> pMap);
-    static void GlobalBundleAdjustment(Map *pMap, int nIterations = 35, bool *pbStopFlag = nullptr);
-    static void OptimizeEssentialGraph(Map *pMap, KeyFrame *pLoopKF, KeyFrame *pCurKF, const Eigen::Matrix4f &Tcw_loop);
+    static void GlobalBundleAdjustment(Map *pMap, int nIterations = 20, bool *pbStopFlag = nullptr, const unsigned long nLoopKF = 0, const bool bRunGBA = false);
+    static void OptimizeEssentialGraph(Map *pMap, KeyFrame *pLoopKF, KeyFrame *pCurKF,
+                                   const std::map<KeyFrame*, Eigen::Matrix4f> &NonCorrectedPoses,
+                                   const std::map<KeyFrame*, Eigen::Matrix4f> &CorrectedPoses);
 };
 
 #endif // OPTIMIZER_H

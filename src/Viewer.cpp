@@ -4,7 +4,6 @@
 #include "Map.h"
 #include "MapPoint.h"
 #include "KeyFrame.h"
-#include "Config.h"
 #include "System.h"
 
 #include <opencv2/highgui/highgui.hpp>
@@ -13,7 +12,7 @@
 #include <vector>
 #include <unistd.h>
 
-Viewer::Viewer(System *pSystem, std::shared_ptr<Map> pMap, std::shared_ptr<FrameDrawer> pFrameDrawer)
+Viewer::Viewer(System *pSystem, std::shared_ptr<Map> pMap, std::shared_ptr<FrameDrawer> pFrameDrawer, const std::string &strSettingPath)
     : mpSystem(pSystem),
       mpMap(pMap),
       mpFrameDrawer(pFrameDrawer),
@@ -23,24 +22,35 @@ Viewer::Viewer(System *pSystem, std::shared_ptr<Map> pMap, std::shared_ptr<Frame
       mbFinishRequested(false),
       mbFinished(false)
 {
-    // 从 Config 读取帧率与图像展示延时
-    mFPS = Config::g_dFps > 0.0 ? Config::g_dFps : 30.0;
+    cv::FileStorage fSettings(strSettingPath, cv::FileStorage::READ);
+
+    float fps = fSettings["Camera.fps"];
+    if (fps < 1.0f) fps = 30.0f;
+    mFPS = fps;
     mT = 1000.0 / mFPS;
     mCameraPose = Eigen::Matrix4f::Identity();
 
-    // 加载配置文件中定义的 Viewer 渲染尺寸参数
-    mKeyFrameSize      = Config::g_dViewerKeyFrameSize > 0.0 ? static_cast<float>(Config::g_dViewerKeyFrameSize) : 0.05f;
-    mKeyFrameLineWidth = Config::g_dViewerKeyFrameLineWidth > 0.0 ? static_cast<float>(Config::g_dViewerKeyFrameLineWidth) : 1.0f;
-    mGraphLineWidth    = Config::g_dViewerGraphLineWidth > 0.0 ? static_cast<float>(Config::g_dViewerGraphLineWidth) : 0.9f;
-    mPointSize         = Config::g_dViewerPointSize > 0.0 ? static_cast<float>(Config::g_dViewerPointSize) : 2.0f;
-    mCameraSize        = Config::g_dViewerCameraSize > 0.0 ? static_cast<float>(Config::g_dViewerCameraSize) : 0.08f;
-    mCameraLineWidth   = Config::g_dViewerCameraLineWidth > 0.0 ? static_cast<float>(Config::g_dViewerCameraLineWidth) : 3.0f;
+    // 读取 Viewer 尺寸与线宽参数
+    mKeyFrameSize = fSettings["Viewer.KeyFrameSize"];
+    mKeyFrameLineWidth = fSettings["Viewer.KeyFrameLineWidth"];
+    mGraphLineWidth = fSettings["Viewer.GraphLineWidth"];
+    mPointSize = fSettings["Viewer.PointSize"];
+    mCameraSize = fSettings["Viewer.CameraSize"];
+    mCameraLineWidth = fSettings["Viewer.CameraLineWidth"];
 
-    // 观察视点参数
-    mViewpointX = static_cast<float>(Config::g_dViewerPointX);
-    mViewpointY = static_cast<float>(Config::g_dViewerPointY);
-    mViewpointZ = static_cast<float>(Config::g_dViewerPointZ);
-    mViewpointF = static_cast<float>(Config::g_dViewerPointF);
+    // 若配置未指定，赋予 ORB-SLAM2 默认值
+    if (mKeyFrameSize <= 0) mKeyFrameSize = 0.05f;
+    if (mKeyFrameLineWidth <= 0) mKeyFrameLineWidth = 1.0f;
+    if (mGraphLineWidth <= 0) mGraphLineWidth = 0.9f;
+    if (mPointSize <= 0) mPointSize = 2.0f;
+    if (mCameraSize <= 0) mCameraSize = 0.08f;
+    if (mCameraLineWidth <= 0) mCameraLineWidth = 3.0f;
+
+    // 观察视点
+    mViewpointX = fSettings["Viewer.ViewpointX"];
+    mViewpointY = fSettings["Viewer.ViewpointY"];
+    mViewpointZ = fSettings["Viewer.ViewpointZ"];
+    mViewpointF = fSettings["Viewer.ViewpointF"];
 
     if (mViewpointF < 1.0f)
     {
@@ -142,7 +152,7 @@ void Viewer::Run()
             if (!im.empty())
             {
                 cv::imshow("ORB-SLAM2: Current Frame", im);
-                cv::waitKey(mT);
+                cv::waitKey(1);
             }
         }
 

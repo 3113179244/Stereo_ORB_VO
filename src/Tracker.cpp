@@ -1,5 +1,4 @@
 #include "Tracker.h"
-#include "Config.h"
 #include "ORBextractor.h"
 #include "Optimizer.h"
 #include "MapPoint.h"
@@ -14,19 +13,94 @@
 #include "KeyFrameDatabase.h"
 #include "Viewer.h"
 #include "Frame.h"
-Tracker::Tracker(System *pSys, ORBVocabulary *pVoc, KeyFrameDatabase *pKFDB, std::shared_ptr<Map> pMap, System::eSensor sensor)
-    : mpSystem(pSys), mpORBVocabulary(pVoc), mpKeyFrameDB(pKFDB), mpMap(pMap), mState(NO_IMAGES_YET), mVelocity(Eigen::Matrix4f::Identity()), mpReferenceKF(nullptr), mpLocalMapper(nullptr), mnLastRelocFrameId(0)
+Tracker::Tracker(System *pSys, ORBVocabulary *pVoc, KeyFrameDatabase *pKFDB, 
+                 std::shared_ptr<Map> pMap, System::eSensor sensor, const std::string &strSettingPath)
+    : mpSystem(pSys), mpORBVocabulary(pVoc), mpKeyFrameDB(pKFDB), mpMap(pMap),
+      mState(NO_IMAGES_YET), mVelocity(Eigen::Matrix4f::Identity()),
+      mpReferenceKF(nullptr), mpLocalMapper(nullptr), mnLastRelocFrameId(0)
 {
-    // 从 Config 类中加载 ORB 提取器参数
-    int nFeatures = Config::g_nORBnFeatures;
-    float fScaleFactor = Config::g_dORBscaleFactor;
-    int nLevels = Config::g_nORBnLevels;
-    int finiThFAST = Config::g_nORBiniThFAST;
-    int fminThFAST = Config::g_nORBminThFAST;
+    cv::FileStorage fSettings(strSettingPath, cv::FileStorage::READ);
+    if (!fSettings.isOpened())
+    {
+        std::cerr << "Failed to open settings file at: " << strSettingPath << std::endl;
+        exit(-1);
+    }
 
-    // 初始化左右图 ORB 提取器
-    mpORBextractorLeft = std::make_unique<ORBextractor>(nFeatures, fScaleFactor, nLevels, finiThFAST, fminThFAST);
-    mpORBextractorRight = std::make_unique<ORBextractor>(nFeatures, fScaleFactor, nLevels, finiThFAST, fminThFAST);
+    float fx = 0.0f, fy = 0.0f, cx = 0.0f, cy = 0.0f;
+    mK = cv::Mat::eye(3, 3, CV_32F);
+    mDistCoef = cv::Mat::zeros(4, 1, CV_32F);
+
+    std::string datasetType = "KITTI / Common";
+
+    // 1. 读取并识别模式
+    if (!fSettings["LEFT.P"].empty() && !fSettings["RIGHT.P"].empty())
+    {
+        datasetType = "EuRoC (Stereo Rectified)";
+        cv::Mat P_l, P_r;
+        fSettings["LEFT.P"] >> P_l;
+        fSettings["RIGHT.P"] >> P_r;
+
+        P_l.convertTo(P_l, CV_32F);
+        P_r.convertTo(P_r, CV_32F);
+
+        fx = P_l.at<float>(0, 0);
+        fy = P_l.at<float>(1, 1);
+        cx = P_l.at<float>(0, 2);
+        cy = P_l.at<float>(1, 2);
+
+        mbf = -P_r.at<float>(0, 3);
+        mDistCoef = cv::Mat::zeros(4, 1, CV_32F);
+    }
+    else
+    {
+        fx = fSettings["Camera.fx"];
+        fy = fSettings["Camera.fy"];
+        cx = fSettings["Camera.cx"];
+        cy = fSettings["Camera.cy"];
+        mbf = fSettings["Camera.bf"];
+
+        mDistCoef.at<float>(0) = fSettings["Camera.k1"];
+        mDistCoef.at<float>(1) = fSettings["Camera.k2"];
+        mDistCoef.at<float>(2) = fSettings["Camera.p1"];
+        mDistCoef.at<float>(3) = fSettings["Camera.p2"];
+    }
+
+    mK.at<float>(0, 0) = fx;
+    mK.at<float>(1, 1) = fy;
+    mK.at<float>(0, 2) = cx;
+    mK.at<float>(1, 2) = cy;
+
+    mFps = fSettings["Camera.fps"];
+    if (mFps <= 0.0f) mFps = 30.0f;
+
+    mThDepth = fSettings["ThDepth"];
+    if (mThDepth <= 0.0f) mThDepth = 35.0f;
+
+    // 2. ORB 提取器参数
+    int nFeatures = fSettings["ORBextractor.nFeatures"];
+    float fScaleFactor = fSettings["ORBextractor.scaleFactor"];
+    int nLevels = fSettings["ORBextractor.nLevels"];
+    int fIniThFAST = fSettings["ORBextractor.iniThFAST"];
+    int fMinThFAST = fSettings["ORBextractor.minThFAST"];
+
+    mpORBextractorLeft = std::make_unique<ORBextractor>(nFeatures, fScaleFactor, nLevels, fIniThFAST, fMinThFAST);
+    mpORBextractorRight = std::make_unique<ORBextractor>(nFeatures, fScaleFactor, nLevels, fIniThFAST, fMinThFAST);
+
+    // 3. 格式化输出配置参数
+    const float b = (fx > 0.0f) ? (mbf / fx) : 0.0f;
+    std::cout << "\n================ Loaded Configuration ================" << std::endl;
+    std::cout << " Dataset Type     : " << datasetType << std::endl;
+    std::cout << " Camera Matrix (K): [ fx: " << fx << ", fy: " << fy 
+              << ", cx: " << cx << ", cy: " << cy << " ]" << std::endl;
+    std::cout << " Distortion Coeff : [ k1: " << mDistCoef.at<float>(0) 
+              << ", k2: " << mDistCoef.at<float>(1) 
+              << ", p1: " << mDistCoef.at<float>(2) 
+              << ", p2: " << mDistCoef.at<float>(3) << " ]" << std::endl;
+    std::cout << " Baseline (b)     : " << b << " m (bf = " << mbf << ")" << std::endl;
+    std::cout << " FPS / Depth Th   : " << mFps << " / " << mThDepth << " (maxDepth = " << mThDepth * b << " m)" << std::endl;
+    std::cout << " ORB Features     : " << nFeatures << " points, " << nLevels << " levels, scale: " << fScaleFactor << std::endl;
+    std::cout << " FAST Thresholds  : ini = " << fIniThFAST << ", min = " << fMinThFAST << std::endl;
+    std::cout << "======================================================\n" << std::endl;
 }
 
 Tracker::~Tracker() {}
@@ -35,20 +109,12 @@ Eigen::Matrix4f Tracker::GrabImageStereo(const cv::Mat &imRectLeft, const cv::Ma
 {
     mImGray = imRectLeft.clone();
 
-    // 构建内参矩阵与畸变矩阵
-    cv::Mat K = (cv::Mat_<float>(3, 3) << Config::g_dFx, 0, Config::g_dCx,
-                 0, Config::g_dFy, Config::g_dCy,
-                 0, 0, 1);
-    cv::Mat DistCoef = (cv::Mat_<float>(4, 1) << Config::g_dK1, Config::g_dK2, Config::g_dP1, Config::g_dP2);
-
+    // 直接使用已解析好的成员变量
     mCurrentFrame = Frame(imRectLeft.clone(), imRectRight.clone(), timestamp,
                           mpORBextractorLeft.get(), mpORBextractorRight.get(),
-                          mpORBVocabulary, K, DistCoef, Config::g_dBf, Config::g_dThDepth);
+                          mpORBVocabulary, mK, mDistCoef, mbf, mThDepth);
 
-    // 执行跟踪状态机主逻辑
     Track();
-
-    // 返回当前帧姿态
     return mCurrentFrame.mTcw;
 }
 
@@ -59,9 +125,6 @@ void Tracker::Track()
     {
         mState = NOT_INITIALIZED;
     }
-
-    // 地图全局更新互斥锁
-    std::unique_lock<std::mutex> lockMap(mpMap->mMutexMapUpdate);
 
     // Step 1: 初始化
     if (mState == NOT_INITIALIZED)
@@ -84,7 +147,20 @@ void Tracker::Track()
         {
             // Step 2.1: 检查并更新上一帧中被 LocalMapping 替换的地图点
             CheckReplacedInLastFrame();
-
+            for (int i = 0; i < mCurrentFrame.N; i++)
+            {
+                MapPoint *pMP = mCurrentFrame.mvpMapPoints[i];
+                if (pMP)
+                {
+                    MapPoint *pRep = pMP->GetReplaced();
+                    while (pRep)
+                    {
+                        pMP = pRep;
+                        pRep = pMP->GetReplaced();
+                    }
+                    mCurrentFrame.mvpMapPoints[i] = pMP->isBad() ? nullptr : pMP;
+                }
+            }
             // Step 2.2: 判断使用运动模型还是参考关键帧
             // 若速度模型为空或刚完成重定位，跟踪参考关键帧；否则使用恒速模型
             if (mVelocity.isIdentity() || mCurrentFrame.mnId < mnLastRelocFrameId + 2)
@@ -296,7 +372,7 @@ bool Tracker::StereoInitialization()
 bool Tracker::TrackWithMotionModel()
 {
     ORBmatcher matcher(0.9f, true);
-
+    UpdateLastFrame();
     // 1. 基于恒速模型预测位姿初值
     mCurrentFrame.SetPose(mVelocity * mLastFrame.mTcw);
     std::fill(mCurrentFrame.mvpMapPoints.begin(), mCurrentFrame.mvpMapPoints.end(), nullptr);
@@ -443,7 +519,7 @@ bool Tracker::Relocalize()
             rvec, tvec,
             false, 300, 8.0f, 0.99, inliersPnP, cv::SOLVEPNP_EPNP);
 
-        if (!bPnPSuccess || inliersPnP.size() < 6)
+        if (!bPnPSuccess || inliersPnP.size() < 15)
             continue;
 
         cv::Mat R_cv;
@@ -470,7 +546,7 @@ bool Tracker::Relocalize()
 
         int nInliers = MotionOnlyBA::Optimize(&mCurrentFrame);
 
-        if (nInliers >= 8)
+        if (nInliers >= 20)
         {
             for (int i = 0; i < mCurrentFrame.N; i++)
             {
@@ -543,8 +619,7 @@ bool Tracker::NeedNewKeyFrame()
     const int nKFs = mpMap ? mpMap->GetKeyFramesInMap() : 0;
 
     // 2. 距离上一次重定位太近且关键帧已有一定积累时，不插入关键帧
-    // （若工程中暂无重定位帧记录，此项默认通过）
-    const int mMaxFrames = static_cast<int>(Config::g_dFps > 0.0 ? Config::g_dFps : 20.0);
+    const int mMaxFrames = static_cast<int>(mFps > 0.0f ? mFps : 20.0f);
     const int mMinFrames = 0;
 
     // 3. 统计参考关键帧跟踪到的稳定地图点数量 (nRefMatches)
@@ -612,16 +687,10 @@ bool Tracker::NeedNewKeyFrame()
         {
             if (mpLocalMapper)
             {
-                // 仅在队列未满且确定要插帧时打断
-                if (mpLocalMapper->KeyframesInQueue() < 3)
-                {
-                    mpLocalMapper->RequestStopBA();
-                    return true;
-                }
-                else
-                    return false;
+                mpLocalMapper->RequestStopBA();
             }
-            return false;
+
+            return true;
         }
     }
 
@@ -633,7 +702,7 @@ void Tracker::CreateNewKeyFrame()
     // 如果局部建图器处于停止状态且无法阻止其停止，则不插入
     if (mpLocalMapper && !mpLocalMapper->SetNotStop())
         return;
-
+    std::unique_lock<std::mutex> lockMap(mpMap->mMutexMapUpdate);
     // Step 1: 创建新关键帧并与当前帧绑定
     KeyFrame *pKF = new KeyFrame(mCurrentFrame, mpMap.get());
     mpReferenceKF = pKF;
@@ -737,11 +806,11 @@ void Tracker::UpdateLastFrame()
     if (!mpReferenceKF || mpReferenceKF->mbBad)
         return;
 
-    // 获取上一帧相对于参考关键帧的相对位姿: T_lr = T_lw * T_rw^-1
+    // 确保从 mlRelativeFramePoses 恢复时参考帧有效
     if (!mlRelativeFramePoses.empty() && mlpReferences.back() == mpReferenceKF)
     {
         Eigen::Matrix4f Tlr = mlRelativeFramePoses.back();
-        // 依据参考关键帧最新可能已被 LocalMapping 优化过的位姿，重新计算上一帧的绝对位姿
+        // 关键帧位姿在闭环后已更新，重新计算上一帧的全局位姿
         mLastFrame.SetPose(Tlr * mpReferenceKF->GetPose());
     }
 }
@@ -934,10 +1003,22 @@ void Tracker::CheckReplacedInLastFrame()
         MapPoint *pMP = mLastFrame.mvpMapPoints[i];
         if (pMP)
         {
+            // 循环解引用，直到找到最终未被替换的点
             MapPoint *pRep = pMP->GetReplaced();
-            if (pRep)
+            while (pRep)
             {
-                mLastFrame.mvpMapPoints[i] = pRep;
+                pMP = pRep;
+                pRep = pMP->GetReplaced();
+            }
+            
+            // 如果最终依然是坏点，直接置空，防止后续野指针访问
+            if (pMP->isBad())
+            {
+                mLastFrame.mvpMapPoints[i] = nullptr;
+            }
+            else
+            {
+                mLastFrame.mvpMapPoints[i] = pMP;
             }
         }
     }

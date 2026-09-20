@@ -29,12 +29,13 @@ Eigen::Matrix3d Camera::K() const
 
 cv::Mat Camera::K_cv() const
 {
-    cv::Mat K = (cv::Mat_<double>(3, 3) << fx_, 0.0, cx_, 0.0, fy_, cy_, 0.0, 0.0, 1.0);
+    cv::Mat K = (cv::Mat_<float>(3, 3) << fx_, 0.0f, cx_, 0.0f, fy_, cy_, 0.0f, 0.0f, 1.0f);
     return K.clone();
 }
 
-cv::Mat Camera::D_cv() const {
-    cv::Mat D = (cv::Mat_<double>(4, 1) << k1_, k2_, p1_, p2_);
+cv::Mat Camera::D_cv() const 
+{
+    cv::Mat D = (cv::Mat_<float>(4, 1) << k1_, k2_, p1_, p2_);
     return D.clone();
 }
 

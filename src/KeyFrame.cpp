@@ -305,11 +305,14 @@ void KeyFrame::SetBadFlag()
         connectedKFs = mConnectedKeyFrameWeights;
         pParent = mpParent;
         vChildren = mspChildren;
+
+        // 【关键】：必须计算并保存 T_child_parent
         if (pParent)
         {
             mTcp = GetPose() * pParent->GetPoseInverse();
         }
     }
+
     {
         std::unique_lock<std::mutex> lockFeat(mMutexFeatures);
         vpMP = mvpMapPoints;
@@ -356,8 +359,7 @@ void KeyFrame::SetBadFlag()
         mConnectedKeyFrameWeights.clear();
         mvpOrderedConnectedKeyFrames.clear();
         mvOrderedWeights.clear();
-        // 【关键改动】：务必注释掉下面这行！保留自己的 mpParent 指针供普通帧回溯位姿
-        // mpParent = nullptr;
+        // 务必保留 mpParent 指针供回溯遍历，不能设为 nullptr！
         mspChildren.clear();
     }
 
