@@ -89,7 +89,7 @@ void KeyFrame::UpdateConnections()
 
     {
         std::unique_lock<std::mutex> lockMatches(mMutexFeatures);
-        vpMP = mvpMapPoints; // 拷贝地图点列表（受 mMutexFeatures 保护）
+        vpMP = mvpMapPoints;
     }
 
     for (size_t i = 0; i < vpMP.size(); i++)
@@ -98,15 +98,14 @@ void KeyFrame::UpdateConnections()
         if (!pMP || pMP->isBad())
             continue;
 
-        // 获取观测到该地图点的所有关键帧（返回副本，内部已加锁）
         std::map<KeyFrame *, size_t> observations = pMP->GetObservations();
 
         for (auto mit = observations.begin(); mit != observations.end(); mit++)
         {
             KeyFrame *pKF = mit->first;
-            if (pKF->mnId == mnId) // 跳过自身
+            if (pKF->mnId == mnId)
                 continue;
-            KFcounter[pKF]++; // 累加共视地图点数
+            KFcounter[pKF]++;
         }
     }
 
@@ -116,7 +115,7 @@ void KeyFrame::UpdateConnections()
     // 2. 找出共视点最多（nmax）的关键帧，作为无门槛邻居时的保底连接
     int nmax = 0;
     KeyFrame *pKFmax = nullptr;
-    const int th = 15; // 共视门槛：至少共享15个地图点才算有效连接
+    const int th = 15; // 共视门槛：至少共享 15 个地图点才算有效连接
 
     std::vector<std::pair<int, KeyFrame *>> vPairs;
     vPairs.reserve(KFcounter.size());
@@ -136,7 +135,7 @@ void KeyFrame::UpdateConnections()
     if (vPairs.empty() && pKFmax)
         vPairs.push_back(std::make_pair(nmax, pKFmax));
 
-    // 3. 升序排序后逆序存入 → 得到降序（权重最大在前），与 UpdateBestCovisibles 一致
+    // 3. 升序排序后逆序存入 → 得到降序
     std::sort(vPairs.begin(), vPairs.end());
 
     std::vector<KeyFrame *> vNeighbors;
@@ -150,24 +149,21 @@ void KeyFrame::UpdateConnections()
         vWeights.push_back(vPairs[i].first);
     }
 
-    // 4. 更新自身的连接关系（加锁，持锁时间尽量短，只更新自己的数据）
+    // 4. 更新自身的连接关系（只保留 >= 15 或保底的邻居，与 ORB-SLAM2 原版对齐）
     {
         std::unique_lock<std::mutex> lockCon(mMutexConnections);
-        mConnectedKeyFrameWeights = KFcounter;
+        mConnectedKeyFrameWeights.clear();
+        for (size_t i = 0; i < vNeighbors.size(); i++)
+            mConnectedKeyFrameWeights[vNeighbors[i]] = vWeights[i];
+
         mvpOrderedConnectedKeyFrames = vNeighbors; // 降序
         mvOrderedWeights = vWeights;
     }
 
-    // 5. 反向注册 + 生成树（Spanning Tree）建立。
-    //    这两步都会获取【其它】关键帧的锁，因此必须放在锁外执行，
-    //    否则会出现“持 this 锁 + 等 neighbor 锁”的嵌套解锁顺序，
-    //    与另一线程反向执行时构成 ABBA 死锁（程序卡死）。
+    // 5. 反向注册 + 生成树建立（在锁外执行避免死锁）
     for (size_t i = 0; i < vNeighbors.size(); i++)
-        vNeighbors[i]->AddConnection(this, KFcounter[vNeighbors[i]]);
+        vNeighbors[i]->AddConnection(this, vWeights[i]);
 
-    //    生成树建立：只有在本关键帧还没有父节点时，才把它共视程度最高的
-    //    关键帧设为父节点。这样生成树会随关键帧插入逐步生长、保持连通，
-    //    且每个关键帧有且仅有一个父节点（不构成环）。
     if (mpParent == nullptr && pKFmax != nullptr)
         SetParent(pKFmax);
 }
@@ -297,28 +293,31 @@ void KeyFrame::SetBadFlag()
     KeyFrame *pParent = nullptr;
     std::set<KeyFrame *> vChildren;
 
+    // 1. 锁保护检查并提取生成树和共视关系
     {
         std::unique_lock<std::mutex> lockCon(mMutexConnections);
-        if (mbBad)
-            return;
-            
-        if (mnId == 0)
+        if (mbBad || mnId == 0)
             return;
 
         if (mbNotErase)
         {
-            mbToBeErased = true; // 处于回环处理保护期，先不删，标记为待删除
+            mbToBeErased = true;
             return;
         }
+
         mbBad = true;
         connectedKFs = mConnectedKeyFrameWeights;
         pParent = mpParent;
         vChildren = mspChildren;
+    }
 
-        if (pParent)
-        {
-            mTcp = GetPose() * pParent->GetPoseInverse();
-        }
+    // 2. 避免锁嵌套：在单独获取位姿锁的逻辑下计算相对位姿
+    if (pParent)
+    {
+        Eigen::Matrix4f T_c_w = GetPose();
+        Eigen::Matrix4f T_p_w = pParent->GetPoseInverse();
+        std::unique_lock<std::mutex> lockPose(mMutexPose);
+        mTcp = T_c_w * T_p_w;
     }
 
     {
@@ -326,52 +325,95 @@ void KeyFrame::SetBadFlag()
         vpMP = mvpMapPoints;
     }
 
-    // 1. 维护生成树（Spanning Tree）：把子节点重连给父节点或最佳共视帧
-    for (auto it = vChildren.begin(); it != vChildren.end(); it++)
+    // 3. 维护生成树（Spanning Tree）：ORB-SLAM2 级防成环重连策略
+    // 收集所有候选的新父节点：优先考虑当前帧的父节点，其次是子节点的共视帧
+    std::vector<KeyFrame *> vpCandidateParents;
+    if (pParent && !pParent->mbBad)
+        vpCandidateParents.push_back(pParent);
+
+    for (KeyFrame *pChild : vChildren)
     {
-        KeyFrame *pChild = *it;
         if (!pChild || pChild->mbBad)
             continue;
 
-        KeyFrame *pNewParent = pParent;
-        if (!pNewParent || pNewParent->mbBad)
+        KeyFrame *pNewParent = nullptr;
+
+        // 策略 A: 先在候选集合（即当前帧的父节点）中匹配
+        for (KeyFrame *pCand : vpCandidateParents)
         {
-            std::vector<KeyFrame *> vpCovisibles = pChild->GetBestCovisibilityKeyFrames(10);
-            for (KeyFrame *pCov : vpCovisibles)
+            if (pCand != pChild)
             {
-                if (pCov && !pCov->mbBad && pCov != this)
+                pNewParent = pCand;
+                break;
+            }
+        }
+
+        // 策略 B: 若没有，则从子节点自身的共视帧中选取（排除当前正在被删的帧和待处理子节点自身）
+        if (!pNewParent)
+        {
+            std::vector<KeyFrame *> vpCov = pChild->GetBestCovisibilityKeyFrames(20);
+            for (KeyFrame *pCov : vpCov)
+            {
+                if (pCov && !pCov->mbBad && pCov != this && pCov != pChild)
                 {
-                    pNewParent = pCov;
-                    break;
+                    // 成环检测：沿着 pCov 往上爬，如果中途遇到了 pChild，则不能选它，否则成环
+                    bool bLoop = false;
+                    KeyFrame *pCurrAncestor = pCov->GetParent();
+                    while (pCurrAncestor)
+                    {
+                        if (pCurrAncestor == pChild)
+                        {
+                            bLoop = true;
+                            break;
+                        }
+                        pCurrAncestor = pCurrAncestor->GetParent();
+                    }
+
+                    if (!bLoop)
+                    {
+                        pNewParent = pCov;
+                        break;
+                    }
                 }
             }
         }
-        pChild->SetParent(pNewParent);
+
+        // 策略 C: 实在找不到，保底沿用当前帧的父节点
+        if (!pNewParent && pParent)
+            pNewParent = pParent;
+
+        if (pNewParent)
+        {
+            pChild->ChangeParent(pNewParent);
+            vpCandidateParents.push_back(pChild); // 该子节点重连成功后，也可以作为后续其他兄弟子节点的候选父节点
+        }
     }
 
     if (pParent)
         pParent->EraseChild(this);
 
-    // 2. 断开相连关键帧的双向共视连接
+    // 4. 断开相连关键帧的双向共视连接
     for (auto mit = connectedKFs.begin(); mit != connectedKFs.end(); mit++)
         mit->first->EraseConnection(this);
 
-    // 3. 解除地图点对该关键帧的观测
+    // 5. 解除地图点对该关键帧的观测
     for (size_t i = 0; i < vpMP.size(); i++)
+    {
         if (vpMP[i])
             vpMP[i]->EraseObservation(this);
+    }
 
-    // 4. 清空连接记录
+    // 6. 清空连接记录（保留 mpParent 供回溯相对位姿 mTcp）
     {
         std::unique_lock<std::mutex> lockCon(mMutexConnections);
         mConnectedKeyFrameWeights.clear();
         mvpOrderedConnectedKeyFrames.clear();
         mvOrderedWeights.clear();
-        // 务必保留 mpParent 指针供回溯遍历，不能设为 nullptr！
         mspChildren.clear();
+        mspLoopEdges.clear();
     }
 
-    // 5. 从全局地图中删除
+    // 7. 从全局地图中删除
     mpMap->EraseKeyFrame(this);
 }
 
@@ -539,10 +581,31 @@ std::vector<size_t> KeyFrame::GetFeaturesInArea(
     return vIndices;
 }
 
+void KeyFrame::ChangeParent(KeyFrame *pKF)
+{
+    if (pKF == this)
+        return;
+
+    KeyFrame *pOldParent = nullptr;
+    {
+        std::unique_lock<std::mutex> lock(mMutexConnections);
+        if (mpParent == pKF)
+            return;
+        pOldParent = mpParent;
+        mpParent = pKF;
+    }
+
+    if (pOldParent)
+        pOldParent->EraseChild(this);
+
+    if (pKF)
+        pKF->AddChild(this);
+}
+
 void KeyFrame::SetParent(KeyFrame *pKF)
 {
     if (pKF == this)
-        return; // 避免自环
+        return;
     {
         std::unique_lock<std::mutex> lock(mMutexConnections);
         mpParent = pKF;

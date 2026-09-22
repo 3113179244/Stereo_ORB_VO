@@ -221,7 +221,28 @@ public:
 
         const double X = P_c[0];
         const double Y = P_c[1];
-        const double Z = std::max(P_c[2], 1e-4);
+        const double Z = P_c[2];
+
+        if (Z <= 1e-4)
+        {
+            residuals[0] = 0.0;
+            residuals[1] = 0.0;
+            residuals[2] = 0.0;
+            if (jacobians)
+            {
+                if (jacobians[0])
+                {
+                    // 3 个残差 x 7 维位姿 = 21 个 double
+                    std::fill(jacobians[0], jacobians[0] + 21, 0.0);
+                }
+                if (jacobians[1])
+                {
+                    // 3 个残差 x 3 维地图点 = 9 个 double
+                    std::fill(jacobians[1], jacobians[1] + 9, 0.0);
+                }
+            }
+            return true;
+        }
 
         const double inv_z = 1.0 / Z;
         const double inv_z2 = inv_z * inv_z;

@@ -75,6 +75,7 @@ public:
     void ComputeBoW();
     void SetBadFlag();
     int TrackedMapPoints(const int &minObs);
+    void ChangeParent(KeyFrame* pKF);
     Eigen::Vector3f UnprojectStereo(int i);
     std::vector<KeyFrame*> GetVectorCovisibleKeyFrames();
     // 获取当自身被标记为 bad 时相对于父节点的相对位姿

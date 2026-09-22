@@ -340,6 +340,7 @@ void LoopClosing::CorrectLoop()
 {
     std::cout << "\033[32;1m>>> [LoopClosing] Loop detected! 开始闭环融合与位姿图优化... <<<\033[0m" << std::endl;
 
+    std::cout << "[DEBUG] 1. 开始请求暂停 LocalMapping..." << std::endl;
     // 1. 请求暂停 LocalMapping 线程并中断局部 BA
     if (mpLocalMapper)
     {
@@ -350,10 +351,11 @@ void LoopClosing::CorrectLoop()
             usleep(1000);
         }
     }
-
+    std::cout << "[DEBUG] 2. LocalMapping 已经成功停止！" << std::endl;
     // 2. 如果上一次的全局 GBA 还在运行，发送中断请求并回收线程
     if (isRunningGBA())
     {
+        std::cout << "[DEBUG] 2.1 正在回收旧 GBA 线程..." << std::endl;
         {
             std::unique_lock<std::mutex> lock(mMutexGBA);
             mbStopGBA = true;
@@ -366,11 +368,11 @@ void LoopClosing::CorrectLoop()
             mpThreadGBA = nullptr;
         }
     }
-
+    std::cout << "[DEBUG] 3. 准备执行 UpdateConnections..." << std::endl;
     // 3. 确保当前关键帧连接关系是最新的
     mpCurrentKF->UpdateConnections();
 
-    // 4. 收集当前关键帧及其相连共视组
+    // 4. 收集当前关键帧共视组与闭环匹配帧共视组
     std::vector<KeyFrame *> vpCurrentConnectedKFs = mpCurrentKF->GetVectorCovisibleKeyFrames();
     vpCurrentConnectedKFs.push_back(mpCurrentKF);
 
@@ -378,46 +380,53 @@ void LoopClosing::CorrectLoop()
     vpLoopConnectedKFs.push_back(mpMatchedKF);
 
     for (KeyFrame *pKFi : vpCurrentConnectedKFs)
-        if (pKFi)
-            pKFi->SetNotErase();
+        if (pKFi) pKFi->SetNotErase();
     for (KeyFrame *pKFi : vpLoopConnectedKFs)
-        if (pKFi)
-            pKFi->SetNotErase();
+        if (pKFi) pKFi->SetNotErase();
+
+    // 5. 闭环漂移沿生成树全局快速传播（为优化提供优质全局初值）
+    // 闭环漂移增量: T_drift = Tcw_loop * (Tcw_cur_old)^-1
+    Eigen::Matrix4f Twc_cur_old = mpCurrentKF->GetPoseInverse();
+    Eigen::Matrix4f T_drift = mTcw_loop * Twc_cur_old;
 
     std::map<KeyFrame *, Eigen::Matrix4f> CorrectedPoses;
     std::map<KeyFrame *, Eigen::Matrix4f> NonCorrectedPoses;
 
-    // 当前关键帧的校正位姿即为闭环几何校验得到的 mTcw_loop
-    CorrectedPoses[mpCurrentKF] = mTcw_loop;
-    Eigen::Matrix4f Twc_cur_old = mpCurrentKF->GetPoseInverse();
+    // 获取地图中所有的关键帧，备份原始位姿并沿生成树传播
+    std::vector<KeyFrame *> vpAllKFs = mpMap->GetAllKeyFrames();
+    for (KeyFrame *pKF : vpAllKFs)
+    {
+        if (pKF && !pKF->mbBad)
+            NonCorrectedPoses[pKF] = pKF->GetPose();
+    }
 
-    // 地图全局更新互斥锁：锁定后 Tracking 和 LocalMapping 都不能变更地图
+    // 先计算当前共视组的校正初值
+    for (KeyFrame *pKFi : vpCurrentConnectedKFs)
+    {
+        if (!pKFi || pKFi->mbBad) continue;
+        Eigen::Matrix4f Tiw_old = NonCorrectedPoses[pKFi];
+        if (pKFi == mpCurrentKF)
+        {
+            CorrectedPoses[pKFi] = mTcw_loop;
+        }
+        else
+        {
+            // Tiw_new = Tiw_old * (Tcw_old)^-1 * Tcw_loop
+            Eigen::Matrix4f Tic = Tiw_old * Twc_cur_old;
+            CorrectedPoses[pKFi] = Tic * mTcw_loop;
+        }
+    }
+
+    // 6. 地图锁保护：校正当前共视组地图点、替换闭环匹配点与特征融合
     {
         std::unique_lock<std::mutex> lockMap(mpMap->mMutexMapUpdate);
 
-        // 5. 计算当前共视组在闭环前后的位姿传播关系
+        // 6.1 校正当前共视组观测到的地图点（仅校正当前共视组即可，其余点交由位姿图优化后更新）
         for (KeyFrame *pKFi : vpCurrentConnectedKFs)
         {
-            if (!pKFi || pKFi->mbBad)
-                continue;
+            if (!pKFi || pKFi->mbBad) continue;
 
-            Eigen::Matrix4f Tiw_old = pKFi->GetPose();
-
-            if (pKFi != mpCurrentKF)
-            {
-                Eigen::Matrix4f Tic = Tiw_old * Twc_cur_old;
-                Eigen::Matrix4f Tiw_corrected = Tic * mTcw_loop;
-                CorrectedPoses[pKFi] = Tiw_corrected;
-            }
-
-            NonCorrectedPoses[pKFi] = Tiw_old;
-        }
-
-        // 6. 校正当前共视组观测到的所有地图点
-        for (auto &mit : CorrectedPoses)
-        {
-            KeyFrame *pKFi = mit.first;
-            Eigen::Matrix4f Tiw_corrected = mit.second;
+            Eigen::Matrix4f Tiw_corrected = CorrectedPoses[pKFi];
             Eigen::Matrix4f Tw_i_corrected = Tiw_corrected.inverse();
             Eigen::Matrix4f Tiw_old = NonCorrectedPoses[pKFi];
 
@@ -425,10 +434,7 @@ void LoopClosing::CorrectLoop()
             for (size_t iMP = 0; iMP < vpMPsi.size(); iMP++)
             {
                 MapPoint *pMPi = vpMPsi[iMP];
-                if (!pMPi || pMPi->isBad())
-                    continue;
-
-                if (pMPi->mnCorrectedByKF == mpCurrentKF->mnId)
+                if (!pMPi || pMPi->isBad() || pMPi->mnCorrectedByKF == mpCurrentKF->mnId)
                     continue;
 
                 Eigen::Vector3f Pw_old = pMPi->GetWorldPos();
@@ -440,12 +446,9 @@ void LoopClosing::CorrectLoop()
                 pMPi->mnCorrectedReference = pKFi->mnId;
                 pMPi->UpdateNormalAndDepth();
             }
-
-            pKFi->SetPose(Tiw_corrected);
-            pKFi->UpdateConnections();
         }
 
-        // 7. 替换闭环匹配点
+        // 6.2 替换闭环匹配点
         for (size_t i = 0; i < mvpLoopMatchedPoints.size(); i++)
         {
             MapPoint *pLoopMP = mvpLoopMatchedPoints[i];
@@ -465,19 +468,18 @@ void LoopClosing::CorrectLoop()
             }
         }
     }
-
-    // 8. 投影融合闭环侧地图点到当前共视组
+    std::cout << "[DEBUG] 4. 准备执行 SearchAndFuse..." << std::endl;
+    // 7. 投影融合闭环侧地图点到当前共视组
     SearchAndFuse(vpLoopConnectedKFs);
 
-    // 9. 更新共视图边连接，并提取由于融合产生的新闭环连接边 LoopConnections
+    // 8. 收集 LoopConnections
     std::map<KeyFrame *, std::set<KeyFrame *>> LoopConnections;
     {
         std::unique_lock<std::mutex> lockMap(mpMap->mMutexMapUpdate);
 
         for (KeyFrame *pKFi : vpCurrentConnectedKFs)
         {
-            if (!pKFi || pKFi->mbBad)
-                continue;
+            if (!pKFi || pKFi->mbBad) continue;
 
             std::vector<KeyFrame *> vpPreviousNeighbors = pKFi->GetVectorCovisibleKeyFrames();
             pKFi->UpdateConnections();
@@ -493,41 +495,36 @@ void LoopClosing::CorrectLoop()
             LoopConnections[pKFi] = sNewConnected;
         }
 
-        // 10. 执行 Essential Graph 位姿图优化
+        // 在优化前必须建立双向回环边！
+        mpMatchedKF->AddLoopEdge(mpCurrentKF);
+        mpCurrentKF->AddLoopEdge(mpMatchedKF);
+        std::cout << "[DEBUG] 5. 准备进入 Optimizer::OptimizeEssentialGraph..." << std::endl;
+        // 9. 执行 Essential Graph 位姿图优化（位姿与全图地图点在内部一次性回写）
         Optimizer::OptimizeEssentialGraph(mpMap, mpMatchedKF, mpCurrentKF,
                                           NonCorrectedPoses, CorrectedPoses, LoopConnections);
 
-        // 添加回环边
-        mpMatchedKF->AddLoopEdge(mpCurrentKF);
-        mpCurrentKF->AddLoopEdge(mpMatchedKF);
-
+        // 10. 更新前端 Tracker
         if (mpTracker)
         {
-            // 1. 重置恒速模型速度为单位阵，强制下一帧退化到重投影/参考帧跟踪，避免速度带来的旧坐标系外推
             mpTracker->ResetVelocity();
-
-            // 2. 将上一帧中的所有地图点指针更新为闭环融合后的新点
             mpTracker->CheckReplacedInLastFrame();
-
-            // 3. 【核心缺失点】：利用参考关键帧优化后的位姿，将 mLastFrame 彻底更新到优化后的世界坐标系
             mpTracker->UpdateLastFrame();
         }
     }
 
     for (KeyFrame *pKFi : vpCurrentConnectedKFs)
-        if (pKFi)
-            pKFi->SetErase();
+        if (pKFi) pKFi->SetErase();
     for (KeyFrame *pKFi : vpLoopConnectedKFs)
-        if (pKFi)
-            pKFi->SetErase();
+        if (pKFi) pKFi->SetErase();
 
-    // 11. 释放 LocalMapping 线程
+    // 11. 释放 LocalMapping 线程并开启 GBA
     if (mpLocalMapper)
     {
         mpLocalMapper->Release();
     }
-
-    mpThreadGBA = new std::thread(&LoopClosing::RunGlobalBundleAdjustment, this, mpCurrentKF->mnId);
+    std::cout << "[DEBUG] 6. 准备创建后台 GBA 线程..." << std::endl;
+    
+    // mpThreadGBA = new std::thread(&LoopClosing::RunGlobalBundleAdjustment, this, mpCurrentKF->mnId);
 
     std::cout << "\033[32;1m>>> [LoopClosing] 回环校正与位姿图优化完成！<<<\033[0m" << std::endl;
 }

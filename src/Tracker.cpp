@@ -13,7 +13,7 @@
 #include "KeyFrameDatabase.h"
 #include "Viewer.h"
 #include "Frame.h"
-Tracker::Tracker(System *pSys, ORBVocabulary *pVoc, KeyFrameDatabase *pKFDB, 
+Tracker::Tracker(System *pSys, ORBVocabulary *pVoc, KeyFrameDatabase *pKFDB,
                  std::shared_ptr<Map> pMap, System::eSensor sensor, const std::string &strSettingPath)
     : mpSystem(pSys), mpORBVocabulary(pVoc), mpKeyFrameDB(pKFDB), mpMap(pMap),
       mState(NO_IMAGES_YET), mVelocity(Eigen::Matrix4f::Identity()),
@@ -71,10 +71,12 @@ Tracker::Tracker(System *pSys, ORBVocabulary *pVoc, KeyFrameDatabase *pKFDB,
     mK.at<float>(1, 2) = cy;
 
     mFps = fSettings["Camera.fps"];
-    if (mFps <= 0.0f) mFps = 30.0f;
+    if (mFps <= 0.0f)
+        mFps = 30.0f;
 
     mThDepth = fSettings["ThDepth"];
-    if (mThDepth <= 0.0f) mThDepth = 35.0f;
+    if (mThDepth <= 0.0f)
+        mThDepth = 35.0f;
 
     // 2. ORB 提取器参数
     int nFeatures = fSettings["ORBextractor.nFeatures"];
@@ -90,17 +92,18 @@ Tracker::Tracker(System *pSys, ORBVocabulary *pVoc, KeyFrameDatabase *pKFDB,
     const float b = (fx > 0.0f) ? (mbf / fx) : 0.0f;
     std::cout << "\n================ Loaded Configuration ================" << std::endl;
     std::cout << " Dataset Type     : " << datasetType << std::endl;
-    std::cout << " Camera Matrix (K): [ fx: " << fx << ", fy: " << fy 
+    std::cout << " Camera Matrix (K): [ fx: " << fx << ", fy: " << fy
               << ", cx: " << cx << ", cy: " << cy << " ]" << std::endl;
-    std::cout << " Distortion Coeff : [ k1: " << mDistCoef.at<float>(0) 
-              << ", k2: " << mDistCoef.at<float>(1) 
-              << ", p1: " << mDistCoef.at<float>(2) 
+    std::cout << " Distortion Coeff : [ k1: " << mDistCoef.at<float>(0)
+              << ", k2: " << mDistCoef.at<float>(1)
+              << ", p1: " << mDistCoef.at<float>(2)
               << ", p2: " << mDistCoef.at<float>(3) << " ]" << std::endl;
     std::cout << " Baseline (b)     : " << b << " m (bf = " << mbf << ")" << std::endl;
     std::cout << " FPS / Depth Th   : " << mFps << " / " << mThDepth << " (maxDepth = " << mThDepth * b << " m)" << std::endl;
     std::cout << " ORB Features     : " << nFeatures << " points, " << nLevels << " levels, scale: " << fScaleFactor << std::endl;
     std::cout << " FAST Thresholds  : ini = " << fIniThFAST << ", min = " << fMinThFAST << std::endl;
-    std::cout << "======================================================\n" << std::endl;
+    std::cout << "======================================================\n"
+              << std::endl;
 }
 
 Tracker::~Tracker() {}
@@ -205,7 +208,6 @@ void Tracker::Track()
             if (mpViewer)
                 mpViewer->UpdateCurrentCameraPose(mCurrentFrame.mTcw);
 
-            // Clean VO matches
             // Step 6：清除观测不到的地图点（未被任何关键帧观测到）
             for (int i = 0; i < mCurrentFrame.N; i++)
             {
@@ -215,7 +217,7 @@ void Tracker::Track()
                     if (pMP->GetObservations().empty())
                     {
                         mCurrentFrame.mvbOutlier[i] = false;
-                        mCurrentFrame.mvpMapPoints[i] = static_cast<MapPoint *>(nullptr);
+                        mCurrentFrame.mvpMapPoints[i] = nullptr;
                     }
                 }
             }
@@ -320,7 +322,7 @@ bool Tracker::StereoInitialization()
         }
     }
 
-    std::cout << "[Initialization] New stereo map created with " 
+    std::cout << "[Initialization] New stereo map created with "
               << mpMap->GetMapPointsInMap() << " points" << std::endl;
 
     // 5. 将初始关键帧推送给局部建图线程
@@ -825,19 +827,23 @@ void Tracker::Reset()
 
 void Tracker::UpdateLastFrame()
 {
-    // Step 1: 获取上一帧的参考关键帧
-    KeyFrame* pRef = mLastFrame.mpReferenceKF;
+    // 0. 清理残留临时点，防止内存泄漏或野指针悬挂
+    for (MapPoint *pMP : mlpTemporalPoints)
+        delete pMP;
+    mlpTemporalPoints.clear();
+
+    // 1. 检查参考关键帧与位姿记录
+    if (mlRelativeFramePoses.empty() || mlpReferences.empty())
+        return;
+
+    KeyFrame *pRef = mlpReferences.back();
     if (!pRef)
         return;
 
-    // 如果还没有记录相对位姿，直接返回
-    if (mlRelativeFramePoses.empty())
-        return;
-
-    // 官方做法：取出上一帧记录的相对位姿 Tlr (Last Frame relative to Reference KF)
     Eigen::Matrix4f Tlr = mlRelativeFramePoses.back();
+    KeyFrame *pOrigRef = pRef;
 
-    // 回溯可能被 LocalMapping 剔除的 bad 关键帧
+    // 沿生成树回溯已剔除的关键帧
     Eigen::Matrix4f Trw = Eigen::Matrix4f::Identity();
     while (pRef->mbBad)
     {
@@ -847,14 +853,14 @@ void Tracker::UpdateLastFrame()
             return;
     }
 
-    // Tlw = Tlr * Trw * P_ref_w
+    // 更新上一帧绝对位姿
     mLastFrame.SetPose(Tlr * Trw * pRef->GetPose());
 
-    // 如果上一帧本身就是关键帧，则上面一步已经足够，不需要生成临时点
+    // 若上一帧本身是关键帧，无需生成临时点
     if (mnLastKeyFrameId == mLastFrame.mnId)
         return;
 
-    // Step 2: 双目专属逻辑 —— 为上一帧生成临时 VO 地图点（提高帧间跟踪稳定性）
+    // 2. 双目专属逻辑：为上一帧有深度但无地图点的特征点生成临时 VO 点
     std::vector<std::pair<float, int>> vDepthIdx;
     vDepthIdx.reserve(mLastFrame.N);
 
@@ -870,7 +876,6 @@ void Tracker::UpdateLastFrame()
     if (vDepthIdx.empty())
         return;
 
-    // 按深度由近到远排序
     std::sort(vDepthIdx.begin(), vDepthIdx.end());
 
     int nPoints = 0;
@@ -878,27 +883,15 @@ void Tracker::UpdateLastFrame()
     {
         int i = vDepthIdx[j].second;
 
-        bool bCreateNew = false;
-        MapPoint* pMP = mLastFrame.mvpMapPoints[i];
-
-        if (!pMP)
+        MapPoint *pMP = mLastFrame.mvpMapPoints[i];
+        // 只有未关联地图点，或者关联的点没有任何关键帧观测时才需要新建
+        if (!pMP || pMP->GetObservations().empty())
         {
-            bCreateNew = true;
-        }
-        else if (pMP->GetObservations().empty())
-        {
-            bCreateNew = true;
-        }
-
-        if (bCreateNew)
-        {
-            // 反投影成世界坐标点
             Eigen::Vector3f x3D = mLastFrame.UnprojectStereo(i);
-
-            // 创建临时地图点（构造函数：传所属地图和当前普通帧指针）
-            MapPoint* pNewMP = new MapPoint(x3D, pRef, mpMap.get());
+            MapPoint *pNewMP = new MapPoint(x3D, pOrigRef, mpMap.get());
 
             mLastFrame.mvpMapPoints[i] = pNewMP;
+            mLastFrame.mvbOutlier[i] = false;
             mlpTemporalPoints.push_back(pNewMP);
             nPoints++;
         }
@@ -907,7 +900,6 @@ void Tracker::UpdateLastFrame()
             nPoints++;
         }
 
-        // 停止条件：深度超过近点阈值且已选取超过 100 个近点
         if (vDepthIdx[j].first > mLastFrame.mThDepth && nPoints > 100)
             break;
     }
