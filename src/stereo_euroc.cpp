@@ -143,6 +143,10 @@ int main(int argc, char **argv)
     bool bIsPaused = false;
 
     // 4. 循环处理每一帧
+    // 记录时间锚点
+    auto t_wall_start = std::chrono::steady_clock::now();
+    double t_dataset_start = vTimestamps[0];
+
     for (int nFrameId = 0; nFrameId < nImages; ++nFrameId)
     {
         while (bIsPaused)
@@ -151,12 +155,28 @@ int main(int argc, char **argv)
             if (cKey == ' ' || cKey == 'q' || cKey == 'Q')
             {
                 bIsPaused = false;
+                // 暂停恢复后，需要重置/修正时间锚点，避免恢复时快速快进
+                double dCurrentElapsed = vTimestamps[nFrameId] - t_dataset_start;
+                t_wall_start = std::chrono::steady_clock::now() - 
+                               std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                                   std::chrono::duration<double>(dCurrentElapsed));
                 std::cout << "\r[状态] 恢复播放...                      " << std::flush;
             }
             else if (cKey == 27)
                 break;
         }
 
+        double dCurrentTimestamp = vTimestamps[nFrameId];
+
+        // 1. 严格时间戳同步：计算本帧应该在真实时间的哪个时刻被处理
+        double dTargetWallElapsed = dCurrentTimestamp - t_dataset_start;
+        auto t_target = t_wall_start + std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                                           std::chrono::duration<double>(dTargetWallElapsed));
+
+        // 2. 如果系统比数据集时间戳跑得快，则休眠等待直到到达目标时刻
+        std::this_thread::sleep_until(t_target);
+
+        // 3. 图像读取与预处理 (包含 I/O)
         cv::Mat image0 = cv::imread(vstrLeft[nFrameId], cv::IMREAD_GRAYSCALE);
         cv::Mat image1 = cv::imread(vstrRight[nFrameId], cv::IMREAD_GRAYSCALE);
         if (image0.empty() || image1.empty())
@@ -165,33 +185,14 @@ int main(int argc, char **argv)
             break;
         }
 
-        // 双目极线校正与去畸变 (Rectification)
         cv::Mat imLeftRect, imRightRect;
         cv::remap(image0, imLeftRect, M1l, M2l, cv::INTER_LINEAR);
         cv::remap(image1, imRightRect, M1r, M2r, cv::INTER_LINEAR);
 
-        double dCurrentTimestamp = vTimestamps[nFrameId];
-        auto t_start = std::chrono::steady_clock::now();
-
-        // 跟踪处理
+        // 4. 送入 SLAM 跟踪
         SLAM.TrackStereo(imLeftRect, imRightRect, dCurrentTimestamp);
 
-        auto t_end = std::chrono::steady_clock::now();
-        double dTrackElapsed = std::chrono::duration_cast<std::chrono::duration<double>>(t_end - t_start).count();
-
-        // 真实速率休眠同步
-        double dWaitTimeSec = 0.0;
-        if (nFrameId + 1 < nImages)
-        {
-            double dDeltaTime = vTimestamps[nFrameId + 1] - dCurrentTimestamp;
-            dWaitTimeSec = dDeltaTime - dTrackElapsed;
-        }
-
-        if (dWaitTimeSec > 0.0)
-        {
-            std::this_thread::sleep_for(std::chrono::duration<double>(dWaitTimeSec));
-        }
-
+        // 5. 按键响应
         char cKey = static_cast<char>(cv::waitKey(1));
         if (cKey == 27)
         {

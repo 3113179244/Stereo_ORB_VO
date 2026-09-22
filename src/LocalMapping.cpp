@@ -857,6 +857,9 @@ void LocalMapping::KeyFrameCulling()
         if (!pKF || pKF->mnId == 0 || pKF->mbBad)
             continue;
 
+        if (!pKF->GetLoopEdges().empty())
+            continue;
+            
         const std::vector<MapPoint *> vpMapPoints = pKF->GetMapPointMatches();
 
         const int thObs = 3;

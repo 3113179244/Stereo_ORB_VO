@@ -9,6 +9,7 @@
 #include "MotionOnlyBA.h"
 #include "Optimizer.h"
 #include <unistd.h>
+#include <iomanip>
 #include <algorithm>
 
 LoopClosing::LoopClosing(Map *pMap, KeyFrameDatabase *pDB, DBoW3::Vocabulary *pVoc, const bool bFixScale)
@@ -225,6 +226,10 @@ bool LoopClosing::ComputeSE3()
         std::vector<cv::Point2f> vPts2D;
         std::vector<int> vMPIndices;
 
+        vPts3D.reserve(mpCurrentKF->N);
+        vPts2D.reserve(mpCurrentKF->N);
+        vMPIndices.reserve(mpCurrentKF->N);
+
         for (int i = 0; i < mpCurrentKF->N; ++i)
         {
             MapPoint *pMP = vpMatchedMapPoints[i];
@@ -240,17 +245,30 @@ bool LoopClosing::ComputeSE3()
         if (vPts3D.size() < 20)
             continue;
 
+        // 保证相机内参转为 CV_64F，避免 solvePnPRansac 精度断言问题
+        cv::Mat K_double;
+        mpCurrentKF->mK.convertTo(K_double, CV_64F);
+        cv::Mat distCoeffs = cv::Mat::zeros(4, 1, CV_64F);
+
         cv::Mat rvec, tvec;
         std::vector<int> inliers;
-        bool bOK = cv::solvePnPRansac(
-            vPts3D, vPts2D, mpCurrentKF->mK, cv::Mat::zeros(4, 1, CV_32F),
-            rvec, tvec, false, 300, 8.0f, 0.99, inliers, cv::SOLVEPNP_EPNP);
 
-        // ORB-SLAM2 标准门槛: RANSAC 内点数必须 >= 20
+        // RANSAC 初求解
+        bool bOK = cv::solvePnPRansac(
+            vPts3D, vPts2D, K_double, distCoeffs,
+            rvec, tvec, false, 500, 8.0f, 0.99, inliers, cv::SOLVEPNP_ITERATIVE);
+
+        if (!bOK || inliers.size() < 20)
+        {
+            bOK = cv::solvePnPRansac(
+                vPts3D, vPts2D, K_double, distCoeffs,
+                rvec, tvec, false, 500, 8.0f, 0.99, inliers, cv::SOLVEPNP_EPNP);
+        }
+
         if (!bOK || inliers.size() < 20)
             continue;
 
-        // 提取粗估计位姿
+        // 提取 PnP 粗位姿
         cv::Mat R_cv;
         cv::Rodrigues(rvec, R_cv);
         Eigen::Matrix4f Tcw = Eigen::Matrix4f::Identity();
@@ -275,7 +293,6 @@ bool LoopClosing::ComputeSE3()
             }
         }
 
-        int nAdditionalMatches = 0;
         const Eigen::Matrix3f Rcw = Tcw.block<3, 3>(0, 0);
         const Eigen::Vector3f tcw = Tcw.block<3, 1>(0, 3);
 
@@ -317,16 +334,43 @@ bool LoopClosing::ComputeSE3()
             if (bestIdx >= 0)
             {
                 vpMatchedMapPoints[bestIdx] = pMP;
-                nAdditionalMatches++;
             }
         }
 
-        // ORB-SLAM2 标准门槛: 最终有效内点总数 >= 40
-        int nTotalMatches = static_cast<int>(inliers.size()) + nAdditionalMatches;
-        if (nTotalMatches >= 40)
+        // 阶段 3: 使用 MotionOnlyBA 进行严密位姿非线性优化
+        // 构造临时帧拷贝，保护 mpCurrentKF 原有跟踪状态不被破坏
+        Frame tempFrame;
+        tempFrame.mnId = mpCurrentKF->mnId;
+        tempFrame.N = mpCurrentKF->N;
+        tempFrame.mvKeysUn = mpCurrentKF->mvKeysUn;
+        tempFrame.mvuRight = mpCurrentKF->mvuRight;
+        tempFrame.mvDepth = mpCurrentKF->mvDepth;
+        tempFrame.mK = mpCurrentKF->mK.clone();
+        tempFrame.mbf = mpCurrentKF->mbf;
+        tempFrame.mThDepth = mpCurrentKF->mThDepth;
+        if (mpTracker)
+        {
+            tempFrame.mpORBextractorLeft = mpTracker->GetORBextractorLeft();
+        }
+        tempFrame.mvpMapPoints = vpMatchedMapPoints;
+        tempFrame.mvbOutlier = std::vector<bool>(tempFrame.N, false);
+        tempFrame.SetPose(Tcw); // 以 PnP 结果作为初值
+
+        // 执行 Ceres Motion-Only BA 优化
+        int nInliers = MotionOnlyBA::Optimize(&tempFrame);
+
+        // ORB-SLAM2 官方门槛: 经 MotionOnlyBA 优化后的有效内点必须 >= 40
+        if (nInliers >= 40)
         {
             mpMatchedKF = pCandKF;
-            mTcw_loop = Tcw;
+            mTcw_loop = tempFrame.mTcw; // 使用优化后的高精度位姿
+
+            // 同步剔除 BA 判定的 Outlier 地图点
+            for (int i = 0; i < tempFrame.N; ++i)
+            {
+                if (tempFrame.mvbOutlier[i])
+                    vpMatchedMapPoints[i] = nullptr;
+            }
             mvpLoopMatchedPoints = vpMatchedMapPoints;
             return true;
         }
@@ -524,7 +568,7 @@ void LoopClosing::CorrectLoop()
     }
     std::cout << "[DEBUG] 6. 准备创建后台 GBA 线程..." << std::endl;
     
-    // mpThreadGBA = new std::thread(&LoopClosing::RunGlobalBundleAdjustment, this, mpCurrentKF->mnId);
+    mpThreadGBA = new std::thread(&LoopClosing::RunGlobalBundleAdjustment, this, mpCurrentKF->mnId);
 
     std::cout << "\033[32;1m>>> [LoopClosing] 回环校正与位姿图优化完成！<<<\033[0m" << std::endl;
 }

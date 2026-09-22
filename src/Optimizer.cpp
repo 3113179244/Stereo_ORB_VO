@@ -1000,6 +1000,7 @@ void Optimizer::OptimizeEssentialGraph(Map *pMap, KeyFrame *pLoopKF, KeyFrame *p
         auto edgePair = std::make_pair(std::min(pCurKF, pLoopKF), std::max(pCurKF, pLoopKF));
         if (!sInsertedEdges.count(edgePair))
         {
+            // 获取闭环前端求解出来的当前帧矫正位姿 T_cur_corrected (T_cw_loop)
             Sophus::SE3d T_cur_corrected = mapPoses[pCurKF];
             auto itCur = CorrectedPoses.find(pCurKF);
             if (itCur != CorrectedPoses.end())
@@ -1010,7 +1011,10 @@ void Optimizer::OptimizeEssentialGraph(Map *pMap, KeyFrame *pLoopKF, KeyFrame *p
                 T_cur_corrected = Sophus::SE3d(Eigen::Quaterniond(R).normalized(), t);
             }
 
+            // pLoopKF 作为固定参考锚点，使用其原位姿 T_loop_w
             Sophus::SE3d T_loop_w = mapOriginalPoses[pLoopKF];
+
+            // 测量值 T_cur_loop_meas = T_cur_w * (T_loop_w)^-1
             Sophus::SE3d T_cur_loop_meas = T_cur_corrected * T_loop_w.inverse();
 
             ceres::CostFunction *cost = new PoseGraphSE3Analytic(T_cur_loop_meas);
@@ -1059,11 +1063,16 @@ void Optimizer::OptimizeEssentialGraph(Map *pMap, KeyFrame *pLoopKF, KeyFrame *p
             if (!pRefKF || !mapOriginalPoses.count(pRefKF) || !mapNewPoses.count(pRefKF))
                 continue;
 
+            // 提取参考关键帧优化前后的相机位姿 T_cw
             Sophus::SE3d T_old_cw = mapOriginalPoses[pRefKF];
-            Sophus::SE3d T_new_wc = mapNewPoses[pRefKF].inverse();
+            Sophus::SE3d T_new_cw = mapNewPoses[pRefKF];
 
+            // 1. 将旧世界坐标系下的点转至参考帧相机系: P_c = T_old_cw * P_w_old
             Eigen::Vector3d Pw_old = pMP->GetWorldPos().cast<double>();
-            Eigen::Vector3d Pw_new = T_new_wc * (T_old_cw * Pw_old);
+            Eigen::Vector3d Pc = T_old_cw * Pw_old;
+
+            // 2. 将相机系下的点转至新世界坐标系: P_w_new = (T_new_cw)^(-1) * P_c
+            Eigen::Vector3d Pw_new = T_new_cw.inverse() * Pc;
 
             pMP->SetWorldPos(Pw_new.cast<float>());
             pMP->UpdateNormalAndDepth();
@@ -1227,27 +1236,41 @@ void Optimizer::GlobalBundleAdjustment(Map *pMap, int nIterations, bool *pbStopF
 
                 if (mapPosesBeforeGBA.count(pParent) && mapNewPoses.count(pParent))
                 {
+                    // 父节点 GBA 优化前后的位姿 (都是世界到相机 T_cw)
                     Sophus::SE3d T_parent_old = mapPosesBeforeGBA[pParent];
                     Sophus::SE3d T_parent_new = mapNewPoses[pParent];
 
+                    // 子节点自身当前的位姿
                     Eigen::Matrix4f T_child_old_mat = pKFi->GetPose();
                     Sophus::SE3d T_child_old(Eigen::Quaterniond(T_child_old_mat.block<3, 3>(0, 0).cast<double>()).normalized(),
                                              T_child_old_mat.block<3, 1>(0, 3).cast<double>());
 
+                    // 子节点相对于父节点的相对变换保持不变: T_child_parent = T_child_old * (T_parent_old)^-1
                     Sophus::SE3d T_rel = T_child_old * T_parent_old.inverse();
+
+                    // 更新子节点在新世界坐标系下的绝对位姿: T_child_new = T_child_parent * T_parent_new
                     Sophus::SE3d T_child_new = T_rel * T_parent_new;
 
                     pKFi->SetPose(T_child_new.matrix().cast<float>());
+
+                    // 更新缓存映射表，以便后续层级的子孙节点能够继续向上回溯
                     mapPosesBeforeGBA[pKFi] = T_child_old;
                     mapNewPoses[pKFi] = T_child_new;
 
+                    // 同步更新以该子帧作为参考关键帧的地图点世界坐标
                     std::vector<MapPoint *> vpKFMPs = pKFi->GetMapPointMatches();
                     for (MapPoint *pMPi : vpKFMPs)
                     {
                         if (!pMPi || pMPi->isBad() || pMPi->GetReferenceKeyFrame() != pKFi)
                             continue;
+
+                        // 1. 旧世界坐标转到子相机系: P_c = T_child_old * P_w_old
                         Eigen::Vector3d Pw_old = pMPi->GetWorldPos().cast<double>();
-                        Eigen::Vector3d Pw_new = T_child_new.inverse() * (T_child_old * Pw_old);
+                        Eigen::Vector3d Pc = T_child_old * Pw_old;
+
+                        // 2. 子相机系转到新世界坐标: P_w_new = (T_child_new)^-1 * P_c
+                        Eigen::Vector3d Pw_new = T_child_new.inverse() * Pc;
+
                         pMPi->SetWorldPos(Pw_new.cast<float>());
                         pMPi->UpdateNormalAndDepth();
                     }

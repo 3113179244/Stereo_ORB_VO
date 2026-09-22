@@ -72,9 +72,40 @@ int main(int argc, char **argv)
     int nFrameId = 0;
     bool bIsPaused = false;
 
+    // 记录全局时间锚点
+    auto t_wall_start = std::chrono::steady_clock::now();
+    double t_dataset_start = vdTimestamps.empty() ? 0.0 : vdTimestamps[0];
+
     // 循环处理每一帧
     while (true)
     {
+        // 检查是否到达末尾
+        if (nFrameId >= static_cast<int>(vdTimestamps.size()))
+        {
+            std::cout << "\n已到达序列末尾，播放结束。共处理 " << nFrameId << " 帧。" << std::endl;
+            break;
+        }
+
+        // 处理暂停逻辑
+        while (bIsPaused)
+        {
+            char cKey = static_cast<char>(cv::waitKey(10));
+            if (cKey == ' ' || cKey == 'q' || cKey == 'Q')
+            {
+                bIsPaused = false;
+                // 恢复时平移时间锚点，避免暂停期间累计的时间差导致图像快速快进
+                double dCurrentElapsed = vdTimestamps[nFrameId] - t_dataset_start;
+                t_wall_start = std::chrono::steady_clock::now() - 
+                               std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                                   std::chrono::duration<double>(dCurrentElapsed));
+                std::cout << "\r[状态] 恢复播放...                      " << std::flush;
+            }
+            else if (cKey == 27) // ESC
+            {
+                break;
+            }
+        }
+
         std::stringstream ssFilename;
         ssFilename << std::setw(6) << std::setfill('0') << nFrameId << ".png";
         std::string strFilename = ssFilename.str();
@@ -82,56 +113,39 @@ int main(int argc, char **argv)
         std::string strLeftImgPath = strLeftDir + strFilename;
         std::string strRightImgPath = strRightDir + strFilename;
 
-        // 检查文件是否存在以及是否到达末尾
-        if (!cv::utils::fs::exists(strLeftImgPath) || !cv::utils::fs::exists(strRightImgPath) || nFrameId >= static_cast<int>(vdTimestamps.size()))
+        if (!cv::utils::fs::exists(strLeftImgPath) || !cv::utils::fs::exists(strRightImgPath))
         {
-            std::cout << "\n已到达序列末尾，播放结束。共处理 " << nFrameId << " 帧。" << std::endl;
+            std::cout << "\n图像文件不存在，播放结束。共处理 " << nFrameId << " 帧。" << std::endl;
             break;
         }
 
-        if (!bIsPaused)
+        double dCurrentTimestamp = vdTimestamps[nFrameId];
+
+        // 1. 严格时间戳同步：计算当前帧应在真实时间的哪个绝对时刻开始喂入
+        double dTargetWallElapsed = dCurrentTimestamp - t_dataset_start;
+        auto t_target = t_wall_start + std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                                           std::chrono::duration<double>(dTargetWallElapsed));
+
+        // 2. 若处理超前，精准休眠等待到达目标时间戳刻度
+        std::this_thread::sleep_until(t_target);
+
+        // 3. 图像读取 (耗时已包含在时间轴同步内)
+        cv::Mat image0 = cv::imread(strLeftImgPath, cv::IMREAD_GRAYSCALE);
+        cv::Mat image1 = cv::imread(strRightImgPath, cv::IMREAD_GRAYSCALE);
+
+        if (image0.empty() || image1.empty())
         {
-            cv::Mat image0 = cv::imread(strLeftImgPath, cv::IMREAD_GRAYSCALE);
-            cv::Mat image1 = cv::imread(strRightImgPath, cv::IMREAD_GRAYSCALE);
-
-            if (image0.empty() || image1.empty())
-            {
-                std::cerr << "错误: 无法读取图像: " << strFilename << std::endl;
-                break;
-            }
-
-            double dCurrentTimestamp = vdTimestamps[nFrameId];
-
-            // 记录当前帧跟踪开始时间
-            auto t_start = std::chrono::steady_clock::now();
-
-            Eigen::Matrix4f Tcw = SLAM.TrackStereo(image0, image1, dCurrentTimestamp);
-
-            // 记录当前帧跟踪结束时间并计算处理耗时 (单位: 秒)
-            auto t_end = std::chrono::steady_clock::now();
-            double dTrackElapsed = std::chrono::duration_cast<std::chrono::duration<double>>(t_end - t_start).count();
-
-            // 计算与下一帧之间的时间间隔，保持真实时间速率喂图
-            double dWaitTimeSec = 0.0;
-            if (nFrameId + 1 < static_cast<int>(vdTimestamps.size()))
-            {
-                double dNextTimestamp = vdTimestamps[nFrameId + 1];
-                double dDeltaTime = dNextTimestamp - dCurrentTimestamp;
-                dWaitTimeSec = dDeltaTime - dTrackElapsed;
-            }
-
-            // 若处理耗时小于两帧真实间隔，则休眠补足差值，为后端 LocalMapping 与 LoopClosing 留出处理时间
-            if (dWaitTimeSec > 0.0)
-            {
-                std::this_thread::sleep_for(std::chrono::duration<double>(dWaitTimeSec));
-            }
-
-            nFrameId++;
+            std::cerr << "错误: 无法读取图像: " << strFilename << std::endl;
+            break;
         }
 
-        int nWaitTime = bIsPaused ? 10 : 1;
-        char cKey = static_cast<char>(cv::waitKey(nWaitTime));
+        // 4. 执行 SLAM 跟踪
+        SLAM.TrackStereo(image0, image1, dCurrentTimestamp);
 
+        nFrameId++;
+
+        // 5. 按键检测
+        char cKey = static_cast<char>(cv::waitKey(1));
         if (cKey == 27) // ESC
         {
             std::cout << "\n按下 ESC，退出程序。" << std::endl;
@@ -139,19 +153,8 @@ int main(int argc, char **argv)
         }
         else if (cKey == ' ') // Space
         {
-            bIsPaused = !bIsPaused;
-            if (bIsPaused)
-                std::cout << "\r[状态] 已暂停播放 (按 Space/Q 键继续)... " << std::flush;
-            else
-                std::cout << "\r[状态] 恢复播放...                      " << std::flush;
-        }
-        else if (cKey == 'q' || cKey == 'Q')
-        {
-            if (bIsPaused)
-            {
-                bIsPaused = false;
-                std::cout << "\r[状态] 恢复播放...                      " << std::flush;
-            }
+            bIsPaused = true;
+            std::cout << "\r[状态] 已暂停播放 (按 Space/Q 键继续)... " << std::flush;
         }
     }
 

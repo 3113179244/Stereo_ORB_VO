@@ -228,18 +228,10 @@ public:
             residuals[0] = 0.0;
             residuals[1] = 0.0;
             residuals[2] = 0.0;
-            if (jacobians)
+            if (jacobians && jacobians[0])
             {
-                if (jacobians[0])
-                {
-                    // 3 个残差 x 7 维位姿 = 21 个 double
-                    std::fill(jacobians[0], jacobians[0] + 21, 0.0);
-                }
-                if (jacobians[1])
-                {
-                    // 3 个残差 x 3 维地图点 = 9 个 double
-                    std::fill(jacobians[1], jacobians[1] + 9, 0.0);
-                }
+                // 仅有参数块 0（7 维位姿）：3 个残差 x 7 维位姿 = 21 个 double
+                std::fill(jacobians[0], jacobians[0] + 21, 0.0);
             }
             return true;
         }

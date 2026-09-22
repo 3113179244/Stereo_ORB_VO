@@ -43,6 +43,7 @@ public:
     void UpdateLastFrame();
     void ResetVelocity();
     void CheckReplacedInLastFrame();
+    ORBextractor* GetORBextractorLeft() const { return mpORBextractorLeft.get(); }
     eTrackingState mState;
     // 当前帧与上一帧
     Frame mCurrentFrame;
