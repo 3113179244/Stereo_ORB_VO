@@ -703,7 +703,7 @@ void Optimizer::LocalBundleAdjustment(KeyFrame *pCurKF, bool *pbStopFlag, std::s
     ceres::Solver::Options options;
     options.linear_solver_type = ceres::SPARSE_SCHUR;
     options.trust_region_strategy_type = ceres::LEVENBERG_MARQUARDT;
-    options.num_threads = 1;
+    options.num_threads = 2;
     options.minimizer_progress_to_stdout = false;
     options.function_tolerance = 1e-4;
     options.gradient_tolerance = 1e-4;

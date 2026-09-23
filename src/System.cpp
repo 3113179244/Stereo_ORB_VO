@@ -9,7 +9,7 @@
 #include <fstream>
 #include <algorithm>
 #include <iomanip>
-
+#include <unistd.h>
 System::System(const std::string &strConfigFile, const std::string &strVocFile, const eSensor sensor, const bool bUseViewer)
     : mSensor(sensor), mpViewerThread(nullptr)
 {
@@ -118,19 +118,36 @@ Eigen::Matrix4f System::TrackStereo(const cv::Mat &imLeft, const cv::Mat &imRigh
 
 void System::Shutdown()
 {
+    // 1. 先向所有子线程发送 Finish 请求
     if (mpLocalMapper)
     {
-        mpLocalMapper->RequestStop();
+        mpLocalMapper->RequestFinish();
     }
     if (mpLoopCloser)
     {
-        mpLoopCloser->RequestStop();
+        mpLoopCloser->RequestFinish();
     }
+    if (mpViewer)
+    {
+        mpViewer->RequestFinish();
+    }
+
+    // 2. 等待各子线程真正退出（LocalMapping 析构内部自带 join，或者在此处等待 finished）
+    if (mpLocalMapper)
+    {
+        while (!mpLocalMapper->isFinished())
+            usleep(2000);
+    }
+    if (mpLoopCloser)
+    {
+        while (!mpLoopCloser->isFinished())
+            usleep(2000);
+    }
+
     if (mpViewerThread)
     {
-        if (mpViewer)
-            mpViewer->RequestFinish();
-        mpViewerThread->join();
+        if (mpViewerThread->joinable())
+            mpViewerThread->join();
         delete mpViewerThread;
         mpViewerThread = nullptr;
     }

@@ -209,23 +209,33 @@ void MapPoint::UpdateNormalAndDepth()
 void MapPoint::SetBadFlag()
 {
     std::map<KeyFrame *, size_t> obs;
+    
     {
         std::unique_lock<std::mutex> lock1(mMutexFeatures);
         std::unique_lock<std::mutex> lock2(mMutexPos);
-        mbBad = true; // 标记为 bad
-        obs = mObservations;
-        mObservations.clear(); // 清空本点的观测记录
-    }
 
-    // 通知曾经观测过这个点的关键帧：抹除关键帧端指向这里的匹配引用
-    for (auto mit = obs.begin(); mit != obs.end(); mit++)
+        // 如果已经是 bad，直接返回，避免重复进入
+        if (mbBad)
+            return;
+
+        mbBad = true;
+        obs = mObservations;   // 拷走所有观测关系
+        mObservations.clear(); // 清空自身的观测字典
+    } 
+
+    for (auto mit = obs.begin(); mit != obs.end(); ++mit)
     {
         KeyFrame *pKF = mit->first;
-        pKF->EraseMapPointMatch(mit->second);
+        if (pKF)
+        {
+            pKF->EraseMapPointMatch(mit->second);
+        }
     }
 
-    // 从地图系统中剔除自己
-    mpMap->EraseMapPoint(this);
+    if (mpMap)
+    {
+        mpMap->EraseMapPoint(this);
+    }
 }
 
 // 线程安全地返回当前是否为坏点

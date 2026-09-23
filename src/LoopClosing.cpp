@@ -22,17 +22,26 @@ LoopClosing::LoopClosing(Map *pMap, KeyFrameDatabase *pDB, DBoW3::Vocabulary *pV
 
 LoopClosing::~LoopClosing()
 {
+    // 1. 停止闭环主线程
     if (mpThread)
     {
         RequestStop();
         mpThread->join();
         delete mpThread;
+        mpThread = nullptr;
     }
-    // 等待并释放 GBA 线程
+
+    // 2. 中断并安全释放后台 GBA 线程
+    {
+        std::unique_lock<std::mutex> lock(mMutexGBA);
+        mbStopGBA = true;
+    }
     if (mpThreadGBA)
     {
-        mpThreadGBA->join();
+        if (mpThreadGBA->joinable())
+            mpThreadGBA->join();
         delete mpThreadGBA;
+        mpThreadGBA = nullptr;
     }
 }
 
@@ -96,8 +105,12 @@ void LoopClosing::Run()
             }
         }
 
+        if (CheckFinish())
+            break;
+
         usleep(5000);
     }
+    SetFinish();
 }
 
 // 阶段 1: 候选帧与共视组检测 (DetectLoop)
@@ -424,9 +437,11 @@ void LoopClosing::CorrectLoop()
     vpLoopConnectedKFs.push_back(mpMatchedKF);
 
     for (KeyFrame *pKFi : vpCurrentConnectedKFs)
-        if (pKFi) pKFi->SetNotErase();
+        if (pKFi)
+            pKFi->SetNotErase();
     for (KeyFrame *pKFi : vpLoopConnectedKFs)
-        if (pKFi) pKFi->SetNotErase();
+        if (pKFi)
+            pKFi->SetNotErase();
 
     // 5. 闭环漂移沿生成树全局快速传播（为优化提供优质全局初值）
     // 闭环漂移增量: T_drift = Tcw_loop * (Tcw_cur_old)^-1
@@ -447,7 +462,8 @@ void LoopClosing::CorrectLoop()
     // 先计算当前共视组的校正初值
     for (KeyFrame *pKFi : vpCurrentConnectedKFs)
     {
-        if (!pKFi || pKFi->mbBad) continue;
+        if (!pKFi || pKFi->mbBad)
+            continue;
         Eigen::Matrix4f Tiw_old = NonCorrectedPoses[pKFi];
         if (pKFi == mpCurrentKF)
         {
@@ -468,7 +484,8 @@ void LoopClosing::CorrectLoop()
         // 6.1 校正当前共视组观测到的地图点（仅校正当前共视组即可，其余点交由位姿图优化后更新）
         for (KeyFrame *pKFi : vpCurrentConnectedKFs)
         {
-            if (!pKFi || pKFi->mbBad) continue;
+            if (!pKFi || pKFi->mbBad)
+                continue;
 
             Eigen::Matrix4f Tiw_corrected = CorrectedPoses[pKFi];
             Eigen::Matrix4f Tw_i_corrected = Tiw_corrected.inverse();
@@ -523,7 +540,8 @@ void LoopClosing::CorrectLoop()
 
         for (KeyFrame *pKFi : vpCurrentConnectedKFs)
         {
-            if (!pKFi || pKFi->mbBad) continue;
+            if (!pKFi || pKFi->mbBad)
+                continue;
 
             std::vector<KeyFrame *> vpPreviousNeighbors = pKFi->GetVectorCovisibleKeyFrames();
             pKFi->UpdateConnections();
@@ -557,17 +575,43 @@ void LoopClosing::CorrectLoop()
     }
 
     for (KeyFrame *pKFi : vpCurrentConnectedKFs)
-        if (pKFi) pKFi->SetErase();
+        if (pKFi)
+            pKFi->SetErase();
     for (KeyFrame *pKFi : vpLoopConnectedKFs)
-        if (pKFi) pKFi->SetErase();
+        if (pKFi)
+            pKFi->SetErase();
 
     // 11. 释放 LocalMapping 线程并开启 GBA
     if (mpLocalMapper)
     {
         mpLocalMapper->Release();
     }
-    std::cout << "[DEBUG] 6. 准备创建后台 GBA 线程..." << std::endl;
-    
+
+    if (isRunningGBA())
+    {
+        // 1. 发出中断标记
+        {
+            std::unique_lock<std::mutex> lock(mMutexGBA);
+            mbStopGBA = true;
+            mnFullBAIdx++;
+        }
+        // 2. 严禁 detach 后 delete！必须安全 join
+        if (mpThreadGBA)
+        {
+            if (mpThreadGBA->joinable())
+                mpThreadGBA->join();
+            delete mpThreadGBA;
+            mpThreadGBA = nullptr;
+        }
+    }
+
+    // 释放后启动新线程
+    {
+        std::unique_lock<std::mutex> lock(mMutexGBA);
+        mbRunningGBA = true;
+        mbFinishedGBA = false;
+        mbStopGBA = false;
+    }
     mpThreadGBA = new std::thread(&LoopClosing::RunGlobalBundleAdjustment, this, mpCurrentKF->mnId);
 
     std::cout << "\033[32;1m>>> [LoopClosing] 回环校正与位姿图优化完成！<<<\033[0m" << std::endl;
@@ -674,32 +718,45 @@ bool LoopClosing::isRunningGBA()
     return mbRunningGBA;
 }
 
+bool LoopClosing::isFinishedGBA()
+{
+    std::unique_lock<std::mutex> lock(mMutexGBA);
+    return mbFinishedGBA;
+}
+
 void LoopClosing::RunGlobalBundleAdjustment(unsigned long nLoopKF)
 {
-    std::cout << "\033[32m[GBA Thread] 开始在后台执行全局 BA (LoopKF ID: " << nLoopKF << ")...\033[0m" << std::endl;
-
-    // 1. 设置运行状态标志位
-    {
-        std::unique_lock<std::mutex> lock(mMutexGBA);
-        mbRunningGBA = true;
-        mbStopGBA = false;
-    }
-
-    // 2. 调用支持中断的 GBA（注意：GBA 内部若被抢占打断，内部会检查 pbStopFlag）
+    const unsigned long idx = mnFullBAIdx;
     Optimizer::GlobalBundleAdjustment(mpMap, 20, &mbStopGBA, nLoopKF, true);
 
-    // 3. 运行结束，更新标志位与索引
+    std::unique_lock<std::mutex> lock(mMutexGBA);
+    if (idx == mnFullBAIdx && !mbStopGBA)
     {
-        std::unique_lock<std::mutex> lock(mMutexGBA);
-        if (mbStopGBA)
-        {
-            std::cout << "\033[33m[GBA Thread] 全局 BA 响应中断请求已提前终止。\033[0m" << std::endl;
-        }
-        else
-        {
-            std::cout << "\033[32;1m[GBA Thread] 全局 BA 优化完成并成功更新地图！\033[0m" << std::endl;
-            mnFullBAIdx++;
-        }
-        mbRunningGBA = false;
+        mbFinishedGBA = true;
     }
+    mbRunningGBA = false;
+}
+
+void LoopClosing::RequestFinish()
+{
+    std::unique_lock<std::mutex> lock(mMutexFinish);
+    mbFinishRequested = true;
+}
+
+bool LoopClosing::CheckFinish()
+{
+    std::unique_lock<std::mutex> lock(mMutexFinish);
+    return mbFinishRequested;
+}
+
+void LoopClosing::SetFinish()
+{
+    std::unique_lock<std::mutex> lock(mMutexFinish);
+    mbFinished = true;
+}
+
+bool LoopClosing::isFinished()
+{
+    std::unique_lock<std::mutex> lock(mMutexFinish);
+    return mbFinished;
 }

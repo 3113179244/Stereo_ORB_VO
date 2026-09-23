@@ -358,6 +358,7 @@ bool Tracker::TrackWithMotionModel()
 {
     ORBmatcher matcher(0.9f, true);
     UpdateLastFrame();
+    
     // 1. 基于恒速模型预测位姿初值
     mCurrentFrame.SetPose(mVelocity * mLastFrame.mTcw);
     std::fill(mCurrentFrame.mvpMapPoints.begin(), mCurrentFrame.mvpMapPoints.end(), nullptr);
@@ -366,17 +367,23 @@ bool Tracker::TrackWithMotionModel()
     int th = 7;
     int nmatches = matcher.SearchByProjection(mCurrentFrame, mLastFrame, th, false);
 
-    // 3. 若匹配过少，扩大 2 倍窗口重新搜索
+    // 3. 若匹配过少，进一步放大窗口重测（对齐 ORB-SLAM2 原版回退）
     if (nmatches < 20)
     {
         std::fill(mCurrentFrame.mvpMapPoints.begin(), mCurrentFrame.mvpMapPoints.end(), nullptr);
-        nmatches = matcher.SearchByProjection(mCurrentFrame, mLastFrame, 2 * th, false);
+        nmatches = matcher.SearchByProjection(mCurrentFrame, mLastFrame, 2 * th, false); // 14
     }
-
+    
     if (nmatches < 20)
+    {
+        std::fill(mCurrentFrame.mvpMapPoints.begin(), mCurrentFrame.mvpMapPoints.end(), nullptr);
+        nmatches = matcher.SearchByProjection(mCurrentFrame, mLastFrame, 3 * th, false); // 21
+    }
+    
+    if (nmatches < 15) // 最低门槛稍微放宽到 15
         return false;
 
-    // 4. 执行位姿优化 (Motion-only BA，内部已含 4 轮核函数外点剔除)
+    // 4. 执行位姿优化
     int num_inliers = MotionOnlyBA::Optimize(&mCurrentFrame);
 
     // 5. 剔除被判定为 Outlier 的地图点
@@ -389,7 +396,7 @@ bool Tracker::TrackWithMotionModel()
         }
     }
 
-    // 6. 原版判定标准：内点数 >= 10 即可交付给 TrackLocalMap
+    // 6. 只要有 10 个以上内点，交给 TrackLocalMap 去扩充和二次校验
     return num_inliers >= 10;
 }
 
@@ -599,8 +606,19 @@ bool Tracker::TrackLocalMap()
     // 5. 将当前局部地图点同步到 Map 供可视化渲染
     mpMap->SetReferenceMapPoints(mvpLocalMapPoints);
 
-    // ORB-SLAM2 官方标准门槛：局部地图跟踪成功判定内点数至少为 30 (保底宽松门槛不低于 15~30)
-    return mnMatchesInliers >= 30;
+    // 如果没有达到 30，但在重定位恢复后不久或存在足够的内点（>= 15），依然认为跟踪有效，避免立刻 Lost
+    if (mCurrentFrame.mnId < mnLastRelocFrameId + mFps)
+    {
+        return mnMatchesInliers > 10;
+    }
+    
+    if (mnMatchesInliers < 30)
+    {
+        // 遇到大运动时的弹性容错：只要依然有稳定内点 (>= 15)，不直接判死
+        return mnMatchesInliers >= 15;
+    }
+
+    return true;
 }
 
 bool Tracker::NeedNewKeyFrame()
@@ -1052,7 +1070,6 @@ void Tracker::SearchLocalPoints()
     if (mvpLocalMapPoints.empty())
         return;
 
-    // 1. 过滤掉当前帧中已经成功匹配且为有效内点（Inlier）的地图点
     std::vector<MapPoint *> vpCandidateMPs;
     vpCandidateMPs.reserve(mvpLocalMapPoints.size());
 
@@ -1064,7 +1081,6 @@ void Tracker::SearchLocalPoints()
         bool bAlreadyTracked = false;
         for (int i = 0; i < mCurrentFrame.N; ++i)
         {
-            // 核心修复：只有当指针匹配且不是 Outlier 时，才视作已跟踪成功
             if (mCurrentFrame.mvpMapPoints[i] == pMP && !mCurrentFrame.mvbOutlier[i])
             {
                 bAlreadyTracked = true;
@@ -1081,9 +1097,18 @@ void Tracker::SearchLocalPoints()
     if (vpCandidateMPs.empty())
         return;
 
-    // 2. 局部地图匹配设置 nnratio = 0.8f，开启旋转一致性校验，搜索半径 th = 5.0f
+    float th = 5.0f;
+    if (mCurrentFrame.mnId < mnLastRelocFrameId + 2)
+    {
+        th = 10.0f;
+    }
+    else if (mnMatchesInliers < 25)
+    {
+        th = 8.0f;
+    }
+
     ORBmatcher matcher(0.8f, true);
-    matcher.SearchByProjection(mCurrentFrame, vpCandidateMPs, 5.0f);
+    matcher.SearchByProjection(mCurrentFrame, vpCandidateMPs, th);
 }
 
 void Tracker::CheckReplacedInLastFrame()

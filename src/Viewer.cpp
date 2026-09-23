@@ -194,7 +194,7 @@ void Viewer::Run()
 void Viewer::DrawMapPoints()
 {
     if (!mpMap) return;
-
+    std::unique_lock<std::mutex> lock(mpMap->mMutexMapUpdate);
     const std::vector<MapPoint *> &vpMPs = mpMap->GetAllMapPoints();
     const std::vector<MapPoint *> &vpRefMPs = mpMap->GetReferenceMapPoints();
 
@@ -234,7 +234,7 @@ void Viewer::DrawMapPoints()
 void Viewer::DrawKeyFrames(bool bDrawKF, bool bDrawGraph)
 {
     if (!mpMap) return;
-
+    std::unique_lock<std::mutex> lock(mpMap->mMutexMapUpdate);
     const std::vector<KeyFrame *> &vpKFs = mpMap->GetAllKeyFrames();
 
     // 1. 绘制关键帧蓝色视锥体

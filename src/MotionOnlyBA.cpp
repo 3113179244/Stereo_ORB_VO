@@ -487,6 +487,13 @@ int MotionOnlyBA::Optimize(Frame *pFrame)
     Sophus::SE3d T_cw_normalized(q_res, T_cw.translation());
     pFrame->SetPose(T_cw_normalized.matrix().cast<float>());
 
+    for (int i = 0; i < N; ++i)
+    {
+        if (pFrame->mvbOutlier[i])
+        {
+            pFrame->mvpMapPoints[i] = nullptr;
+        }
+    }
     // std::cout << "[PoseBA-Debug] Frame ID: " << pFrame->mnId
     //           << " | 匹配数: " << nInitialCorrespondences
     //           << " -> 内点数: " << num_inliers

@@ -24,26 +24,29 @@ class LoopClosing
 {
 public:
     // 连续性检验结构体：记录候选组与其连续命中的次数
-    typedef std::pair<std::set<KeyFrame*>, int> ConsistentGroup;
+    typedef std::pair<std::set<KeyFrame *>, int> ConsistentGroup;
 
 public:
-    LoopClosing(Map* pMap, KeyFrameDatabase* pDB, DBoW3::Vocabulary* pVoc, const bool bFixScale = true);
+    LoopClosing(Map *pMap, KeyFrameDatabase *pDB, DBoW3::Vocabulary *pVoc, const bool bFixScale = true);
     ~LoopClosing();
 
-    void SetTracker(Tracker* pTracker) { mpTracker = pTracker; }
-    void SetLocalMapper(LocalMapping* pLocalMapper) { mpLocalMapper = pLocalMapper; }
+    void SetTracker(Tracker *pTracker) { mpTracker = pTracker; }
+    void SetLocalMapper(LocalMapping *pLocalMapper) { mpLocalMapper = pLocalMapper; }
 
     // 主线程循环
     void Run();
 
     // 插入待检测的关键帧
-    void InsertKeyFrame(KeyFrame* pKF);
+    void InsertKeyFrame(KeyFrame *pKF);
 
     // 请求与状态查询
     void RequestStop();
     bool isStopped();
     void RequestReset();
-
+    bool isRunningGBA();
+    bool isFinishedGBA();
+    void RequestFinish();
+    bool isFinished();
 private:
     bool CheckNewKeyFrames();
 
@@ -57,35 +60,36 @@ private:
     void CorrectLoop();
 
     // 局部地图点投影融合辅助函数
-    void SearchAndFuse(const std::vector<KeyFrame*>& vpLoopConnectedKFs);
+    void SearchAndFuse(const std::vector<KeyFrame *> &vpLoopConnectedKFs);
     void RunGlobalBundleAdjustment(unsigned long nLoopKF);
-    bool isRunningGBA();
+    bool CheckFinish();
+    void SetFinish();
 private:
-    Map* mpMap;
-    KeyFrameDatabase* mpKeyFrameDB;
-    DBoW3::Vocabulary* mpORBVocabulary;
-    Tracker* mpTracker;
-    LocalMapping* mpLocalMapper;
+    Map *mpMap;
+    KeyFrameDatabase *mpKeyFrameDB;
+    DBoW3::Vocabulary *mpORBVocabulary;
+    Tracker *mpTracker;
+    LocalMapping *mpLocalMapper;
 
-    std::thread* mpThread;
+    std::thread *mpThread;
     bool mbFixScale; // 双目 SLAM 固定尺度为 true (SE3)
 
     // 关键帧队列
-    std::list<KeyFrame*> mlpLoopKeyFrameQueue;
+    std::list<KeyFrame *> mlpLoopKeyFrameQueue;
     std::mutex mMutexLoopQueue;
 
     // 当前处理的关键帧与匹配到的闭环候选帧
-    KeyFrame* mpCurrentKF;
-    KeyFrame* mpMatchedKF;
+    KeyFrame *mpCurrentKF;
+    KeyFrame *mpMatchedKF;
     Eigen::Matrix4f mTcw_loop; // 闭环计算出的当前帧位姿
 
     // 匹配关系缓存
-    std::vector<MapPoint*> mvpCurrentMatchedPoints;
-    std::vector<MapPoint*> mvpLoopMatchedPoints;
+    std::vector<MapPoint *> mvpCurrentMatchedPoints;
+    std::vector<MapPoint *> mvpLoopMatchedPoints;
 
     // 连续性检验 (Temporal Consistency) 历史记录
     std::vector<ConsistentGroup> mvConsistentGroups;
-    std::vector<KeyFrame*> mvpEnoughConsistentCandidates;
+    std::vector<KeyFrame *> mvpEnoughConsistentCandidates;
 
     // 线程控制标志
     bool mbStopRequested;
@@ -95,9 +99,14 @@ private:
     std::mutex mMutexReset;
 
     // 全局 BA 线程与控制变量
-    std::thread* mpThreadGBA = nullptr;
+    std::thread *mpThreadGBA = nullptr;
     bool mbRunningGBA = false;
+    bool mbFinishedGBA = true;
     bool mbStopGBA = false;
     std::mutex mMutexGBA;
     unsigned long mnFullBAIdx = 0;
+
+    std::mutex mMutexFinish;
+    bool mbFinishRequested = false;
+    bool mbFinished = false;
 };
