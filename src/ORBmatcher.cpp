@@ -512,7 +512,12 @@ int ORBmatcher::SearchByProjection(Frame &F, const std::vector<MapPoint *> &vpMa
         {
             const size_t idx = candidates[c];
             if (F.mvpMapPoints[idx])
-                continue;
+            {
+                // 只有当该特征点绑定的地图点具有真实关键帧观测时才跳过；
+                // 若仅为恒速模型生成的临时 VO 点 (observations == 0)，允许被局部高质量地图点替换
+                if (F.mvpMapPoints[idx]->GetObservations().size() > 0)
+                    continue;
+            }
 
             const cv::Mat &dF = F.mDescriptors.row(idx);
             const int distDesc = DescriptorDistance(dMP, dF);

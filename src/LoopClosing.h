@@ -20,6 +20,7 @@ class Tracker;
 class LocalMapping;
 class KeyFrameDatabase;
 class Optimizer;
+class Sim3Solver;
 class LoopClosing
 {
 public:
@@ -43,10 +44,11 @@ public:
     void RequestStop();
     bool isStopped();
     void RequestReset();
-    bool isRunningGBA();
-    bool isFinishedGBA();
     void RequestFinish();
     bool isFinished();
+    void RequestStopGBA();
+    bool isRunningGBA();
+    bool isFinishedGBA();
 private:
     bool CheckNewKeyFrames();
 
@@ -104,7 +106,7 @@ private:
     bool mbFinishedGBA = true;
     bool mbStopGBA = false;
     std::mutex mMutexGBA;
-    unsigned long mnFullBAIdx = 0;
+    unsigned long mnFullBAIdx = 0; 
 
     std::mutex mMutexFinish;
     bool mbFinishRequested = false;

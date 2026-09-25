@@ -297,7 +297,7 @@ void LocalMapping::MapPointCulling()
     const unsigned long int nCurrentKFid = mpCurrentKeyFrame->mnId;
 
     // 单目为 2，双目 / RGB-D 为 3
-    const int cnThObs = 3;
+    const int cnThObs = 2;
 
     while (lit != mlpRecentAddedMapPoints.end())
     {

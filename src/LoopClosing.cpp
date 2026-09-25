@@ -6,12 +6,11 @@
 #include "Tracker.h"
 #include "ORBmatcher.h"
 #include "KeyFrameDatabase.h"
-#include "MotionOnlyBA.h"
 #include "Optimizer.h"
 #include <unistd.h>
 #include <iomanip>
 #include <algorithm>
-
+#include "Sim3Solver.h"
 LoopClosing::LoopClosing(Map *pMap, KeyFrameDatabase *pDB, DBoW3::Vocabulary *pVoc, const bool bFixScale)
     : mpMap(pMap), mpKeyFrameDB(pDB), mpORBVocabulary(pVoc), mpTracker(nullptr), mpLocalMapper(nullptr),
       mbFixScale(bFixScale), mpCurrentKF(nullptr), mpMatchedKF(nullptr),
@@ -31,10 +30,10 @@ LoopClosing::~LoopClosing()
         mpThread = nullptr;
     }
 
-    // 2. 中断并安全释放后台 GBA 线程
+    // 2. 终止并回收 GBA 线程
     {
         std::unique_lock<std::mutex> lock(mMutexGBA);
-        mbStopGBA = true;
+        mbStopGBA = true; // 发出终止信号
     }
     if (mpThreadGBA)
     {
@@ -140,8 +139,11 @@ bool LoopClosing::DetectLoop()
     }
     else
     {
-        minScore = 0.4f; // 避免保底阈值过低
+        minScore = 0.4f;
     }
+
+    // 限制最高门槛，避免当前共视帧重合度过高导致历史候选回环被全部误杀
+    minScore = std::min(minScore, 0.35f);
 
     // 2. 数据库检索候选关键帧
     std::vector<KeyFrame *> vpCandidateKFs;
@@ -228,71 +230,41 @@ bool LoopClosing::ComputeSE3()
         if (!pCandKF || pCandKF->mbBad)
             continue;
 
-        // 阶段 1: BoW 粗匹配 (ORB-SLAM2 标准门槛: 至少 20 对匹配)
+        // 1. 词袋粗匹配
         std::vector<MapPoint *> vpMatchedMapPoints;
         int nmatches = matcher.SearchByBoW(mpCurrentKF, pCandKF, vpMatchedMapPoints);
 
-        if (nmatches < 20)
+        if (nmatches < 15)
             continue;
 
-        std::vector<cv::Point3f> vPts3D;
-        std::vector<cv::Point2f> vPts2D;
-        std::vector<int> vMPIndices;
+        // 2. 构造 Sim3Solver
+        Sim3Solver solver(mpCurrentKF, pCandKF, vpMatchedMapPoints, mbFixScale);
+        solver.SetRansacParameters(0.99, 15, 300);
 
-        vPts3D.reserve(mpCurrentKF->N);
-        vPts2D.reserve(mpCurrentKF->N);
-        vMPIndices.reserve(mpCurrentKF->N);
+        bool bNoMore = false;
+        std::vector<bool> vbInliers;
+        int nInliers = 0;
+        bool bMatch = false;
 
-        for (int i = 0; i < mpCurrentKF->N; ++i)
+        // RANSAC 跑满直到收敛或没有更多候选
+        while (!bNoMore)
         {
-            MapPoint *pMP = vpMatchedMapPoints[i];
-            if (pMP && !pMP->isBad())
-            {
-                Eigen::Vector3f Pw = pMP->GetWorldPos();
-                vPts3D.push_back(cv::Point3f(Pw.x(), Pw.y(), Pw.z()));
-                vPts2D.push_back(mpCurrentKF->mvKeysUn[i].pt);
-                vMPIndices.push_back(i);
-            }
+            bMatch = solver.iterate(50, bNoMore, vbInliers, nInliers);
+            if (bMatch)
+                break;
         }
 
-        if (vPts3D.size() < 20)
+        if (!bMatch || nInliers < 15)
             continue;
 
-        // 保证相机内参转为 CV_64F，避免 solvePnPRansac 精度断言问题
-        cv::Mat K_double;
-        mpCurrentKF->mK.convertTo(K_double, CV_64F);
-        cv::Mat distCoeffs = cv::Mat::zeros(4, 1, CV_64F);
+        // 相机 2 (pCandKF) 到相机 1 (mpCurrentKF) 的变换 T_c_l
+        Eigen::Matrix4f T_c_l = solver.GetEstimatedTransformation();
 
-        cv::Mat rvec, tvec;
-        std::vector<int> inliers;
+        // 3. 推导当前帧的估计位姿: T_c_w = T_c_l * T_l_w
+        Eigen::Matrix4f T_l_w = pCandKF->GetPose();
+        Eigen::Matrix4f T_cw_estimated = T_c_l * T_l_w;
 
-        // RANSAC 初求解
-        bool bOK = cv::solvePnPRansac(
-            vPts3D, vPts2D, K_double, distCoeffs,
-            rvec, tvec, false, 500, 8.0f, 0.99, inliers, cv::SOLVEPNP_ITERATIVE);
-
-        if (!bOK || inliers.size() < 20)
-        {
-            bOK = cv::solvePnPRansac(
-                vPts3D, vPts2D, K_double, distCoeffs,
-                rvec, tvec, false, 500, 8.0f, 0.99, inliers, cv::SOLVEPNP_EPNP);
-        }
-
-        if (!bOK || inliers.size() < 20)
-            continue;
-
-        // 提取 PnP 粗位姿
-        cv::Mat R_cv;
-        cv::Rodrigues(rvec, R_cv);
-        Eigen::Matrix4f Tcw = Eigen::Matrix4f::Identity();
-        for (int r = 0; r < 3; ++r)
-        {
-            Tcw(r, 3) = static_cast<float>(tvec.at<double>(r));
-            for (int c = 0; c < 3; ++c)
-                Tcw(r, c) = static_cast<float>(R_cv.at<double>(r, c));
-        }
-
-        // 阶段 2: 投影引导二次扩充匹配
+        // 4. 利用初值投影扩充匹配点
         std::vector<KeyFrame *> vpCandNeighs = pCandKF->GetBestCovisibilityKeyFrames(10);
         vpCandNeighs.push_back(pCandKF);
 
@@ -306,8 +278,8 @@ bool LoopClosing::ComputeSE3()
             }
         }
 
-        const Eigen::Matrix3f Rcw = Tcw.block<3, 3>(0, 0);
-        const Eigen::Vector3f tcw = Tcw.block<3, 1>(0, 3);
+        const Eigen::Matrix3f Rcw = T_cw_estimated.block<3, 3>(0, 0);
+        const Eigen::Vector3f tcw = T_cw_estimated.block<3, 1>(0, 3);
 
         for (MapPoint *pMP : sCandMPs)
         {
@@ -350,8 +322,7 @@ bool LoopClosing::ComputeSE3()
             }
         }
 
-        // 阶段 3: 使用 MotionOnlyBA 进行严密位姿非线性优化
-        // 构造临时帧拷贝，保护 mpCurrentKF 原有跟踪状态不被破坏
+        // 5. 构造临时帧进行仅位姿优化
         Frame tempFrame;
         tempFrame.mnId = mpCurrentKF->mnId;
         tempFrame.N = mpCurrentKF->N;
@@ -362,23 +333,18 @@ bool LoopClosing::ComputeSE3()
         tempFrame.mbf = mpCurrentKF->mbf;
         tempFrame.mThDepth = mpCurrentKF->mThDepth;
         if (mpTracker)
-        {
             tempFrame.mpORBextractorLeft = mpTracker->GetORBextractorLeft();
-        }
         tempFrame.mvpMapPoints = vpMatchedMapPoints;
         tempFrame.mvbOutlier = std::vector<bool>(tempFrame.N, false);
-        tempFrame.SetPose(Tcw); // 以 PnP 结果作为初值
+        tempFrame.SetPose(T_cw_estimated);
 
-        // 执行 Ceres Motion-Only BA 优化
-        int nInliers = MotionOnlyBA::Optimize(&tempFrame);
+        int numInliersBA = Optimizer::PoseOptimization(&tempFrame);
 
-        // ORB-SLAM2 官方门槛: 经 MotionOnlyBA 优化后的有效内点必须 >= 40
-        if (nInliers >= 40)
+        if (numInliersBA >= 25)
         {
             mpMatchedKF = pCandKF;
-            mTcw_loop = tempFrame.mTcw; // 使用优化后的高精度位姿
+            mTcw_loop = tempFrame.mTcw;
 
-            // 同步剔除 BA 判定的 Outlier 地图点
             for (int i = 0; i < tempFrame.N; ++i)
             {
                 if (tempFrame.mvbOutlier[i])
@@ -397,8 +363,7 @@ void LoopClosing::CorrectLoop()
 {
     std::cout << "\033[32;1m>>> [LoopClosing] Loop detected! 开始闭环融合与位姿图优化... <<<\033[0m" << std::endl;
 
-    std::cout << "[DEBUG] 1. 开始请求暂停 LocalMapping..." << std::endl;
-    // 1. 请求暂停 LocalMapping 线程并中断局部 BA
+    // ----------------- Step 1: 停止 LocalMapping -----------------
     if (mpLocalMapper)
     {
         mpLocalMapper->RequestStop();
@@ -408,31 +373,30 @@ void LoopClosing::CorrectLoop()
             usleep(1000);
         }
     }
-    std::cout << "[DEBUG] 2. LocalMapping 已经成功停止！" << std::endl;
-    // 2. 如果上一次的全局 GBA 还在运行，发送中断请求并回收线程
+
+    // ----------------- Step 2: 检查并中断正在运行的旧 GBA (ORB-SLAM2 规范) -----------------
     if (isRunningGBA())
     {
-        std::cout << "[DEBUG] 2.1 正在回收旧 GBA 线程..." << std::endl;
-        {
-            std::unique_lock<std::mutex> lock(mMutexGBA);
-            mbStopGBA = true;
-            mnFullBAIdx++;
-        }
+        std::unique_lock<std::mutex> lock(mMutexGBA);
+        mbStopGBA = true;
+        mnFullBAIdx++; // 递增索引，废弃此前的 GBA 结果
+        lock.unlock();
+
         if (mpThreadGBA)
         {
-            mpThreadGBA->detach();
+            if (mpThreadGBA->joinable())
+                mpThreadGBA->join();
             delete mpThreadGBA;
             mpThreadGBA = nullptr;
         }
     }
-    std::cout << "[DEBUG] 3. 准备执行 UpdateConnections..." << std::endl;
-    // 3. 确保当前关键帧连接关系是最新的
+
+    // ----------------- Step 3~9: 闭环融合与位姿图优化 -----------------
     mpCurrentKF->UpdateConnections();
 
-    // 4. 收集当前关键帧共视组与闭环匹配帧共视组
+    // 收集共视组并设置保护
     std::vector<KeyFrame *> vpCurrentConnectedKFs = mpCurrentKF->GetVectorCovisibleKeyFrames();
     vpCurrentConnectedKFs.push_back(mpCurrentKF);
-
     std::vector<KeyFrame *> vpLoopConnectedKFs = mpMatchedKF->GetBestCovisibilityKeyFrames(10);
     vpLoopConnectedKFs.push_back(mpMatchedKF);
 
@@ -443,50 +407,34 @@ void LoopClosing::CorrectLoop()
         if (pKFi)
             pKFi->SetNotErase();
 
-    // 5. 闭环漂移沿生成树全局快速传播（为优化提供优质全局初值）
-    // 闭环漂移增量: T_drift = Tcw_loop * (Tcw_cur_old)^-1
     Eigen::Matrix4f Twc_cur_old = mpCurrentKF->GetPoseInverse();
-    Eigen::Matrix4f T_drift = mTcw_loop * Twc_cur_old;
-
     std::map<KeyFrame *, Eigen::Matrix4f> CorrectedPoses;
     std::map<KeyFrame *, Eigen::Matrix4f> NonCorrectedPoses;
 
-    // 获取地图中所有的关键帧，备份原始位姿并沿生成树传播
     std::vector<KeyFrame *> vpAllKFs = mpMap->GetAllKeyFrames();
     for (KeyFrame *pKF : vpAllKFs)
-    {
         if (pKF && !pKF->mbBad)
             NonCorrectedPoses[pKF] = pKF->GetPose();
-    }
 
-    // 先计算当前共视组的校正初值
+    // 1. 先计算当前共视组的校正位姿
     for (KeyFrame *pKFi : vpCurrentConnectedKFs)
     {
         if (!pKFi || pKFi->mbBad)
             continue;
         Eigen::Matrix4f Tiw_old = NonCorrectedPoses[pKFi];
         if (pKFi == mpCurrentKF)
-        {
             CorrectedPoses[pKFi] = mTcw_loop;
-        }
         else
-        {
-            // Tiw_new = Tiw_old * (Tcw_old)^-1 * Tcw_loop
-            Eigen::Matrix4f Tic = Tiw_old * Twc_cur_old;
-            CorrectedPoses[pKFi] = Tic * mTcw_loop;
-        }
+            CorrectedPoses[pKFi] = (Tiw_old * Twc_cur_old) * mTcw_loop;
     }
 
-    // 6. 地图锁保护：校正当前共视组地图点、替换闭环匹配点与特征融合
     {
         std::unique_lock<std::mutex> lockMap(mpMap->mMutexMapUpdate);
-
-        // 6.1 校正当前共视组观测到的地图点（仅校正当前共视组即可，其余点交由位姿图优化后更新）
+        // 校正当前共视组地图点
         for (KeyFrame *pKFi : vpCurrentConnectedKFs)
         {
             if (!pKFi || pKFi->mbBad)
                 continue;
-
             Eigen::Matrix4f Tiw_corrected = CorrectedPoses[pKFi];
             Eigen::Matrix4f Tw_i_corrected = Tiw_corrected.inverse();
             Eigen::Matrix4f Tiw_old = NonCorrectedPoses[pKFi];
@@ -509,7 +457,7 @@ void LoopClosing::CorrectLoop()
             }
         }
 
-        // 6.2 替换闭环匹配点
+        // 替换闭环匹配点
         for (size_t i = 0; i < mvpLoopMatchedPoints.size(); i++)
         {
             MapPoint *pLoopMP = mvpLoopMatchedPoints[i];
@@ -517,9 +465,7 @@ void LoopClosing::CorrectLoop()
             {
                 MapPoint *pCurMP = mpCurrentKF->GetMapPoint(i);
                 if (pCurMP)
-                {
                     pCurMP->Replace(pLoopMP);
-                }
                 else
                 {
                     mpCurrentKF->AddMapPoint(pLoopMP, i);
@@ -529,47 +475,63 @@ void LoopClosing::CorrectLoop()
             }
         }
     }
-    std::cout << "[DEBUG] 4. 准备执行 SearchAndFuse..." << std::endl;
-    // 7. 投影融合闭环侧地图点到当前共视组
+
+    // 1. 先将所有校正后的位姿更新进关键帧！
+    {
+        std::unique_lock<std::mutex> lockMap(mpMap->mMutexMapUpdate);
+        for (auto &mit : CorrectedPoses)
+        {
+            KeyFrame *pKFi = mit.first;
+            if (pKFi && !pKFi->mbBad)
+            {
+                pKFi->SetPose(mit.second);
+            }
+        }
+    }
+
+    // 2. 关键帧位姿已校正，此时重投影才能落在正确的像平面像素区域进行融合
     SearchAndFuse(vpLoopConnectedKFs);
 
-    // 8. 收集 LoopConnections
+    // 3. 最后更新共视连接与添加闭环边
     std::map<KeyFrame *, std::set<KeyFrame *>> LoopConnections;
     {
         std::unique_lock<std::mutex> lockMap(mpMap->mMutexMapUpdate);
-
         for (KeyFrame *pKFi : vpCurrentConnectedKFs)
         {
             if (!pKFi || pKFi->mbBad)
                 continue;
-
             std::vector<KeyFrame *> vpPreviousNeighbors = pKFi->GetVectorCovisibleKeyFrames();
             pKFi->UpdateConnections();
 
             std::vector<KeyFrame *> vConnected = pKFi->GetConnectedKeyFrames();
             std::set<KeyFrame *> sNewConnected(vConnected.begin(), vConnected.end());
-
             for (KeyFrame *pPrev : vpPreviousNeighbors)
                 sNewConnected.erase(pPrev);
             for (KeyFrame *pCurConn : vpCurrentConnectedKFs)
                 sNewConnected.erase(pCurConn);
-
             LoopConnections[pKFi] = sNewConnected;
         }
 
-        // 在优化前必须建立双向回环边！
         mpMatchedKF->AddLoopEdge(mpCurrentKF);
         mpCurrentKF->AddLoopEdge(mpMatchedKF);
-        std::cout << "[DEBUG] 5. 准备进入 Optimizer::OptimizeEssentialGraph..." << std::endl;
-        // 9. 执行 Essential Graph 位姿图优化（位姿与全图地图点在内部一次性回写）
-        Optimizer::OptimizeEssentialGraph(mpMap, mpMatchedKF, mpCurrentKF,
-                                          NonCorrectedPoses, CorrectedPoses, LoopConnections);
+    }
 
-        // 10. 更新前端 Tracker
+    // 执行 Essential Graph 优化
+    Optimizer::OptimizeEssentialGraph(mpMap, mpMatchedKF, mpCurrentKF,
+                                      NonCorrectedPoses, CorrectedPoses, LoopConnections);
+
+    {
+        std::unique_lock<std::mutex> lockMap(mpMap->mMutexMapUpdate);
         if (mpTracker)
         {
-            mpTracker->ResetVelocity();
+            // 1. 重置匀速模型速度
+            // mpTracker->ResetVelocity();
+            // 2. 检查替换点
             mpTracker->CheckReplacedInLastFrame();
+            // 3. 强制把上一帧的位姿更新为闭环校正后的位姿，消除阶跃断层
+            mpTracker->mLastFrame.SetPose(mpCurrentKF->GetPose());
+            // 4. 更新参考关键帧
+            mpTracker->mCurrentFrame.mpReferenceKF = mpCurrentKF;
             mpTracker->UpdateLastFrame();
         }
     }
@@ -581,40 +543,22 @@ void LoopClosing::CorrectLoop()
         if (pKFi)
             pKFi->SetErase();
 
-    // 11. 释放 LocalMapping 线程并开启 GBA
+    // 释放 LocalMapping 继续运行
     if (mpLocalMapper)
-    {
         mpLocalMapper->Release();
-    }
 
-    if (isRunningGBA())
-    {
-        // 1. 发出中断标记
-        {
-            std::unique_lock<std::mutex> lock(mMutexGBA);
-            mbStopGBA = true;
-            mnFullBAIdx++;
-        }
-        // 2. 严禁 detach 后 delete！必须安全 join
-        if (mpThreadGBA)
-        {
-            if (mpThreadGBA->joinable())
-                mpThreadGBA->join();
-            delete mpThreadGBA;
-            mpThreadGBA = nullptr;
-        }
-    }
-
-    // 释放后启动新线程
+    // ----------------- Step 10: 触发新一轮全局 BA (Trigger Global BA) -----------------
     {
         std::unique_lock<std::mutex> lock(mMutexGBA);
         mbRunningGBA = true;
         mbFinishedGBA = false;
         mbStopGBA = false;
     }
+
+    // 后台非阻塞启动 Global BA 线程
     mpThreadGBA = new std::thread(&LoopClosing::RunGlobalBundleAdjustment, this, mpCurrentKF->mnId);
 
-    std::cout << "\033[32;1m>>> [LoopClosing] 回环校正与位姿图优化完成！<<<\033[0m" << std::endl;
+    std::cout << "\033[32;1m>>> [LoopClosing] 回环校正与位姿图优化完成，已在后台触发全局 BA！<<<\033[0m" << std::endl;
 }
 
 // 辅助函数: 闭环区域地图点投影融合
@@ -726,13 +670,23 @@ bool LoopClosing::isFinishedGBA()
 
 void LoopClosing::RunGlobalBundleAdjustment(unsigned long nLoopKF)
 {
+    std::cout << "[GBA] 后台全局 BA 开始执行, 目标关键帧 ID: " << nLoopKF << " ..." << std::endl;
+
     const unsigned long idx = mnFullBAIdx;
+
+    // 调用 Optimizer::GlobalBundleAdjustment，传入 &mbStopGBA 标志指针支持内部提前中断
     Optimizer::GlobalBundleAdjustment(mpMap, 20, &mbStopGBA, nLoopKF, true);
 
     std::unique_lock<std::mutex> lock(mMutexGBA);
+    // 如果中途未被请求停止，并且期间没有新的回环递增 mnFullBAIdx
     if (idx == mnFullBAIdx && !mbStopGBA)
     {
         mbFinishedGBA = true;
+        std::cout << "\033[32;1m[GBA] 后台全局 BA 成功收敛并更新地图！\033[0m" << std::endl;
+    }
+    else
+    {
+        std::cout << "\033[33;1m[GBA] 后台全局 BA 被新回环或外部请求中断 (Aborted)。\033[0m" << std::endl;
     }
     mbRunningGBA = false;
 }
@@ -759,4 +713,13 @@ bool LoopClosing::isFinished()
 {
     std::unique_lock<std::mutex> lock(mMutexFinish);
     return mbFinished;
+}
+
+void LoopClosing::RequestStopGBA()
+{
+    std::unique_lock<std::mutex> lock(mMutexGBA);
+    if (mbRunningGBA)
+    {
+        mbStopGBA = true;
+    }
 }

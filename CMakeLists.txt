@@ -48,13 +48,13 @@ add_library(${PROJECT_NAME}_lib SHARED
   src/MapPoint.cpp
   src/Optimizer.cpp
   src/System.cpp
-  src/MotionOnlyBA.cpp
   src/Tracker.cpp
   src/Viewer.cpp
   src/FrameDrawer.cpp
   src/KeyFrameDatabase.cpp
   src/LocalMapping.cpp
   src/LoopClosing.cpp
+  src/Sim3Solver.cpp
 )
 
 target_link_libraries(${PROJECT_NAME}_lib

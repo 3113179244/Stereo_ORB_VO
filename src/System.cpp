@@ -156,18 +156,18 @@ void System::Shutdown()
 void System::Reset()
 {
     std::unique_lock<std::mutex> lock(mMutexMode);
-    
-    // 1. 请求后端复位并清空队列
+
+    if (mpLoopCloser)
+    {
+        mpLoopCloser->RequestStopGBA(); // 中断后台全局 BA
+        mpLoopCloser->RequestReset();
+    }
     if (mpLocalMapper)
         mpLocalMapper->RequestReset();
-    if (mpLoopCloser)
-        mpLoopCloser->RequestReset();
 
-    // 2. 复位前端追踪器
     if (mpTracker)
         mpTracker->Reset();
 
-    // 3. 最后清空地图
     if (mpMap)
         mpMap->Clear();
 }
@@ -195,7 +195,7 @@ void System::SaveTrajectoryKITTI(const std::string &filename)
     auto lit  = mpTracker->mlRelativeFramePoses.begin();
     auto lRit = mpTracker->mlpReferences.begin();
 
-    // 1. 获取序列第一帧相机在世界系下的位姿 Twc 作为原点参考系
+    // 记录第一帧作为 KITTI 评估的初始基准原点 T_w_0
     Eigen::Matrix4f Two = Eigen::Matrix4f::Identity();
     bool bFirst = true;
 
@@ -205,18 +205,25 @@ void System::SaveTrajectoryKITTI(const std::string &filename)
         if (!pKF)
             continue;
 
+        // 声明相对位姿累计矩阵
         Eigen::Matrix4f Trw = Eigen::Matrix4f::Identity();
+
+        // 顺着父节点指针向上回溯第一个有效的关键帧
         while (pKF->mbBad)
         {
-            Trw = Trw * pKF->GetRelativePoseToParent();
+            Trw = pKF->GetRelativePoseToParent() * Trw;
             pKF = pKF->GetParent();
             if (!pKF)
                 break;
         }
+
         if (!pKF)
             continue;
 
+        // 计算当前参考关键帧在世界系下的位姿
         Trw = Trw * pKF->GetPose();
+
+        // 计算当前普通帧在世界系下的位姿
         Eigen::Matrix4f Tcw = (*lit) * Trw;
         Eigen::Matrix4f Twc = Tcw.inverse();
 
@@ -226,7 +233,7 @@ void System::SaveTrajectoryKITTI(const std::string &filename)
             bFirst = false;
         }
 
-        // KITTI 标准位姿：当前帧相对于初始帧的位姿 T_0_c = (T_w_0)^-1 * T_w_c
+        // KITTI 标准：转换到以首帧为原点的局部坐标系 T_0_c = (T_w_0)^-1 * T_w_c
         Eigen::Matrix4f T0c = Two.inverse() * Twc;
 
         Eigen::Matrix3f R = T0c.block<3, 3>(0, 0);

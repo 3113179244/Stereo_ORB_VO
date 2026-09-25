@@ -64,7 +64,9 @@ std::vector<KeyFrame *> KeyFrameDatabase::DetectRelocalizationCandidates(Frame *
 
             for (KeyFrame *pKFi : lKFs)
             {
-                // 用 mnRelocQuery 标记防止在同一查询中重复处理同一个关键帧
+                if (!pKFi || pKFi->mbBad)
+                    continue;
+
                 if (pKFi->mnRelocQuery != pF->mnId)
                 {
                     pKFi->mnRelocWords = 0;
@@ -198,6 +200,10 @@ std::vector<KeyFrame *> KeyFrameDatabase::DetectLoopCandidates(KeyFrame *pKF, fl
 
             for (KeyFrame *pKFi : lKFs)
             {
+                // 过滤空指针及已被 LocalMapping 剔除的坏帧
+                if (!pKFi || pKFi->mbBad)
+                    continue;
+
                 if (spConnectedKeyFrames.count(pKFi))
                     continue; // 严格根据拓扑排除共视邻域
                 if (std::abs(static_cast<long int>(pKFi->mnId) - static_cast<long int>(pKF->mnId)) < 30)

@@ -127,7 +127,7 @@ int main(int argc, char **argv)
     R_r.convertTo(R_r, CV_32F);
     P_l.convertTo(P_l, CV_32F);
     P_r.convertTo(P_r, CV_32F);
-    
+
     // 初始化极线校正映射表 (CV_32F)
     cv::Mat M1l, M2l, M1r, M2r;
     cv::initUndistortRectifyMap(K_l, D_l, R_l, P_l.rowRange(0, 3).colRange(0, 3),
@@ -137,46 +137,19 @@ int main(int argc, char **argv)
     std::cout << "[EuRoC] 极线校正与去畸变映射表 (initUndistortRectifyMap) 初始化完成。" << std::endl;
     fs.release();
 
-    // 3. 初始化 SLAM 系统 (System 内部会解析 strConfigFile 中的 Camera.* 参数，与 ORB-SLAM2 完全一致)
     System SLAM(strConfigFile, strVocFile, System::STEREO, true);
 
-    bool bIsPaused = false;
+    std::cout << "  - ESC 键: 退出程序" << std::endl;
 
-    // 4. 循环处理每一帧
-    // 记录时间锚点
-    auto t_wall_start = std::chrono::steady_clock::now();
-    double t_dataset_start = vTimestamps[0];
-
+    // 循环处理每一帧
     for (int nFrameId = 0; nFrameId < nImages; ++nFrameId)
     {
-        while (bIsPaused)
-        {
-            char cKey = static_cast<char>(cv::waitKey(10));
-            if (cKey == ' ' || cKey == 'q' || cKey == 'Q')
-            {
-                bIsPaused = false;
-                // 暂停恢复后，需要重置/修正时间锚点，避免恢复时快速快进
-                double dCurrentElapsed = vTimestamps[nFrameId] - t_dataset_start;
-                t_wall_start = std::chrono::steady_clock::now() - 
-                               std::chrono::duration_cast<std::chrono::steady_clock::duration>(
-                                   std::chrono::duration<double>(dCurrentElapsed));
-                std::cout << "\r[状态] 恢复播放...                      " << std::flush;
-            }
-            else if (cKey == 27)
-                break;
-        }
-
         double dCurrentTimestamp = vTimestamps[nFrameId];
 
-        // 1. 严格时间戳同步：计算本帧应该在真实时间的哪个时刻被处理
-        double dTargetWallElapsed = dCurrentTimestamp - t_dataset_start;
-        auto t_target = t_wall_start + std::chrono::duration_cast<std::chrono::steady_clock::duration>(
-                                           std::chrono::duration<double>(dTargetWallElapsed));
+        // 1. 记录本帧开始处理的实际时间点
+        auto t_frame_start = std::chrono::steady_clock::now();
 
-        // 2. 如果系统比数据集时间戳跑得快，则休眠等待直到到达目标时刻
-        std::this_thread::sleep_until(t_target);
-
-        // 3. 图像读取与预处理 (包含 I/O)
+        // 2. 图像读取与极线校正 (Remap)
         cv::Mat image0 = cv::imread(vstrLeft[nFrameId], cv::IMREAD_GRAYSCALE);
         cv::Mat image1 = cv::imread(vstrRight[nFrameId], cv::IMREAD_GRAYSCALE);
         if (image0.empty() || image1.empty())
@@ -189,20 +162,34 @@ int main(int argc, char **argv)
         cv::remap(image0, imLeftRect, M1l, M2l, cv::INTER_LINEAR);
         cv::remap(image1, imRightRect, M1r, M2r, cv::INTER_LINEAR);
 
-        // 4. 送入 SLAM 跟踪
+        // 3. 送入 SLAM 跟踪
         SLAM.TrackStereo(imLeftRect, imRightRect, dCurrentTimestamp);
 
-        // 5. 按键响应
+        // 4. 计算与下一帧的理论时间差（EuRoC 约 20Hz，即 0.05s）
+        double dExpectedInterval = 0.05;
+        if (nFrameId + 1 < nImages)
+        {
+            dExpectedInterval = vTimestamps[nFrameId + 1] - dCurrentTimestamp;
+        }
+        else if (nFrameId > 0)
+        {
+            dExpectedInterval = dCurrentTimestamp - vTimestamps[nFrameId - 1];
+        }
+
+        // 5. 按键检测（仅响应 ESC 退出）
         char cKey = static_cast<char>(cv::waitKey(1));
         if (cKey == 27)
         {
             std::cout << "\n按下 ESC 键退出..." << std::endl;
             break;
         }
-        else if (cKey == ' ')
+
+        // 6. 控制帧率休眠
+        auto t_frame_end = std::chrono::steady_clock::now();
+        double dActualElapsed = std::chrono::duration<double>(t_frame_end - t_frame_start).count();
+        if (dActualElapsed < dExpectedInterval)
         {
-            bIsPaused = true;
-            std::cout << "\r[状态] 已暂停 (按 Space 或 Q 继续)... " << std::flush;
+            std::this_thread::sleep_for(std::chrono::duration<double>(dExpectedInterval - dActualElapsed));
         }
     }
 

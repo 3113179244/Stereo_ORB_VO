@@ -10,6 +10,7 @@
 #include "System.h"
 #include "Viewer.h"
 #include "Map.h"
+
 int main(int argc, char **argv)
 {
     // 设置默认路径
@@ -64,17 +65,10 @@ int main(int argc, char **argv)
     fileTimes.close();
 
     std::cout << "成功加载 " << vdTimestamps.size() << " 个时间戳。" << std::endl;
-    std::cout << "  - 空格键 (Space): 暂停/恢复播放" << std::endl;
-    std::cout << "  - Q 键           : 恢复播放" << std::endl;
-    std::cout << "  - ESC 键         : 退出程序" << std::endl;
+    std::cout << "  - ESC 键: 退出程序" << std::endl;
 
     System SLAM(strConfigFile, strVocFile, System::STEREO, true);
     int nFrameId = 0;
-    bool bIsPaused = false;
-
-    // 记录全局时间锚点
-    auto t_wall_start = std::chrono::steady_clock::now();
-    double t_dataset_start = vdTimestamps.empty() ? 0.0 : vdTimestamps[0];
 
     // 循环处理每一帧
     while (true)
@@ -84,26 +78,6 @@ int main(int argc, char **argv)
         {
             std::cout << "\n已到达序列末尾，播放结束。共处理 " << nFrameId << " 帧。" << std::endl;
             break;
-        }
-
-        // 处理暂停逻辑
-        while (bIsPaused)
-        {
-            char cKey = static_cast<char>(cv::waitKey(10));
-            if (cKey == ' ' || cKey == 'q' || cKey == 'Q')
-            {
-                bIsPaused = false;
-                // 恢复时平移时间锚点，避免暂停期间累计的时间差导致图像快速快进
-                double dCurrentElapsed = vdTimestamps[nFrameId] - t_dataset_start;
-                t_wall_start = std::chrono::steady_clock::now() - 
-                               std::chrono::duration_cast<std::chrono::steady_clock::duration>(
-                                   std::chrono::duration<double>(dCurrentElapsed));
-                std::cout << "\r[状态] 恢复播放...                      " << std::flush;
-            }
-            else if (cKey == 27) // ESC
-            {
-                break;
-            }
         }
 
         std::stringstream ssFilename;
@@ -121,15 +95,10 @@ int main(int argc, char **argv)
 
         double dCurrentTimestamp = vdTimestamps[nFrameId];
 
-        // 1. 严格时间戳同步：计算当前帧应在真实时间的哪个绝对时刻开始喂入
-        double dTargetWallElapsed = dCurrentTimestamp - t_dataset_start;
-        auto t_target = t_wall_start + std::chrono::duration_cast<std::chrono::steady_clock::duration>(
-                                           std::chrono::duration<double>(dTargetWallElapsed));
+        // 1. 记录本帧开始处理的实际时间点
+        auto t_frame_start = std::chrono::steady_clock::now();
 
-        // 2. 若处理超前，精准休眠等待到达目标时间戳刻度
-        std::this_thread::sleep_until(t_target);
-
-        // 3. 图像读取 (耗时已包含在时间轴同步内)
+        // 2. 读取图像
         cv::Mat image0 = cv::imread(strLeftImgPath, cv::IMREAD_GRAYSCALE);
         cv::Mat image1 = cv::imread(strRightImgPath, cv::IMREAD_GRAYSCALE);
 
@@ -139,22 +108,36 @@ int main(int argc, char **argv)
             break;
         }
 
-        // 4. 执行 SLAM 跟踪
+        // 3. 执行 SLAM 跟踪
         SLAM.TrackStereo(image0, image1, dCurrentTimestamp);
+
+        // 4. 计算当前帧与下一帧理论上的时间差
+        double dExpectedInterval = 0.1; // 默认 10Hz
+        if (nFrameId + 1 < static_cast<int>(vdTimestamps.size()))
+        {
+            dExpectedInterval = vdTimestamps[nFrameId + 1] - dCurrentTimestamp;
+        }
+        else if (nFrameId > 0)
+        {
+            dExpectedInterval = dCurrentTimestamp - vdTimestamps[nFrameId - 1];
+        }
 
         nFrameId++;
 
-        // 5. 按键检测
+        // 5. 按键检测（仅响应 ESC 退出）
         char cKey = static_cast<char>(cv::waitKey(1));
         if (cKey == 27) // ESC
         {
             std::cout << "\n按下 ESC，退出程序。" << std::endl;
             break;
         }
-        else if (cKey == ' ') // Space
+
+        // 6. 控制帧率休眠
+        auto t_frame_end = std::chrono::steady_clock::now();
+        double dActualElapsed = std::chrono::duration<double>(t_frame_end - t_frame_start).count();
+        if (dActualElapsed < dExpectedInterval)
         {
-            bIsPaused = true;
-            std::cout << "\r[状态] 已暂停播放 (按 Space/Q 键继续)... " << std::flush;
+            std::this_thread::sleep_for(std::chrono::duration<double>(dExpectedInterval - dActualElapsed));
         }
     }
 
@@ -163,6 +146,7 @@ int main(int argc, char **argv)
     cv::utils::fs::createDirectories(strTrajDir); 
     std::string strTrajFile = strTrajDir + "/CameraTrajectory.txt";
     SLAM.SaveTrajectoryKITTI(strTrajFile);
+
     if (SLAM.GetMap())
     {
         unsigned long nKFs = SLAM.GetMap()->GetKeyFramesInMap();
@@ -172,6 +156,7 @@ int main(int argc, char **argv)
         std::cout << "地图点数量 (MapPoints): " << nMPs << std::endl;
         std::cout << "----------------------------\n" << std::endl;
     }
+
     if (SLAM.GetViewer())
     {
         while (!SLAM.GetViewer()->isFinished())
@@ -179,6 +164,7 @@ int main(int argc, char **argv)
             std::this_thread::sleep_for(std::chrono::milliseconds(200));
         }
     }
+
     SLAM.Shutdown();
     return 0;
 }

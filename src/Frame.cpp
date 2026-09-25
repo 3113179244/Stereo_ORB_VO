@@ -269,13 +269,9 @@ void Frame::ComputeStereoMatches()
             float bestuR = mpORBextractorLeft->GetScaleFactors()[levelL] * (static_cast<float>(scaleduR0) + static_cast<float>(bestincR) + deltaR);
             float disparity = (uL - bestuR);
 
-            if (disparity >= minD && disparity < maxD)
+            // 严格要求有效正视差，必须大于 0.0f，绝不能强行赋 0.01 产生几万米的离群噪点
+            if (disparity > 0.0f && disparity < maxD)
             {
-                if (disparity <= 0.0f)
-                {
-                    disparity = 0.01f;
-                    bestuR = uL - 0.01f;
-                }
                 mvDepth[iL] = mbf / disparity;
                 mvuRight[iL] = bestuR;
                 vDistIdx.push_back(std::make_pair(bestDistSub, iL));

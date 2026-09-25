@@ -8,7 +8,6 @@
 #include <algorithm>
 #include <iostream>
 #include "ORBmatcher.h"
-#include "MotionOnlyBA.h"
 #include "LocalMapping.h"
 #include "KeyFrameDatabase.h"
 #include "Viewer.h"
@@ -384,7 +383,7 @@ bool Tracker::TrackWithMotionModel()
         return false;
 
     // 4. 执行位姿优化
-    int num_inliers = MotionOnlyBA::Optimize(&mCurrentFrame);
+    int num_inliers = Optimizer::PoseOptimization(&mCurrentFrame);
 
     // 5. 剔除被判定为 Outlier 的地图点
     for (int i = 0; i < mCurrentFrame.N; ++i)
@@ -426,7 +425,7 @@ bool Tracker::TrackReferenceKeyFrame()
     mCurrentFrame.SetPose(mLastFrame.mTcw);
 
     // Step 4：通过重投影误差优化当前帧位姿 (Pose-Only BA)
-    MotionOnlyBA::Optimize(&mCurrentFrame);
+    Optimizer::PoseOptimization(&mCurrentFrame);
 
     // Discard outliers
     // Step 5：剔除优化后的外点（MapPoints），并统计匹配成功的内点数
@@ -544,7 +543,7 @@ bool Tracker::Relocalize()
 
         mCurrentFrame.SetPose(Tcw_pnp);
 
-        int nInliers = MotionOnlyBA::Optimize(&mCurrentFrame);
+        int nInliers = Optimizer::PoseOptimization(&mCurrentFrame);
 
         if (nInliers >= 20)
         {
@@ -583,7 +582,7 @@ bool Tracker::TrackLocalMap()
     SearchLocalPoints();
 
     // 3. 位姿优化 (Motion-Only BA)
-    int nInliers = MotionOnlyBA::Optimize(&mCurrentFrame);
+    Optimizer::PoseOptimization(&mCurrentFrame);
 
     // 4. 更新内点标记并剔除外点
     mnMatchesInliers = 0;
