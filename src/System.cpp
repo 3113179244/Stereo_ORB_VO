@@ -192,7 +192,7 @@ void System::SaveTrajectoryKITTI(const std::string &filename)
     }
     f << std::fixed;
 
-    auto lit  = mpTracker->mlRelativeFramePoses.begin();
+    auto lit = mpTracker->mlRelativeFramePoses.begin();
     auto lRit = mpTracker->mlpReferences.begin();
 
     // 记录第一帧作为 KITTI 评估的初始基准原点 T_w_0
@@ -270,10 +270,10 @@ void System::SaveTrajectoryTUM(const std::string &filename)
     }
     f << std::fixed;
 
-    auto lit  = mpTracker->mlRelativeFramePoses.begin();
+    auto lit = mpTracker->mlRelativeFramePoses.begin();
     auto lRit = mpTracker->mlpReferences.begin();
-    auto lT   = mpTracker->mlFrameTimes.begin();
-    auto lbL  = mpTracker->mlbLost.begin();
+    auto lT = mpTracker->mlFrameTimes.begin();
+    auto lbL = mpTracker->mlbLost.begin();
 
     for (; lit != mpTracker->mlRelativeFramePoses.end(); ++lit, ++lRit, ++lT, ++lbL)
     {
@@ -288,7 +288,7 @@ void System::SaveTrajectoryTUM(const std::string &filename)
 
         while (pKF->mbBad)
         {
-            Trw = Trw * pKF->GetRelativePoseToParent();
+            Trw = pKF->GetRelativePoseToParent() * Trw;
             pKF = pKF->GetParent();
             if (!pKF)
                 break;

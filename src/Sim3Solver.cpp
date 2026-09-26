@@ -10,8 +10,7 @@ Sim3Solver::Sim3Solver(KeyFrame *pKF1, KeyFrame *pKF2,
       mIterations(0), mBestInliers(0), mBestScale(1.0f),
       mRng(std::random_device{}())
 {
-    std::random_device rd;
-    mRng.seed(rd() ^ static_cast<unsigned int>(std::chrono::system_clock::now().time_since_epoch().count()));
+    mRng.seed(0);
     // 获取相机 1 与相机 2 的位姿，用于将地图点转换至各自相机坐标系
     Eigen::Matrix4f T1w = pKF1->GetPose();
     Eigen::Matrix3f R1w = T1w.block<3, 3>(0, 0);

@@ -41,6 +41,7 @@ public:
     Eigen::Matrix4f TrackStereo(const cv::Mat &imLeft, const cv::Mat &imRight, const double &timestamp);
     ORBVocabulary *GetVocabulary() const { return mpVocabulary.get(); }
     std::shared_ptr<LoopClosing> GetLoopCloser() const { return mpLoopCloser; }
+    std::shared_ptr<LocalMapping> GetLocalMapper() const { return mpLocalMapper; }
     // 控制接口
     void Reset();
     void Shutdown();

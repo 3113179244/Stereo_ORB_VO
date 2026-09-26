@@ -7,7 +7,7 @@
 #include <thread>
 #include <opencv2/opencv.hpp>
 #include <opencv2/core/utils/filesystem.hpp>
-
+#include "LocalMapping.h"
 #include "System.h"
 #include "Viewer.h"
 #include "Map.h"
@@ -194,6 +194,23 @@ int main(int argc, char **argv)
     }
 
     cv::destroyAllWindows();
+
+    std::cout << "\n[System] 数据流输入完成，正在等待后台线程收敛..." << std::endl;
+
+    // 1. 等待 LocalMapping 队列中的待处理关键帧清空
+    while (SLAM.GetLocalMapper() && SLAM.GetLocalMapper()->KeyframesInQueue() > 0)
+    {
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+
+    // 2. 如果后台有全局 BA (GBA) 正在运行，等待其收敛回写地图
+    if (SLAM.GetLoopCloser())
+    {
+        while (SLAM.GetLoopCloser()->isRunningGBA())
+        {
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+    }
 
     // 5. 保存轨迹 (EuRoC 数据集使用 TUM 格式便于与 ground truth 对齐评估)
     std::string strTrajDir = "/home/wzj/output";

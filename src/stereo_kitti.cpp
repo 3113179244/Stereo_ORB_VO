@@ -10,7 +10,7 @@
 #include "System.h"
 #include "Viewer.h"
 #include "Map.h"
-
+#include "LocalMapping.h"
 int main(int argc, char **argv)
 {
     // 设置默认路径
@@ -26,7 +26,7 @@ int main(int argc, char **argv)
     {
         strConfigFile = argv[2];
     }
-    if (argc >= 4) 
+    if (argc >= 4)
     {
         strSequenceDir = argv[3];
     }
@@ -142,8 +142,26 @@ int main(int argc, char **argv)
     }
 
     cv::destroyAllWindows();
+
+    std::cout << "\n[System] 数据流输入完成，正在等待后台线程收敛..." << std::endl;
+
+    // 1. 等待 LocalMapping 队列中的待处理关键帧清空
+    while (SLAM.GetLocalMapper() && SLAM.GetLocalMapper()->KeyframesInQueue() > 0)
+    {
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+
+    // 2. 如果后台有全局 BA (GBA) 正在运行，等待其收敛回写地图
+    if (SLAM.GetLoopCloser())
+    {
+        while (SLAM.GetLoopCloser()->isRunningGBA())
+        {
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+    }
+
     std::string strTrajDir = "/home/wzj/output";
-    cv::utils::fs::createDirectories(strTrajDir); 
+    cv::utils::fs::createDirectories(strTrajDir);
     std::string strTrajFile = strTrajDir + "/CameraTrajectory.txt";
     SLAM.SaveTrajectoryKITTI(strTrajFile);
 
@@ -154,7 +172,8 @@ int main(int argc, char **argv)
         std::cout << "\n------- 系统运行统计 -------" << std::endl;
         std::cout << "关键帧数量 (KeyFrames): " << nKFs << std::endl;
         std::cout << "地图点数量 (MapPoints): " << nMPs << std::endl;
-        std::cout << "----------------------------\n" << std::endl;
+        std::cout << "----------------------------\n"
+                  << std::endl;
     }
 
     if (SLAM.GetViewer())
